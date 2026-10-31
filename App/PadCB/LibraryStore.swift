@@ -177,7 +177,8 @@ final class LibraryStore: ObservableObject {
 
     /// Convenience: one resolved symbol definition from a named library.
     func symbol(library: String, name: String) -> KiCadSymbolDef? {
-        library(named: library)?.symbols[name]
+        // `self.` is required: the `library` parameter shadows this method.
+        self.library(named: library)?.symbols[name]
     }
 
     // MARK: - Index entries from headers
