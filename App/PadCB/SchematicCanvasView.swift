@@ -375,18 +375,18 @@ struct SchematicCanvasView: View {
 
         switch dragKind {
         case .pan:
-            canvasState.offset = CGPoint(x: dragStartOffset.x + translation.width,
-                                       y: dragStartOffset.y + translation.height)
+            canvasState.offset = CGPoint(x: dragStartOffset.x + translation.x,
+                                       y: dragStartOffset.y + translation.y)
         case .moveSymbol:
-            let dw = DPoint(x: Double(translation.width) / scaleD,
-                            y: -Double(translation.height) / scaleD)
+            let dw = DPoint(x: Double(translation.x) / scaleD,
+                            y: -Double(translation.y) / scaleD)
             dragOrigin = snap(dragStartOrigin + dw)
         case .track:
             if tool == .wire {
                 let target = nearestPin(to: w, defs: defsByID)?.point ?? snap(w)
                 if wireDragActive {
                     updateWireDrag(to: target)
-                } else if hypot(translation.width, translation.height) >= 5,
+                } else if hypot(translation.x, translation.y) >= 5,
                           let start = wireDragStart {
                     // Threshold crossed: this pan is a wire drag. Seed it
                     // from the captured start point (continuing any
@@ -408,7 +408,7 @@ struct SchematicCanvasView: View {
     }
 
     private func handlePanEnded(location: CGPoint, translation: CGPoint, cancelled: Bool) {
-        let dist = hypot(translation.width, translation.height)
+        let dist = hypot(translation.x, translation.y)
         canvasState.cursorWorld = world(location)
         if wireDragActive {
             // A finished wire drag commits through the normal finishWire
