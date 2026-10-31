@@ -1,0 +1,118 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+  push:
+
+env:
+  # Pinned KiCad symbol libraries (canonical source: KiCad GitLab.
+  # The GitHub mirror KiCad/kicad-symbols is frozen at 5.1.x-era tags.)
+  KICAD_SYMBOLS_TAG: "10.0.1"
+  KICAD_SYMBOLS_COMMIT: "7058584a0fbe9aa2f1c9ff2acf7847726ff6922c"
+  KICAD_SYMBOLS_URL: "https://gitlab.com/kicad/libraries/kicad-symbols/-/archive/10.0.1/kicad-symbols-10.0.1.tar.gz"
+
+jobs:
+  build:
+    name: Unsigned IPA
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download KiCad symbol libraries (pinned) and merge symdirs
+        run: |
+          curl -fL "$KICAD_SYMBOLS_URL" -o /tmp/kicad-symbols.tar.gz
+          mkdir -p /tmp/kicad-symbols
+          tar -xzf /tmp/kicad-symbols.tar.gz -C /tmp/kicad-symbols --strip-components=1
+          # KiCad 10 ships one .kicad_sym file per symbol inside
+          # <Library>.kicad_symdir/ directories; merge each directory into a
+          # single per-library file (extracted symbol nodes are unmodified).
+          # The upstream LICENSE.md lands next to them as
+          # KICAD-LIBRARIES-LICENSE.md so attribution ships in the bundle.
+          python3 tools/merge_symdirs.py /tmp/kicad-symbols App/PadCB/Symbols | tail -4
+          ls App/PadCB/Symbols | head -5
+
+      - name: Validate merged symbol libraries (structure + counts)
+        run: |
+          python3 - <<'EOF'
+          import glob, sys
+          files = sorted(glob.glob("App/PadCB/Symbols/*.kicad_sym"))
+          print(f"library files: {len(files)}")
+          assert len(files) >= 200, "suspiciously few library files"
+          total_symbols = 0
+          total_bytes = 0
+          for path in files:
+              text = open(path, encoding="utf-8").read()
+              total_bytes += len(text.encode("utf-8"))
+              assert text.startswith("(kicad_symbol_lib"), f"{path}: bad root"
+              depth = 0; in_str = False; esc = False
+              for ch in text:
+                  if in_str:
+                      if esc: esc = False
+                      elif ch == "\\": esc = True
+                      elif ch == '"': in_str = False
+                  else:
+                      if ch == '"': in_str = True
+                      elif ch == "(": depth += 1
+                      elif ch == ")":
+                          depth -= 1
+                          assert depth >= 0, f"{path}: unbalanced"
+              assert depth == 0, f"{path}: paren depth {depth}"
+              # merged files place each top-level symbol at column 0
+              total_symbols += sum(1 for line in text.splitlines()
+                                   if line.startswith('(symbol "'))
+          print(f"total bytes: {total_bytes}")
+          print(f"top-level symbols: {total_symbols}")
+          assert total_symbols >= 22000, "suspiciously few symbols"
+          print("symbol library validation OK")
+          EOF
+
+      - name: Build app (unsigned)
+        run: |
+          xcodebuild -project App/PadCB.xcodeproj \
+            -scheme PadCB \
+            -sdk iphoneos \
+            -configuration Release \
+            -derivedDataPath build/dd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Verify file-sharing keys in built app
+        run: |
+          PLIST="build/dd/Build/Products/Release-iphoneos/PadCB.app/Info.plist"
+          python3 - "$PLIST" <<'EOF'
+          import plistlib, sys
+          with open(sys.argv[1], "rb") as f:
+              p = plistlib.load(f)
+          for key in ("UIFileSharingEnabled", "LSSupportsOpeningDocumentsInPlace"):
+              assert p.get(key) is True, f"{key} is not true in the built app"
+              print(f"{key} = true")
+          print("bundle id:", p.get("CFBundleIdentifier"))
+          assert p.get("CFBundleIdentifier") == "com.user.padcb"
+          EOF
+
+      - name: Verify bundled symbol libraries in built app
+        run: |
+          APP_PATH="build/dd/Build/Products/Release-iphoneos/PadCB.app"
+          SRC=$(ls App/PadCB/Symbols/*.kicad_sym | wc -l | tr -d ' ')
+          DST=$(ls "$APP_PATH/Symbols"/*.kicad_sym | wc -l | tr -d ' ')
+          echo "symbols in project: $SRC ; in app bundle: $DST"
+          test "$SRC" = "$DST"
+          test -f "$APP_PATH/Symbols/KICAD-LIBRARIES-LICENSE.md"
+          du -sh "$APP_PATH"
+
+      - name: Package IPA
+        run: |
+          APP_PATH="build/dd/Build/Products/Release-iphoneos/PadCB.app"
+          test -d "$APP_PATH"
+          rm -rf Payload PadCB-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -qry PadCB-unsigned.ipa Payload
+          ls -lh PadCB-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: PadCB-unsigned
+          path: PadCB-unsigned.ipa
