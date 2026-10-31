@@ -54,6 +54,12 @@ enum KiCadGraphic {
                 strokeWidth: Double, strokeType: String, fill: String)
     case text(string: String, x: Double, y: Double, rotation: Double, size: Double,
               bold: Bool, italic: Bool, hJustify: String, vJustify: String)
+    /// (text_box ...): a bordered box spanning (x, y) -> (x + w, y + h)
+    /// (w/h are signed) with its text laid out inside.
+    case textBox(string: String, x: Double, y: Double, w: Double, h: Double,
+                 rotation: Double, size: Double, bold: Bool, italic: Bool,
+                 hJustify: String, vJustify: String,
+                 strokeWidth: Double, strokeType: String, fill: String)
 }
 
 struct KiCadUnitDef {
@@ -66,7 +72,9 @@ struct KiCadSymbolDef {
     var library: String
     /// Merged properties (child wins by name); order = child's first.
     var properties: [KiCadProperty]
-    /// Key = unit number (0 = common to all units). Style 1 only.
+    /// Key = unit number (0 = common to all units). Each unit merges its
+    /// body-style-0 (common to all body styles) and style-1 sub-symbols;
+    /// style 2 (De Morgan) is not merged.
     var units: [Int: KiCadUnitDef]
     /// Max unit key excluding 0; 1 when there are no numbered units.
     var unitCount: Int
@@ -260,7 +268,13 @@ private func unitAndStyle(ofSubSymbolName subName: String) -> (unit: Int, style:
 private func parseSubSymbol(_ node: SExpr, into raw: inout RawSymbol) {
     guard let subName = node.value(1),
           let (unit, style) = unitAndStyle(ofSubSymbolName: subName) else { return }
-    guard style == 1 else { return } // De Morgan (style 2) not used in part 1
+    // Body style 0 means "common to all body styles": KiCad draws the
+    // style-0 sub-symbol's items together with the active style's. Pins
+    // of multi-unit logic parts live there (e.g. 4538's pins are in
+    // 4538_<unit>_0 while its rectangles are in _<unit>_1) — dropping
+    // style 0 rendered 1,288 symbols pinless (part 1.2 census). Style 2
+    // (De Morgan alternate body) is still not used in part 1.
+    guard style == 0 || style == 1 else { return }
     var unitDef = KiCadUnitDef()
     for item in node.items {
         guard case .list(let children) = item,
@@ -407,7 +421,18 @@ private func strokeOf(_ node: SExpr) -> (width: Double, type: String) {
 }
 
 private func fillOf(_ node: SExpr) -> String {
-    node.child("fill")?.child("type")?.value(1) ?? "none"
+    guard let fill = node.child("fill"),
+          let type = fill.child("type")?.value(1) else { return "none" }
+    if type == "color", let color = fill.child("color") {
+        // (fill (type color) (color R G B A)) — R/G/B are 0-255, A is
+        // 0-1. Encoded into the token so KiCadGraphic's fill stays a
+        // single string; SymbolRenderer.fillColor decodes it. (Only
+        // Connector:DP_Sink / DP_Source use this in the 10.0.1 corpus.)
+        let r = color.double(1) ?? 0, g = color.double(2) ?? 0
+        let b = color.double(3) ?? 0, a = color.double(4) ?? 1
+        return "color=\(r),\(g),\(b),\(a)"
+    }
+    return type
 }
 
 /// The (x, y) pair of a point child such as (start x y) / (end x y).
@@ -458,9 +483,67 @@ private func parseGraphic(_ node: SExpr) -> KiCadGraphic? {
                        fill: fillOf(node))
     case "text":
         return parseTextGraphic(node)
+    case "text_box":
+        return parseTextBoxGraphic(node)
     default:
         return nil
     }
+}
+
+/// (text_box "s" (at x y rot) (size w h) (margins ...) (stroke ...)
+/// (fill ...) (effects (font ...) (justify ...))). The box spans from
+/// the at point by the SIGNED size (KiCad writes e.g. (size 7.62 -7.62)).
+private func parseTextBoxGraphic(_ node: SExpr) -> KiCadGraphic? {
+    guard let sizeNode = node.child("size"),
+          let w = sizeNode.double(1), let h = sizeNode.double(2) else { return nil }
+    let at = node.child("at")
+    var size = 1.27
+    var bold = false
+    var italic = false
+    var hJustify = "center"
+    var vJustify = "center"
+    if let effects = node.child("effects") {
+        if let font = effects.child("font") {
+            if let fontHeight = font.child("size")?.double(1) {
+                size = fontHeight
+            }
+            for item in font.items {
+                if case .atom(let atom) = item {
+                    if atom == "bold" { bold = true }
+                    if atom == "italic" { italic = true }
+                }
+            }
+            if let boldNode = font.child("bold") {
+                bold = (boldNode.value(1) ?? "yes") != "no"
+            }
+            if let italicNode = font.child("italic") {
+                italic = (italicNode.value(1) ?? "yes") != "no"
+            }
+        }
+        if let justify = effects.child("justify") {
+            for item in justify.items {
+                guard let atom = item.atomValue else { continue }
+                switch atom {
+                case "left", "right", "center":
+                    hJustify = atom
+                case "top", "bottom":
+                    vJustify = atom
+                default:
+                    break
+                }
+            }
+        }
+    }
+    let stroke = strokeOf(node)
+    return .textBox(string: node.value(1) ?? "",
+                    x: at?.double(1) ?? 0,
+                    y: at?.double(2) ?? 0,
+                    w: w, h: h,
+                    rotation: at?.double(3) ?? 0,
+                    size: size, bold: bold, italic: italic,
+                    hJustify: hJustify, vJustify: vJustify,
+                    strokeWidth: stroke.width, strokeType: stroke.type,
+                    fill: fillOf(node))
 }
 
 private func parseTextGraphic(_ node: SExpr) -> KiCadGraphic? {

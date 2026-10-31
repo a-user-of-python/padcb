@@ -109,6 +109,9 @@ enum SymbolRenderer {
                     let w = Double(string.count) * size * 0.6
                     include(CGRect(x: CGFloat(x - w / 2), y: CGFloat(y - size / 2),
                                    width: CGFloat(w), height: CGFloat(size)))
+                case .textBox(_, let x, let y, let w, let h, _, _, _, _, _, _, _, _, _):
+                    include(CGRect(x: CGFloat(min(x, x + w)), y: CGFloat(min(y, y + h)),
+                                   width: CGFloat(abs(w)), height: CGFloat(abs(h))))
                 }
             }
         }
@@ -211,6 +214,48 @@ enum SymbolRenderer {
                                    size: max(CGFloat(size) * scale, 6),
                                    color: outlineColor, angle: angle, anchor: anchor,
                                    bold: bold, italic: italic)
+
+                case .textBox(let string, let x, let y, let w, let h, let rotation, let size, let bold, let italic, let hJustify, _, let sw, let st, let f):
+                    var box = Path()
+                    box.move(to: lp(x, y))
+                    box.addLine(to: lp(x + w, y))
+                    box.addLine(to: lp(x + w, y + h))
+                    box.addLine(to: lp(x, y + h))
+                    box.closeSubpath()
+                    finish(&ctx, path: box, widthMM: sw, type: st, fill: f, scale: scale)
+                    // Text lines stacked inside the box, centred as a
+                    // block on the box centre; per-line horizontal
+                    // placement follows the box's justification.
+                    let lines = string
+                        .components(separatedBy: "\n")
+                        .flatMap { $0.components(separatedBy: "\\n") }
+                    if !lines.isEmpty {
+                        let rad = rotation * Double.pi / 180.0
+                        let dir = screenDir(cos(rad), sin(rad))
+                        let angle = atan2(Double(dir.y), Double(dir.x))
+                        let lineStep = size * 1.25
+                        let topY = max(y, y + h)
+                        for (index, line) in lines.enumerated() where !line.isEmpty {
+                            let lineCenterY = topY - (Double(index) + 0.5) * lineStep
+                            let anchorX: Double
+                            let anchor: UnitPoint
+                            switch hJustify {
+                            case "left":
+                                anchorX = min(x, x + w) + size * 0.4
+                                anchor = UnitPoint(x: 0, y: 0.5)
+                            case "right":
+                                anchorX = max(x, x + w) - size * 0.4
+                                anchor = UnitPoint(x: 1, y: 0.5)
+                            default:
+                                anchorX = x + w / 2
+                                anchor = UnitPoint(x: 0.5, y: 0.5)
+                            }
+                            KiCadText.draw(in: &ctx, line, at: lp(anchorX, lineCenterY),
+                                           size: max(CGFloat(size) * scale, 6),
+                                           color: outlineColor, angle: angle, anchor: anchor,
+                                           bold: bold, italic: italic)
+                        }
+                    }
                 }
             }
         }
@@ -331,8 +376,26 @@ enum SymbolRenderer {
     private static func fillColor(_ fill: String) -> Color {
         switch fill {
         case "background": return bodyFillColor
-        case "foreground": return outlineColor
-        default: return .clear
+        // KiCad's "outline" fill = filled with the symbol outline (pen)
+        // colour — 5,813 elements in the 10.0.1 corpus (solid arrowheads,
+        // logo shapes, filled dots). It fell through to .clear before
+        // part 1.2, so those shapes rendered hollow. "foreground" is
+        // the pre-10 spelling of the same thing.
+        case "foreground", "outline": return outlineColor
+        default:
+            // "color=R,G,B,A" token produced by KiCadSymbol.fillOf for
+            // (fill (type color) (color R G B A)): R/G/B are 0-255,
+            // A is 0-1.
+            if fill.hasPrefix("color=") {
+                let parts = fill.dropFirst("color=".count)
+                    .split(separator: ",")
+                    .compactMap { Double($0) }
+                if parts.count == 4 {
+                    return Color(red: parts[0] / 255, green: parts[1] / 255,
+                                 blue: parts[2] / 255, opacity: parts[3])
+                }
+            }
+            return .clear
         }
     }
 
