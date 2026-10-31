@@ -207,10 +207,10 @@ enum SymbolRenderer {
                     let angle = atan2(Double(dir.y), Double(dir.x))
                     let anchor = UnitPoint(x: hJustify == "left" ? 0 : (hJustify == "right" ? 1 : 0.5),
                                            y: vJustify == "top" ? 0 : (vJustify == "bottom" ? 1 : 0.5))
-                    drawText(&ctx, string, at: lp(x, y),
-                             size: max(CGFloat(size) * scale, 6),
-                             color: outlineColor, angle: angle, anchor: anchor,
-                             bold: bold, italic: italic)
+                    KiCadText.draw(in: &ctx, string, at: lp(x, y),
+                                   size: max(CGFloat(size) * scale, 6),
+                                   color: outlineColor, angle: angle, anchor: anchor,
+                                   bold: bold, italic: italic)
                 }
             }
         }
@@ -218,10 +218,14 @@ enum SymbolRenderer {
         // --- Pins ---
         for (pin, local) in pinLocalPoints(def: def, unit: unit) where !pin.hidden {
             let rad = pin.rotation * Double.pi / 180.0
-            let dirx = cos(rad), diry = sin(rad) // direction pin points, away from body
+            // dir points from the connection point toward the body: KiCad's
+            // parser maps the file angle to an orientation whose root (the
+            // body-side stub end, SCH_PIN::GetPinRoot()) lies at
+            // conn + dir * length in file (y-UP) coordinates.
+            let dirx = cos(rad), diry = sin(rad)
             let conn = local
-            let inner = CGPoint(x: conn.x - CGFloat(dirx * pin.length),
-                                y: conn.y - CGFloat(diry * pin.length)) // body-side stub end (local)
+            let inner = CGPoint(x: conn.x + CGFloat(dirx * pin.length),
+                                y: conn.y + CGFloat(diry * pin.length)) // body-side stub end (local)
 
             // Stub: connection point toward the body.
             if pin.length > 0 {
@@ -240,8 +244,9 @@ enum SymbolRenderer {
             }
             switch pin.shape {
             case .inverted, .invertedClock:
-                // Bubble just inside the body, tangent to the stub end.
-                let center = localPt(inner, -bubbleRadius, 0)
+                // Bubble just inside the body, tangent to the stub end:
+                // its centre lies one radius beyond the root, along +dir.
+                let center = localPt(inner, bubbleRadius, 0)
                 let c = map(center)
                 let rp = CGFloat(bubbleRadius) * scale
                 let circle = Path(ellipseIn: CGRect(x: c.x - rp, y: c.y - rp, width: 2 * rp, height: 2 * rp))
@@ -249,30 +254,45 @@ enum SymbolRenderer {
                 ctx.stroke(circle, with: .color(outlineColor),
                            style: strokeStyle(widthMM: 0, type: "solid", scale: scale, minPoints: 0.75))
                 if pin.shape == .invertedClock {
-                    drawClockWedge(&ctx, tipBase: localPt(inner, -2 * bubbleRadius, 0),
+                    // Clock wedge beyond the bubble, further along +dir.
+                    drawClockWedge(&ctx, tipBase: localPt(inner, 2 * bubbleRadius, 0),
                                    dirx: dirx, diry: diry, localPt: localPt, map: map, scale: scale)
                 }
             case .clock, .clockLow, .edgeClockHigh:
                 drawClockWedge(&ctx, tipBase: inner, dirx: dirx, diry: diry,
                                localPt: localPt, map: map, scale: scale)
             case .nonLogic:
-                // Small x at the connection point.
+                // Small x centred at the root (inner stub end).
                 let d = 0.3
                 var xPath = Path()
-                xPath.move(to: map(localPt(conn, -d, -d)))
-                xPath.addLine(to: map(localPt(conn, d, d)))
-                xPath.move(to: map(localPt(conn, -d, d)))
-                xPath.addLine(to: map(localPt(conn, d, -d)))
+                xPath.move(to: map(localPt(inner, -d, -d)))
+                xPath.addLine(to: map(localPt(inner, d, d)))
+                xPath.move(to: map(localPt(inner, -d, d)))
+                xPath.addLine(to: map(localPt(inner, d, -d)))
                 ctx.stroke(xPath, with: .color(outlineColor),
                            style: strokeStyle(widthMM: 0, type: "solid", scale: scale, minPoints: 0.75))
             default:
                 break // line / input_low / output_low etc: plain stub
             }
 
+            // No-connect pins carry a small x at the CONNECTION point
+            // (KiCad's PT_NC branch draws the cross at the pin position,
+            // independently of the pin's shape glyph above).
+            if pin.type == .noConnect {
+                let d = 0.3
+                var ncPath = Path()
+                ncPath.move(to: map(localPt(conn, -d, -d)))
+                ncPath.addLine(to: map(localPt(conn, d, d)))
+                ncPath.move(to: map(localPt(conn, -d, d)))
+                ncPath.addLine(to: map(localPt(conn, d, -d)))
+                ctx.stroke(ncPath, with: .color(outlineColor),
+                           style: strokeStyle(widthMM: 0, type: "solid", scale: scale, minPoints: 0.75))
+            }
+
             // Pin number: near the stub, offset perpendicular from its middle.
             if showPinNumbers && !pin.number.isEmpty {
-                let midLocal = CGPoint(x: conn.x - CGFloat(dirx * pin.length / 2),
-                                       y: conn.y - CGFloat(diry * pin.length / 2))
+                let midLocal = CGPoint(x: conn.x + CGFloat(dirx * pin.length / 2),
+                                       y: conn.y + CGFloat(diry * pin.length / 2))
                 let off = pin.numberSize * 0.8 + 0.1
                 let posLocal = CGPoint(x: midLocal.x + CGFloat(-diry * off),
                                        y: midLocal.y + CGFloat(dirx * off))
@@ -287,21 +307,21 @@ enum SymbolRenderer {
             }
 
             // Pin name: inside the body, starting pinNameOffset beyond the
-            // inner stub end, extending along -dir (into the body).
+            // inner stub end, extending along +dir (into the body).
             if showPinNames && !pin.name.isEmpty && pin.name != "~" {
-                let anchorLocal = CGPoint(x: inner.x - CGFloat(dirx * def.pinNameOffset),
-                                          y: inner.y - CGFloat(diry * def.pinNameOffset))
-                let inward = screenDir(-dirx, -diry)
+                let anchorLocal = CGPoint(x: inner.x + CGFloat(dirx * def.pinNameOffset),
+                                          y: inner.y + CGFloat(diry * def.pinNameOffset))
+                let inward = screenDir(dirx, diry)
                 var angle = atan2(Double(inward.y), Double(inward.x))
                 var anchor: UnitPoint = .leading
                 if cos(angle) < 0 { // text would run right-to-left; flip so it reads into the body
                     angle += Double.pi
                     anchor = .trailing
                 }
-                drawText(&ctx, pin.name, at: map(anchorLocal),
-                         size: max(CGFloat(pin.nameSize) * scale, 6),
-                         color: pinNameColor, angle: angle, anchor: anchor,
-                         bold: false, italic: false)
+                KiCadText.draw(in: &ctx, pin.name, at: map(anchorLocal),
+                               size: max(CGFloat(pin.nameSize) * scale, 6),
+                               color: pinNameColor, angle: angle, anchor: anchor,
+                               bold: false, italic: false)
             }
         }
     }
@@ -345,14 +365,16 @@ enum SymbolRenderer {
         }
     }
 
-    /// Small open triangle at a pin's inner end (clock edge marker).
+    /// Small open triangle at a pin's inner end (clock edge marker):
+    /// base corners at tipBase ± perp * 0.3, apex at tipBase + dir * 0.6
+    /// (pointing into the body, along +dir).
     private static func drawClockWedge(_ ctx: inout GraphicsContext, tipBase: CGPoint,
                                        dirx: Double, diry: Double,
                                        localPt: (CGPoint, Double, Double) -> CGPoint,
                                        map: (CGPoint) -> CGPoint, scale: CGFloat) {
         var path = Path()
         path.move(to: map(localPt(tipBase, 0, 0.3)))
-        path.addLine(to: map(localPt(tipBase, -0.6, 0)))
+        path.addLine(to: map(localPt(tipBase, 0.6, 0)))
         path.addLine(to: map(localPt(tipBase, 0, -0.3)))
         ctx.stroke(path, with: .color(outlineColor),
                    style: strokeStyle(widthMM: 0, type: "solid", scale: scale, minPoints: 0.75))
@@ -407,5 +429,195 @@ enum SymbolRenderer {
             path.addLine(to: CGPoint(x: cx + r * CGFloat(cos(t)), y: cy + r * CGFloat(sin(t))))
         }
         return path
+    }
+}
+
+// MARK: - KiCad text markup
+
+/// KiCad text markup (see KiCad's markup_parser grammar): `_{...}` is a
+/// subscript, `^{...}` a superscript and `~{...}` an overbar. Braced
+/// content may itself contain markup, and the flags combine under
+/// nesting. A lone `{identifier}` is an escape sequence and renders as
+/// the bare identifier. Unmatched braces degrade gracefully to literal
+/// text. This is an original implementation of those semantics, used for
+/// pin names (e.g. `IN_{BIAS}`, `V_{SO+}`) and graphic text elements.
+enum KiCadText {
+    struct Run: Equatable { var text: String; var sub: Bool = false; var sup: Bool = false; var overbar: Bool = false }
+
+    // MARK: Parsing
+
+    static func runs(_ string: String) -> [Run] {
+        var parser = Parser(chars: Array(string))
+        return parser.parseTopLevel()
+    }
+
+    /// The visible text with all markup removed (escape sequences kept).
+    static func plain(_ string: String) -> String {
+        runs(string).map { $0.text }.joined()
+    }
+
+    /// Approximate rendered width: 0.55 * size per character at full
+    /// size, with a 0.7 factor for subscript / superscript runs. For
+    /// bounds estimation only — `draw` measures the real glyphs.
+    static func estimatedWidth(_ string: String, size: CGFloat) -> CGFloat {
+        runs(string).reduce(CGFloat(0)) { sum, run in
+            let factor: CGFloat = (run.sub || run.sup) ? 0.7 : 1.0
+            return sum + CGFloat(run.text.count) * size * 0.55 * factor
+        }
+    }
+
+    // MARK: Drawing
+
+    /// Lays the parsed runs left-to-right along a baseline through `pt`,
+    /// rotated by `angle` (radians, screen space). Subscript /
+    /// superscript runs are drawn at 0.7x size with the baseline shifted
+    /// down / up by 0.28 * size in the text's local frame (+y is
+    /// down-screen after rotation). Overbar runs get a thin line above
+    /// their glyphs. Horizontally the anchor picks where `pt` sits
+    /// (.leading = start, .center = middle, .trailing = end); the runs
+    /// are centred vertically on `pt` for the usual .leading / .center /
+    /// .trailing anchors (anchor.y is honoured, so top / bottom
+    /// justified graphic text keeps its justification).
+    static func draw(in ctx: inout GraphicsContext, _ string: String, at pt: CGPoint,
+                     size: CGFloat, color: Color, angle: Double, anchor: UnitPoint,
+                     bold: Bool, italic: Bool) {
+        let parsed = runs(string)
+        guard !parsed.isEmpty else { return }
+
+        // Resolve and measure every run up front so the anchor can be
+        // honoured against the true total width.
+        var resolved: [GraphicsContext.ResolvedText] = []
+        var widths: [CGFloat] = []
+        var heights: [CGFloat] = []
+        for run in parsed {
+            let runSize = size * ((run.sub || run.sup) ? 0.7 : 1.0)
+            var text = Text(run.text)
+                .font(.system(size: runSize, weight: bold ? .bold : .regular))
+                .foregroundColor(color)
+            if italic { text = text.italic() }
+            let item = ctx.resolve(text)
+            let measured = item.measure(in: CGSize(width: 10000, height: 10000))
+            resolved.append(item)
+            widths.append(measured.width)
+            heights.append(measured.height)
+        }
+        let totalWidth = widths.reduce(CGFloat(0), +)
+
+        var c = ctx
+        c.translateBy(x: pt.x, y: pt.y)
+        if angle != 0 { c.rotate(by: .radians(angle)) }
+
+        var x = -anchor.x * totalWidth
+        for index in parsed.indices {
+            let run = parsed[index]
+            var dy: CGFloat = 0
+            if run.sub { dy += size * 0.28 }
+            if run.sup { dy -= size * 0.28 }
+            c.draw(resolved[index], at: CGPoint(x: x, y: dy),
+                   anchor: UnitPoint(x: 0, y: anchor.y))
+            if run.overbar {
+                let top = dy - anchor.y * heights[index]
+                let lineY = top - max(size * 0.08, 1)
+                var line = Path()
+                line.move(to: CGPoint(x: x, y: lineY))
+                line.addLine(to: CGPoint(x: x + widths[index], y: lineY))
+                c.stroke(line, with: .color(color),
+                         style: StrokeStyle(lineWidth: max(size * 0.06, 0.75)))
+            }
+            x += widths[index]
+        }
+    }
+
+    // MARK: Parser
+
+    /// Recursive-descent parser over the markup grammar. Adjacent
+    /// characters sharing the same flags are coalesced into one run.
+    private struct Parser {
+        var chars: [Character]
+        var pos: Int = 0
+
+        mutating func parseTopLevel() -> [Run] {
+            parseSequence(sub: false, sup: false, overbar: false, insideBraces: false).runs
+        }
+
+        private mutating func append(_ text: String, to runs: inout [Run],
+                                     sub: Bool, sup: Bool, overbar: Bool) {
+            guard !text.isEmpty else { return }
+            if let last = runs.last, last.sub == sub, last.sup == sup, last.overbar == overbar {
+                runs[runs.count - 1].text += text
+            } else {
+                runs.append(Run(text: text, sub: sub, sup: sup, overbar: overbar))
+            }
+        }
+
+        /// Parses until the end of input or — when `insideBraces` — the
+        /// matching closing brace (which is consumed). `closed` reports
+        /// whether that closing brace was found.
+        private mutating func parseSequence(sub: Bool, sup: Bool, overbar: Bool,
+                                            insideBraces: Bool) -> (runs: [Run], closed: Bool) {
+            var out: [Run] = []
+            while pos < chars.count {
+                let ch = chars[pos]
+                if insideBraces && ch == "}" {
+                    pos += 1
+                    return (out, true)
+                }
+                if (ch == "_" || ch == "^" || ch == "~"),
+                   pos + 1 < chars.count, chars[pos + 1] == "{" {
+                    // Markup opener: parse the braced content with the
+                    // extra flag set. If its brace never closes, fall
+                    // back to treating the opener as literal text.
+                    let saved = pos
+                    pos += 2
+                    let inner = parseSequence(sub: sub || ch == "_",
+                                              sup: sup || ch == "^",
+                                              overbar: overbar || ch == "~",
+                                              insideBraces: true)
+                    if inner.closed {
+                        for run in inner.runs {
+                            append(run.text, to: &out, sub: run.sub, sup: run.sup, overbar: run.overbar)
+                        }
+                    } else {
+                        pos = saved + 2
+                        append(String(ch) + "{", to: &out, sub: sub, sup: sup, overbar: overbar)
+                    }
+                    continue
+                }
+                if ch == "{" {
+                    // Escape sequence {identifier}: renders as the bare
+                    // identifier. Any other lone "{" is literal text.
+                    if let escape = scanEscape(from: pos) {
+                        append(escape.text, to: &out, sub: sub, sup: sup, overbar: overbar)
+                        pos = escape.end
+                    } else {
+                        append("{", to: &out, sub: sub, sup: sup, overbar: overbar)
+                        pos += 1
+                    }
+                    continue
+                }
+                append(String(ch), to: &out, sub: sub, sup: sup, overbar: overbar)
+                pos += 1
+            }
+            return (out, false)
+        }
+
+        /// If `chars[open]` opens a `{identifier}` escape, returns the
+        /// identifier and the index just past the closing brace.
+        private func scanEscape(from open: Int) -> (text: String, end: Int)? {
+            var i = open + 1
+            guard i < chars.count, isIdentifierStart(chars[i]) else { return nil }
+            let start = i
+            while i < chars.count, isIdentifierContinue(chars[i]) { i += 1 }
+            guard i < chars.count, chars[i] == "}" else { return nil }
+            return (String(chars[start..<i]), i + 1)
+        }
+
+        private func isIdentifierStart(_ ch: Character) -> Bool {
+            ch.isLetter || ch == "_"
+        }
+
+        private func isIdentifierContinue(_ ch: Character) -> Bool {
+            ch.isLetter || ch.isNumber || ch == "_"
+        }
     }
 }

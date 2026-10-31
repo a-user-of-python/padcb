@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 // MARK: - Canvas view state (owned by the editor, driven by toolbar buttons)
 
@@ -94,7 +95,19 @@ struct SchematicCanvasView: View {
     @State private var dragStartOrigin: DPoint = .zero
     @State private var dragPinPoints: [DPoint] = []
     @State private var dragOrigin: DPoint? // live snapped origin while moving a symbol
-    @State private var pinchBase: CGFloat?
+
+    // Two-finger session (pinch zoom + two-finger pan, UIKit bridge):
+    // scale at session start and the world point that was under the touch
+    // centroid at session start. The centroid anchor invariant is that this
+    // world point stays under the (moving) centroid for the whole session.
+    @State private var twoFingerStartScale: CGFloat?
+    @State private var twoFingerAnchorWorld: DPoint?
+
+    // Wire drag (Wire tool, one finger, movement >= 5 pt): the snapped start
+    // point captured when the drag began, and whether the drag has crossed
+    // the movement threshold and is building a wire.
+    @State private var wireDragStart: DPoint?
+    @State private var wireDragActive = false
 
     // Wire-in-progress
     @State private var wirePoints: [DPoint] = []
@@ -225,8 +238,7 @@ struct SchematicCanvasView: View {
             }
             .background(Color.white)
             .contentShape(Rectangle())
-            .gesture(dragGesture)
-            .simultaneousGesture(magnificationGesture)
+            .overlay(CanvasGestureOverlay(handlers: gestureHandlers))
             .onContinuousHover { phase in
                 switch phase {
                 case .active(let location):
@@ -262,6 +274,8 @@ struct SchematicCanvasView: View {
                 wirePoints = []
                 wirePointer = nil
                 lastWireTap = nil
+                wireDragStart = nil
+                wireDragActive = false
             }
             .onChange(of: pendingSymbol?.name) { _, _ in
                 ghostRotation = 0
@@ -288,78 +302,169 @@ struct SchematicCanvasView: View {
         }
     }
 
-    // MARK: Gestures
+    // MARK: Gestures (fed by the UIKit bridge at the bottom of this file)
 
-    private var dragGesture: some Gesture {
-        DragGesture(minimumDistance: 0, coordinateSpace: .local)
-            .onChanged { v in handleDragChanged(v) }
-            .onEnded { v in handleDragEnded(v) }
-    }
-
-    private var magnificationGesture: some Gesture {
-        MagnificationGesture()
-            .onChanged { value in
-                if pinchBase == nil { pinchBase = canvasState.scale }
-                let base = pinchBase ?? canvasState.scale
-                canvasState.scale = min(max(base * value, CanvasViewState.minScale), CanvasViewState.maxScale)
-            }
-            .onEnded { _ in pinchBase = nil }
-    }
-
-    private func handleDragChanged(_ v: DragGesture.Value) {
-        if !focused { focused = true }
-        let w = world(v.location)
-        canvasState.cursorWorld = w
-
-        if dragKind == .none {
-            switch tool {
-            case .select:
-                if let hit = symbolAt(world(v.startLocation), defs: defsByID) {
-                    dragKind = .moveSymbol
-                    dragSymbolID = hit.id
-                    selection = hit.id
-                    dragStartOrigin = hit.origin
-                    dragOrigin = hit.origin
-                    dragPinPoints = pinPoints(of: hit)
-                } else {
-                    dragKind = .pan
-                    dragStartOffset = canvasState.offset
-                }
-            default:
-                dragKind = .track
+    /// Handler set handed to the gesture overlay. Rebuilt on every body
+    /// pass and pushed into the coordinator by `updateUIView`, so the
+    /// recognizers always call the current view value's logic.
+    private var gestureHandlers: CanvasGestureCoordinator.Handlers {
+        var h = CanvasGestureCoordinator.Handlers()
+        h.panBegan = { location, startLocation in
+            self.handlePanBegan(location: location, startLocation: startLocation)
+        }
+        h.panChanged = { location, translation in
+            self.handlePanChanged(location: location, translation: translation)
+        }
+        h.panEnded = { location, translation, cancelled in
+            self.handlePanEnded(location: location, translation: translation, cancelled: cancelled)
+        }
+        h.tap = { location in
+            if !self.focused { self.focused = true }
+            self.canvasState.cursorWorld = self.world(location)
+            self.handleTap(at: location)
+        }
+        h.twoFingerBegan = { centroid in self.handleTwoFingerBegan(centroid: centroid) }
+        h.twoFingerChanged = { centroid, pinchScale in
+            self.handleTwoFingerChanged(centroid: centroid, pinchScale: pinchScale)
+        }
+        h.twoFingerEnded = { self.handleTwoFingerEnded() }
+        h.hover = { location in
+            if let location {
+                self.canvasState.cursorWorld = self.world(location)
+            } else {
+                self.canvasState.cursorWorld = nil
             }
         }
+        return h
+    }
+
+    // MARK: One-finger pan (symbol move / canvas pan / tracking / wire drag)
+
+    private func handlePanBegan(location: CGPoint, startLocation: CGPoint) {
+        if !focused { focused = true }
+        canvasState.cursorWorld = world(location)
+        guard dragKind == .none else { return }
+        switch tool {
+        case .select:
+            if let hit = symbolAt(world(startLocation), defs: defsByID) {
+                dragKind = .moveSymbol
+                dragSymbolID = hit.id
+                selection = hit.id
+                dragStartOrigin = hit.origin
+                dragOrigin = hit.origin
+                dragPinPoints = pinPoints(of: hit)
+            } else {
+                dragKind = .pan
+                dragStartOffset = canvasState.offset
+            }
+        case .wire:
+            dragKind = .track
+            // The wire drag (if this pan turns into one) builds from the
+            // pin snap / grid snap of where the finger landed.
+            let startWorld = world(startLocation)
+            wireDragStart = nearestPin(to: startWorld, defs: defsByID)?.point ?? snap(startWorld)
+            wireDragActive = false
+        default:
+            dragKind = .track
+        }
+    }
+
+    private func handlePanChanged(location: CGPoint, translation: CGPoint) {
+        let w = world(location)
+        canvasState.cursorWorld = w
 
         switch dragKind {
         case .pan:
-            canvasState.offset = CGPoint(x: dragStartOffset.x + v.translation.width,
-                                       y: dragStartOffset.y + v.translation.height)
+            canvasState.offset = CGPoint(x: dragStartOffset.x + translation.width,
+                                       y: dragStartOffset.y + translation.height)
         case .moveSymbol:
-            let dw = DPoint(x: Double(v.translation.width) / scaleD,
-                            y: -Double(v.translation.height) / scaleD)
+            let dw = DPoint(x: Double(translation.width) / scaleD,
+                            y: -Double(translation.height) / scaleD)
             dragOrigin = snap(dragStartOrigin + dw)
         case .track:
             if tool == .wire {
-                wirePointer = nearestPin(to: w, defs: defsByID)?.point ?? snap(w)
+                let target = nearestPin(to: w, defs: defsByID)?.point ?? snap(w)
+                if wireDragActive {
+                    updateWireDrag(to: target)
+                } else if hypot(translation.width, translation.height) >= 5,
+                          let start = wireDragStart {
+                    // Threshold crossed: this pan is a wire drag. Seed it
+                    // from the captured start point (continuing any
+                    // tap-tap wire already in progress via the L-route).
+                    wireDragActive = true
+                    if wirePoints.isEmpty {
+                        wirePoints = [start]
+                    } else {
+                        appendRouted(to: start)
+                    }
+                    updateWireDrag(to: target)
+                } else {
+                    wirePointer = target
+                }
             }
         case .none:
             break
         }
     }
 
-    private func handleDragEnded(_ v: DragGesture.Value) {
-        let dist = hypot(v.translation.width, v.translation.height)
-        canvasState.cursorWorld = world(v.location)
-        if dist < 5 {
-            handleTap(at: v.location)
+    private func handlePanEnded(location: CGPoint, translation: CGPoint, cancelled: Bool) {
+        let dist = hypot(translation.width, translation.height)
+        canvasState.cursorWorld = world(location)
+        if wireDragActive {
+            // A finished wire drag commits through the normal finishWire
+            // path — including when a second finger cancelled the pan to
+            // start a pinch ("commit as if lifted").
+            finishWireDrag(at: location)
+        } else if !cancelled && dist < 5 {
+            // Preserves the old DragGesture split: sub-5 pt = tap. A
+            // cancelled pan never synthesises a tap (the tap recognizer
+            // covers genuine taps the pan never picked up), so starting a
+            // pinch cannot also place/select/delete under the first finger.
+            handleTap(at: location)
         } else if dragKind == .moveSymbol, let id = dragSymbolID,
                   let target = dragOrigin, target != dragStartOrigin {
             document.moveSymbol(id: id, to: target, pinPointsBefore: dragPinPoints)
         }
+        resetDrag()
+    }
+
+    private func resetDrag() {
         dragKind = .none
         dragSymbolID = nil
         dragOrigin = nil
         dragPinPoints = []
+        wireDragStart = nil
+        wireDragActive = false
+    }
+
+    // MARK: Two-finger session (pinch zoom anchored at the centroid + pan)
+
+    private func handleTwoFingerBegan(centroid: CGPoint) {
+        guard twoFingerStartScale == nil else { return }
+        twoFingerStartScale = canvasState.scale
+        twoFingerAnchorWorld = world(centroid)
+        canvasState.cursorWorld = twoFingerAnchorWorld
+    }
+
+    private func handleTwoFingerChanged(centroid: CGPoint, pinchScale: CGFloat) {
+        if twoFingerStartScale == nil { handleTwoFingerBegan(centroid: centroid) }
+        guard let startScale = twoFingerStartScale,
+              let anchor = twoFingerAnchorWorld else { return }
+        let newScale = min(max(startScale * pinchScale, CanvasViewState.minScale),
+                           CanvasViewState.maxScale)
+        canvasState.scale = newScale
+        // Anchor invariant: screen(anchor) == centroid, i.e.
+        // offset = (centroid.x - anchor.x * scale, centroid.y + anchor.y * scale).
+        // Because the CURRENT centroid is used, two-finger translation
+        // (pan) is folded into the same adjustment — the world point under
+        // the fingers at session start stays under the fingers throughout.
+        canvasState.offset = CGPoint(x: centroid.x - CGFloat(anchor.x) * newScale,
+                                     y: centroid.y + CGFloat(anchor.y) * newScale)
+    }
+
+    private func handleTwoFingerEnded() {
+        twoFingerStartScale = nil
+        twoFingerAnchorWorld = nil
     }
 
     // MARK: Tap handling per tool
@@ -431,6 +536,42 @@ struct SchematicCanvasView: View {
         }
         pts.append(to)
         return pts
+    }
+
+    /// Live update for a wire drag: the endpoint follows the (pin/grid
+    /// snapped) finger position, and the routed preview's corner is
+    /// committed into `wirePoints` once the finger has moved at least one
+    /// grid step past it along the new axis — so one drag can lay down a
+    /// multi-bend wire, KiCad-style.
+    private func updateWireDrag(to target: DPoint) {
+        wirePointer = target
+        guard let last = wirePoints.last else { return }
+        let preview = routedPreview(to: target)
+        // A preview exactly 2 points longer than wirePoints is
+        // [.., corner, target]: the corner is the candidate to commit.
+        guard preview.count == wirePoints.count + 2 else { return }
+        let corner = preview[wirePoints.count]
+        guard corner != last, corner != target else { return }
+        // Distance travelled along the post-corner segment (pure H or V).
+        let along = max(abs(target.x - corner.x), abs(target.y - corner.y))
+        if along >= Self.grid - 1e-9 {
+            wirePoints.append(corner)
+        }
+    }
+
+    /// Release of a wire drag: route to the release point (pin snap wins,
+    /// so a wire released on a pin ends exactly on it) and commit through
+    /// the existing finishWire machinery (cleaning + endpoint
+    /// auto-junctions).
+    private func finishWireDrag(at location: CGPoint) {
+        let w = world(location)
+        let end = nearestPin(to: w, defs: defsByID)?.point ?? snap(w)
+        updateWireDrag(to: end)
+        appendRouted(to: end)
+        wireDragActive = false
+        wireDragStart = nil
+        lastWireTap = nil
+        finishWire()
     }
 
     private func wireTap(at w: DPoint) {
@@ -549,6 +690,8 @@ struct SchematicCanvasView: View {
             wirePoints = []
             wirePointer = nil
             lastWireTap = nil
+            wireDragStart = nil
+            wireDragActive = false
         } else if tool == .placeSymbol || tool == .placePower {
             tool = .select
             onConsumePlacementDone()
@@ -630,14 +773,13 @@ extension SchematicCanvasView {
                      with: .color(Self.wireColor))
         }
 
-        // Labels
+        // Labels (KiCad label texts support _{...} markup -> KiCadText)
         for l in document.state.labels {
             let sizePt = max(CGFloat(1.27 * scaleD), 9)
-            let text = Text(l.text).font(.system(size: sizePt)).foregroundColor(Self.labelColor)
-            var c = ctx
             let pt = screen(l.at)
-            c.translateBy(x: pt.x, y: pt.y - 2)
-            c.draw(text, at: .zero, anchor: UnitPoint(x: 0, y: 1))
+            KiCadText.draw(in: &ctx, l.text, at: CGPoint(x: pt.x, y: pt.y - 2),
+                           size: sizePt, color: Self.labelColor, angle: 0,
+                           anchor: UnitPoint(x: 0, y: 1), bold: false, italic: false)
         }
 
         // Symbols + property texts
@@ -743,29 +885,19 @@ extension SchematicCanvasView {
                 let wp = SymbolRenderer.transformPoint(DPoint(x: prop.x, y: prop.y), placed: placed)
                 let sizePt = max(CGFloat(prop.fontSize * scaleD), 8)
                 let angle = -(Double(placed.rotation) + prop.rotation) * Double.pi / 180.0
-                drawRotatedText(&ctx, entry.text, at: screen(wp), size: sizePt,
-                                color: entry.color, angle: angle)
+                KiCadText.draw(in: &ctx, entry.text, at: screen(wp), size: sizePt,
+                               color: entry.color, angle: angle, anchor: .center,
+                               bold: false, italic: false)
             } else {
                 let yOffset = 3.4 - Double(fallbackSlot) * 1.9
                 fallbackSlot += 1
                 let wp = DPoint(x: Double(bounds.minX), y: Double(bounds.maxY) + yOffset)
                 let sizePt = max(CGFloat(1.27 * scaleD), 8)
-                var c = ctx
-                let pt = screen(wp)
-                c.translateBy(x: pt.x, y: pt.y)
-                c.draw(Text(entry.text).font(.system(size: sizePt)).foregroundColor(entry.color),
-                       at: .zero, anchor: UnitPoint(x: 0, y: 1))
+                KiCadText.draw(in: &ctx, entry.text, at: screen(wp), size: sizePt,
+                               color: entry.color, angle: 0,
+                               anchor: UnitPoint(x: 0, y: 1), bold: false, italic: false)
             }
         }
-    }
-
-    private func drawRotatedText(_ ctx: inout GraphicsContext, _ string: String, at pt: CGPoint,
-                                 size: CGFloat, color: Color, angle: Double) {
-        var c = ctx
-        c.translateBy(x: pt.x, y: pt.y)
-        if angle != 0 { c.rotate(by: .radians(angle)) }
-        c.draw(Text(string).font(.system(size: size)).foregroundColor(color),
-               at: .zero, anchor: .center)
     }
 
     private func drawMissingDefPlaceholder(_ ctx: inout GraphicsContext, placed: PlacedSymbol) {
@@ -805,5 +937,214 @@ extension SchematicCanvasView {
                 }
             }
         }
+    }
+}
+
+// MARK: - UIKit gesture bridge
+//
+// A transparent UIView overlay carrying the real recognizers. It replaces
+// the old SwiftUI DragGesture + MagnificationGesture combo (whose pinch
+// zoomed about the canvas centre with no anchor, hence "very sketchy"):
+//   - UIPinchGestureRecognizer: zoom anchored at the touch centroid.
+//   - UIPanGestureRecognizer (2 touches): two-finger pan, simultaneous
+//     with the pinch; both feed ONE two-finger session in the view, whose
+//     anchor math (world point under the centroid stays under the
+//     centroid) folds pan and zoom into a single offset/scale update, so
+//     the two recognizers can never double-apply a translation.
+//   - UIPanGestureRecognizer (1 touch): the existing one-finger logic
+//     (symbol move / canvas pan / tracking / wire drag). It is NOT
+//     simultaneous with pinch/pan2, so when a second finger lands and the
+//     pinch begins, UIKit cancels this pan and the view commits the drag
+//     through its normal end path first.
+//   - UITapGestureRecognizer: taps the one-finger pan never picked up
+//     (touch released before the pan began). It is required to fail the
+//     one-finger pan, so a touch is delivered exactly once: pan-ended
+//     (< 5 pt -> tap split in the view) XOR tap recognizer.
+//   - UIHoverGestureRecognizer: mouse/trackpad hover, forwarded to the
+//     same cursorWorld tracking as SwiftUI's onContinuousHover (which
+//     stays attached as well). A mouse/trackpad "touch" is a single
+//     touch, so pointer drags ride the one-finger pan path.
+
+final class CanvasGestureCoordinator: NSObject, UIGestureRecognizerDelegate {
+    struct Handlers {
+        /// (location, startLocation) — startLocation = location - translation.
+        var panBegan: (CGPoint, CGPoint) -> Void = { _, _ in }
+        /// (location, translation)
+        var panChanged: (CGPoint, CGPoint) -> Void = { _, _ in }
+        /// (location, translation, cancelled)
+        var panEnded: (CGPoint, CGPoint, Bool) -> Void = { _, _, _ in }
+        var tap: (CGPoint) -> Void = { _ in }
+        /// (centroid)
+        var twoFingerBegan: (CGPoint) -> Void = { _ in }
+        /// (centroid, cumulative pinch scale from session start)
+        var twoFingerChanged: (CGPoint, CGFloat) -> Void = { _, _ in }
+        var twoFingerEnded: () -> Void = {}
+        /// (location, or nil when the pointer leaves)
+        var hover: (CGPoint?) -> Void = { _ in }
+    }
+
+    var handlers = Handlers()
+
+    private weak var pinchGesture: UIPinchGestureRecognizer?
+    private weak var twoFingerPanGesture: UIPanGestureRecognizer?
+
+    fileprivate func register(pinch: UIPinchGestureRecognizer, twoFingerPan: UIPanGestureRecognizer) {
+        pinchGesture = pinch
+        twoFingerPanGesture = twoFingerPan
+    }
+
+    /// The pinch recognizer's live cumulative scale while it is tracking,
+    /// else 1 (a pure two-finger pan leaves the scale alone).
+    private var currentPinchScale: CGFloat {
+        guard let pinch = pinchGesture,
+              pinch.state == .began || pinch.state == .changed else { return 1 }
+        return pinch.scale
+    }
+
+    // MARK: Recognizer actions
+
+    @objc func handleOneFingerPan(_ g: UIPanGestureRecognizer) {
+        guard let view = g.view else { return }
+        let location = g.location(in: view)
+        let translation = g.translation(in: view)
+        let startLocation = CGPoint(x: location.x - translation.x,
+                                    y: location.y - translation.y)
+        switch g.state {
+        case .began:
+            handlers.panBegan(location, startLocation)
+        case .changed:
+            handlers.panChanged(location, translation)
+        case .ended:
+            handlers.panEnded(location, translation, false)
+        case .cancelled, .failed:
+            handlers.panEnded(location, translation, true)
+        default:
+            break
+        }
+    }
+
+    @objc func handleTap(_ g: UITapGestureRecognizer) {
+        guard g.state == .recognized, let view = g.view else { return }
+        handlers.tap(g.location(in: view))
+    }
+
+    @objc func handlePinch(_ g: UIPinchGestureRecognizer) {
+        guard let view = g.view else { return }
+        let centroid = g.location(in: view)
+        switch g.state {
+        case .began:
+            handlers.twoFingerBegan(centroid)
+        case .changed:
+            handlers.twoFingerChanged(centroid, g.scale)
+        case .ended, .cancelled, .failed:
+            handlers.twoFingerEnded()
+        default:
+            break
+        }
+    }
+
+    @objc func handleTwoFingerPan(_ g: UIPanGestureRecognizer) {
+        guard let view = g.view else { return }
+        let centroid = g.location(in: view)
+        switch g.state {
+        case .began:
+            handlers.twoFingerBegan(centroid)
+        case .changed:
+            handlers.twoFingerChanged(centroid, currentPinchScale)
+        case .ended, .cancelled, .failed:
+            // If the pinch is still tracking it owns the session end;
+            // otherwise the session is over. (Idempotent in the view:
+            // when both recognizers end together both may call it.)
+            let pinchState = pinchGesture?.state
+            if pinchState != .began && pinchState != .changed {
+                handlers.twoFingerEnded()
+            }
+        default:
+            break
+        }
+    }
+
+    @objc func handleHover(_ g: UIHoverGestureRecognizer) {
+        guard let view = g.view else { return }
+        switch g.state {
+        case .began, .changed:
+            handlers.hover(g.location(in: view))
+        case .ended, .cancelled, .failed:
+            handlers.hover(nil)
+        default:
+            break
+        }
+    }
+
+    // MARK: UIGestureRecognizerDelegate
+
+    /// Only pinch + two-finger pan run simultaneously (they feed one
+    /// shared session). The one-finger pan is exclusive with both, which
+    /// is what makes a starting pinch cancel it through its end path.
+    /// Hover runs alongside everything.
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                           shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+        if gestureRecognizer is UIHoverGestureRecognizer || other is UIHoverGestureRecognizer {
+            return true
+        }
+        let twoFinger = { (g: UIGestureRecognizer) in
+            g === self.pinchGesture || g === self.twoFingerPanGesture
+        }
+        return twoFinger(gestureRecognizer) && twoFinger(other)
+    }
+}
+
+private struct CanvasGestureOverlay: UIViewRepresentable {
+    var handlers: CanvasGestureCoordinator.Handlers
+
+    func makeCoordinator() -> CanvasGestureCoordinator { CanvasGestureCoordinator() }
+
+    func makeUIView(context: Context) -> UIView {
+        let coordinator = context.coordinator
+        coordinator.handlers = handlers
+        let view = UIView()
+        view.backgroundColor = .clear
+
+        let pinch = UIPinchGestureRecognizer(target: coordinator,
+                                             action: #selector(CanvasGestureCoordinator.handlePinch(_:)))
+        pinch.delegate = coordinator
+
+        let twoFingerPan = UIPanGestureRecognizer(target: coordinator,
+                                                  action: #selector(CanvasGestureCoordinator.handleTwoFingerPan(_:)))
+        twoFingerPan.minimumNumberOfTouches = 2
+        twoFingerPan.maximumNumberOfTouches = 2
+        twoFingerPan.delegate = coordinator
+
+        let oneFingerPan = UIPanGestureRecognizer(target: coordinator,
+                                                  action: #selector(CanvasGestureCoordinator.handleOneFingerPan(_:)))
+        oneFingerPan.minimumNumberOfTouches = 1
+        oneFingerPan.maximumNumberOfTouches = 1
+        oneFingerPan.delegate = coordinator
+
+        let tap = UITapGestureRecognizer(target: coordinator,
+                                         action: #selector(CanvasGestureCoordinator.handleTap(_:)))
+        tap.numberOfTapsRequired = 1
+        tap.numberOfTouchesRequired = 1
+        // Exactly-once tap delivery: the tap fires only when the
+        // one-finger pan failed (touch ended before the pan began). If
+        // the pan ran, the view's own < 5 pt split handles the tap.
+        tap.require(toFail: oneFingerPan)
+        tap.delegate = coordinator
+
+        let hover = UIHoverGestureRecognizer(target: coordinator,
+                                             action: #selector(CanvasGestureCoordinator.handleHover(_:)))
+        hover.delegate = coordinator
+
+        coordinator.register(pinch: pinch, twoFingerPan: twoFingerPan)
+        view.addGestureRecognizer(pinch)
+        view.addGestureRecognizer(twoFingerPan)
+        view.addGestureRecognizer(oneFingerPan)
+        view.addGestureRecognizer(tap)
+        view.addGestureRecognizer(hover)
+        return view
+    }
+
+    func updateUIView(_ view: UIView, context: Context) {
+        context.coordinator.handlers = handlers
     }
 }
