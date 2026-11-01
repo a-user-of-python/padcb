@@ -48,12 +48,13 @@ it ships.
 | --- | --- | --- |
 | **Part 1** (v1.3) | Schematic editor: KiCad-style canvas, toolbars, symbol chooser with previews, pin-to-pin drag wiring, labels, datasheets — with the full KiCad 10.0.1 symbol libraries bundled | ✅ Shipped |
 | **Part 2** (v2.0) | File sharing, your own imported symbol libraries, encrypted connection table saved with every schematic, `.kicad_mod` footprint parser + browser, full KiCad footprint libraries bundled | ✅ Shipped |
-| **Part 3** (v3.0) | Instant search, KiCad-model symbol↔footprint matching, PCB editor shell, and schematic→PCB correspondence (the PCB editor reads the connection table and binds every pin to its footprint pad) | ✅ Shipped — **current** |
-| **Future** | PCB placement, routing and editing; KiCad `.kicad_sch` round-trip | 🔜 Planned |
+| **Part 3** (v3.0) | Instant search, KiCad-model symbol↔footprint matching, PCB editor shell, and schematic→PCB correspondence (the PCB editor reads the connection table and binds every pin to its footprint pad) | ✅ Shipped |
+| **Part 4** (v4.0) | The PCB editor becomes a working editor: move/delete footprints, route resizeable traces (45° bends, per-net), draw lines/arcs/circles/text, highlight nets, real layer/object visibility, zoom to 6000%, and boards that persist per schematic and merge (never wipe) on Sync from Schematic | ✅ Shipped — **current** |
+| **Future** | KiCad `.kicad_sch` round-trip; PCB export (e.g. Gerber) | 🔜 Planned |
 
 Current limits: projects save in PadCB's own format (no `.kicad_sch`
-round-trip yet), and the PCB editor is a viewing shell — it builds and shows
-the board from a schematic, but you can't edit it yet.
+round-trip yet), and there is no PCB export yet — boards live in the app
+(and as readable JSON in Documents/Boards).
 
 ## Features
 
@@ -134,8 +135,19 @@ connection table and builds the board:
 - Anything that doesn't line up — a pin with no pad, a pad with no pin, an
   unresolved footprint — is listed plainly under **Problems**, never
   silently dropped. Power symbols are excluded and listed separately.
-- The correspondence is proven off-device by a fixture board (schematic →
-  encrypted table → board model, every binding asserted): **43/43 checks**.
+- Since part 4 it is a working editor: drag footprints to place them,
+  route copper traces pad-to-pad (they bend at 45° and their width can be
+  changed any time), draw board graphics and text, highlight a whole net,
+  and hide layers or object classes for real. Board work is saved per
+  schematic (Documents/Boards, plain JSON) and **Sync from Schematic**
+  merges the schematic's latest save into the board — placements and
+  traces survive, parts deleted from the board are restored and named in
+  the sync report, and a trace whose net disappears stays on the board,
+  flagged unconnected under Problems.
+- The correspondence — and now the merge, trace, visibility and zoom
+  rules — is proven off-device by a fixture board (schematic → encrypted
+  table → board model → merged board state, every step asserted):
+  **110/110 checks**.
 
 ## How it works
 
