@@ -354,17 +354,17 @@ checkEqual(u1.pins.map(\.pinNumber), ["1", "2", "3", "4", "7", "8", "9"],
 checkEqual(u1.pins.filter { $0.pad != nil }.map(\.pinNumber),
            ["1", "2", "3", "4", "7", "8"],
            "U1 pins 1,2,3,4,7,8 are the ones bound to real pads")
-let u1Pin9 = binding(u1, "9")
-check(u1Pin9.pad == nil, "U1 pin 9 binding has no pad (the anomaly below is its report)")
+let u1Bind9 = binding(u1, "9")
+check(u1Bind9.pad == nil, "U1 pin 9 binding has no pad (the anomaly below is its report)")
 checkEqual(u1.footprintKey ?? "", "FixtureFP:FIXIC_FP",
            "U1 footprintKey is FixtureFP:FIXIC_FP")
 checkEqual(u1.matchKind ?? "", "property",
            "U1 matchKind is property")
 
-let u1Pin1 = binding(u1, "1")
-checkEqual(u1Pin1.netName ?? "", "NET_A", "U1 pin 1 is on NET_A")
-checkEqual(u1Pin1.pad?.number ?? "", "1", "U1 pin 1 binds to pad 1")
-if let pad = u1Pin1.pad {
+let u1Bind1 = binding(u1, "1")
+checkEqual(u1Bind1.netName ?? "", "NET_A", "U1 pin 1 is on NET_A")
+checkEqual(u1Bind1.pad?.number ?? "", "1", "U1 pin 1 binds to pad 1")
+if let pad = u1Bind1.pad {
     check(approx(pad.x, -3.81) && approx(pad.y, -2.54),
           "U1 pin 1 pad centre is the fixture pad 1 centre (-3.81, -2.54) (got \(pad.x), \(pad.y))")
     check(approx(pad.width, 1.6) && approx(pad.height, 1.6),
@@ -375,17 +375,17 @@ if let pad = u1Pin1.pad {
     check(false, "U1 pin 1 has a pad")
 }
 
-let u1Pin4 = binding(u1, "4")
-checkEqual(u1Pin4.netName ?? "", "NET_B", "U1 pin 4 is on NET_B")
-checkEqual(u1Pin4.pad?.number ?? "", "4", "U1 pin 4 binds to pad 4")
+let u1Bind4 = binding(u1, "4")
+checkEqual(u1Bind4.netName ?? "", "NET_B", "U1 pin 4 is on NET_B")
+checkEqual(u1Bind4.pad?.number ?? "", "4", "U1 pin 4 binds to pad 4")
 
-let u1Pin8 = binding(u1, "8")
-checkEqual(u1Pin8.netName ?? "", "VCC",
+let u1Bind8 = binding(u1, "8")
+checkEqual(u1Bind8.netName ?? "", "VCC",
            "U1 pin 8 (common unit, via the unit-1 instance) is on VCC")
-checkEqual(u1Pin8.pad?.number ?? "", "8", "U1 pin 8 binds to pad 8")
+checkEqual(u1Bind8.pad?.number ?? "", "8", "U1 pin 8 binds to pad 8")
 
-let u1Pin2 = binding(u1, "2")
-check(u1Pin2.netName == nil && u1Pin2.pad != nil,
+let u1Bind2 = binding(u1, "2")
+check(u1Bind2.netName == nil && u1Bind2.pad != nil,
       "U1 pin 2 has a pad but no net (unconnected output)")
 
 // Pin 9 exists in the symbol but not in the footprint -> anomaly.
@@ -411,12 +411,12 @@ check(!u1.anomalies.contains { $0.contains("unnumbered") },
 
 // -- R1 --
 let r1Component = component("R1")
-let r1Pin1 = binding(r1Component, "1")
-checkEqual(r1Pin1.netName ?? "", "NET_A", "R1 pin 1 is on NET_A")
-checkEqual(r1Pin1.pad?.number ?? "", "1", "R1 pin 1 binds to pad 1")
-let r1Pin2 = binding(r1Component, "2")
-check(r1Pin2.netName == nil, "R1 pin 2 has no net")
-check(r1Pin2.pad != nil, "R1 pin 2 has a pad")
+let r1Bind1 = binding(r1Component, "1")
+checkEqual(r1Bind1.netName ?? "", "NET_A", "R1 pin 1 is on NET_A")
+checkEqual(r1Bind1.pad?.number ?? "", "1", "R1 pin 1 binds to pad 1")
+let r1Bind2 = binding(r1Component, "2")
+check(r1Bind2.netName == nil, "R1 pin 2 has no net")
+check(r1Bind2.pad != nil, "R1 pin 2 has a pad")
 check(r1Component.anomalies.isEmpty,
       "R1 has no anomalies (got \(r1Component.anomalies))")
 

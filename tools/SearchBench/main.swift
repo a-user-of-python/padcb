@@ -47,6 +47,10 @@ let symbolQueries: [String] = [
     "ethernet", "SPI", "I2C", "uart", "UART", "ADC", "DAC",
     "bridge rectifier", "schottky", "photodiode", "thermistor",
     "  resistor  ", "no-such-symbol-zzz",
+    // ICU-fold probes (added after CI run 41344234853 found the
+    // superscript-two footprint): the old localized compare treats
+    // compatibility variants as equal — the new engine must too.
+    "2", "µF", "μF", "²",
 ]
 
 let footprintQueries: [String] = [
@@ -60,6 +64,9 @@ let footprintQueries: [String] = [
     "a", "e", "1", "2", "-", "_",
     "D_PAK", "TO-220", "TO220", "Crystal", "crystal", "SMD", "smd",
     "  0603  ", "no-such-footprint-zzz",
+    // ICU-fold probes: "37x44mm²" must match "2", "²" and "mm²";
+    // micro-sign and Greek-mu spellings must match each other.
+    "²", "mm²", "µF", "μF",
 ]
 
 // MARK: - Helpers

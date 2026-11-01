@@ -73,6 +73,9 @@ jobs:
 
       - name: SearchBench (old vs new semantics, full corpora)
         run: |
+          # pipefail: the bench's exit code must gate the step, not
+          # tee's (run 41344234853 masked a real set mismatch).
+          set -o pipefail
           python3 tools/search_fixtures.py \
             --symbols-dir App/PadCB/Symbols \
             --footprint-index App/PadCB/Footprints/FootprintIndex.json \
@@ -88,6 +91,7 @@ jobs:
 
       - name: MatchCensus (bundled-corpus coverage + cross-namespace fixtures)
         run: |
+          set -o pipefail
           xcrun swiftc -O -o /tmp/MatchCensus \
             App/PadCB/SExpr.swift \
             App/PadCB/KiCadSymbol.swift \
@@ -104,6 +108,7 @@ jobs:
 
       - name: BoardFixture (schematic -> table -> board model proof)
         run: |
+          set -o pipefail
           xcrun swiftc -O -o /tmp/BoardFixture \
             App/PadCB/SExpr.swift \
             App/PadCB/KiCadSymbol.swift \

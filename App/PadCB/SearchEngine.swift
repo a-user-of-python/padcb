@@ -15,11 +15,35 @@ import Foundation
 // search returns exactly the same result SET as the old per-field
 // semantics while running far faster.
 //
-// How it works: building a SearchIndex precomputes, per row, ONE
-// lowercased blob (the row's fields joined with "\n") and the
-// lowercased name field. A search is then a plain `contains` scan
-// over those precomputed strings — no per-row lowercasing, no
-// localized compare machinery in the hot loop.
+// HOW IT WORKS (v2 — rewritten after the first CI bench run):
+// per row, the index precomputes ONE canonical byte string: the
+// row's fields joined with "\n", lowercased, compatibility-folded
+// (below), as UTF-8 bytes; plus the canonical name-field bytes.
+// A search is a SINGLE pass of byte-substring scans over those
+// precomputed bytes, bucketing matches into the three ranks as it
+// goes. Byte-substring search over valid UTF-8 is character-safe:
+// a valid UTF-8 needle can only match at character boundaries
+// (UTF-8 is self-synchronising).
+//
+// Why not Swift String.contains over lowercased blobs (v1)?
+// Two measured failures on the real corpus (CI run 41344234853):
+//   1. SPEED: String.contains on the corpus's non-ASCII strings
+//      (µ, ², …) is a grapheme-cluster search — far slower than the
+//      old ICU-backed compares. v1 measured SLOWER than the old
+//      semantics (symbols 242 ms vs 113 ms median). Byte scans run
+//      at memory speed instead.
+//   2. A MISSED MATCH: the old localizedCaseInsensitiveContains is
+//      ICU-backed and treats compatibility variants as equal at
+//      primary collation strength — e.g. the "²" in a footprint
+//      description "37x44mm²" matches the query "2". Plain
+//      lowercase containment does not (that footprint was the one
+//      mismatch in 38k rows). The canonical fold below maps the
+//      compatibility classes that occur in this corpus — super- /
+//      subscript digits, fullwidth digits, circled digits, and the
+//      micro sign µ -> Greek μ — onto their base characters on BOTH
+//      the row text and the query, restoring the equivalence.
+//      (Not folded: full ICU tailoring such as ß -> ss. The bench
+//      battery over the real corpora is the evidence standard.)
 
 /// One searchable row: a stable id plus its searchable fields.
 /// `fields[0]` is the primary (name) field; the remaining fields are
@@ -27,6 +51,75 @@ import Foundation
 struct SearchRow: Codable {
     var id: String
     var fields: [String]
+}
+
+/// Canonicalisation for search: lowercase, then fold the
+/// compatibility characters the old ICU-backed compare treated as
+/// equal to their base characters. Applied identically to row text
+/// and to queries, so the equivalence holds in both directions.
+private enum SearchCanonical {
+    private static let folds: [Character: String] = [
+        // Micro sign (U+00B5) folds to Greek small mu (U+03BC) —
+        // the old compare matched "µF" against "μF" fields and
+        // vice versa; both occur throughout the corpora.
+        "µ": "μ",
+        // Superscript digits.
+        "⁰": "0", "¹": "1", "²": "2", "³": "3", "⁴": "4",
+        "⁵": "5", "⁶": "6", "⁷": "7", "⁸": "8", "⁹": "9",
+        // Subscript digits.
+        "₀": "0", "₁": "1", "₂": "2", "₃": "3", "₄": "4",
+        "₅": "5", "₆": "6", "₇": "7", "₈": "8", "₉": "9",
+        // Fullwidth digits.
+        "０": "0", "１": "1", "２": "2", "３": "3", "４": "4",
+        "５": "5", "６": "6", "７": "7", "８": "8", "９": "9",
+        // Circled digits.
+        "⓪": "0", "①": "1", "②": "2", "③": "3", "④": "4",
+        "⑤": "5", "⑥": "6", "⑦": "7", "⑧": "8", "⑨": "9",
+        "⑩": "10", "⑪": "11", "⑫": "12", "⑬": "13", "⑭": "14",
+        "⑮": "15", "⑯": "16", "⑰": "17", "⑱": "18", "⑲": "19",
+        "⑳": "20",
+    ]
+
+    /// The canonical UTF-8 bytes of a search string.
+    static func bytes(of raw: String) -> [UInt8] {
+        let lowered = raw.lowercased()
+        var out = String()
+        out.reserveCapacity(lowered.count)
+        for ch in lowered {
+            if let folded = folds[ch] {
+                out += folded
+            } else {
+                out.append(ch)
+            }
+        }
+        return Array(out.utf8)
+    }
+
+    /// Byte-substring search: true iff `needle` occurs in
+    /// `haystack`. Both are canonical UTF-8, so a match always
+    /// lands on character boundaries.
+    static func contains(_ haystack: [UInt8], _ needle: [UInt8]) -> Bool {
+        if needle.isEmpty { return true }
+        if haystack.count < needle.count { return false }
+        let first = needle[0]
+        let lastStart = haystack.count - needle.count
+        var i = 0
+        while i <= lastStart {
+            if haystack[i] == first {
+                var j = 1
+                while j < needle.count && haystack[i + j] == needle[j] { j += 1 }
+                if j == needle.count { return true }
+            }
+            i += 1
+        }
+        return false
+    }
+
+    static func hasPrefix(_ bytes: [UInt8], _ prefix: [UInt8]) -> Bool {
+        guard bytes.count >= prefix.count else { return false }
+        for j in prefix.indices where bytes[j] != prefix[j] { return false }
+        return true
+    }
 }
 
 /// A precomputed search index over a fixed list of rows.
@@ -39,50 +132,50 @@ struct SearchRow: Codable {
 /// whitespace-only) query returns every row in original order.
 struct SearchIndex {
     let rows: [SearchRow]
-    /// Per-row searchable text: fields joined with "\n", lowercased
-    /// once at build time.
-    private let blobs: [String]
-    /// Per-row name field (fields[0]), lowercased once at build time.
-    private let names: [String]
+    /// Per-row canonical searchable bytes: fields joined with "\n".
+    private let blobs: [[UInt8]]
+    /// Per-row canonical name-field bytes (fields[0]).
+    private let names: [[UInt8]]
 
     init(rows: [SearchRow]) {
         self.rows = rows
-        blobs = rows.map { $0.fields.joined(separator: "\n").lowercased() }
-        names = rows.map { ($0.fields.first ?? "").lowercased() }
+        blobs = rows.map {
+            SearchCanonical.bytes(of: $0.fields.joined(separator: "\n"))
+        }
+        names = rows.map {
+            SearchCanonical.bytes(of: $0.fields.first ?? "")
+        }
     }
 
     var count: Int { rows.count }
 
     /// Indices of the rows matching `rawQuery`, ranked as described
-    /// above. The query is trimmed and lowercased once; matching is a
-    /// single `contains` per row per rank pass over the precomputed
-    /// blob — no string allocations inside the loop beyond the
-    /// result array itself.
-    ///
-    /// Result SET (ignoring the ranking order) is identical to the
-    /// old semantics — "any field contains the query,
-    /// case-insensitively" — for any query that does not itself
-    /// contain "\n": `contains` over the "\n"-joined blob can only
-    /// match inside one field, which is exactly the per-field OR.
-    /// tools/SearchBench asserts this set equality over the real
+    /// above. Single pass over the precomputed bytes: a row matches
+    /// iff its blob contains the canonical query bytes — for any
+    /// query without "\n" that is exactly the old per-field OR,
+    /// modulo the compatibility folds documented at the top of this
+    /// file, which exist to PRESERVE the old ICU-backed semantics.
+    /// tools/SearchBench asserts the set equality over the real
     /// corpora against `SearchSemantics.referenceMatches`.
     func search(_ rawQuery: String) -> [Int] {
-        let query = rawQuery.trimmingCharacters(in: .whitespaces).lowercased()
+        let query = SearchCanonical.bytes(
+            of: rawQuery.trimmingCharacters(in: .whitespaces))
         guard !query.isEmpty else { return Array(rows.indices) }
-        var result: [Int] = []
-        // Three passes, one per rank, so the only allocation in the
-        // hot loop is the result array. Each pass is a plain contains
-        // scan over precomputed lowercase strings.
-        for targetRank in 0...2 {
-            for index in rows.indices {
-                guard blobs[index].contains(query) else { continue }
-                let name = names[index]
-                let rank = name.hasPrefix(query) ? 0
-                    : (name.contains(query) ? 1 : 2)
-                if rank == targetRank { result.append(index) }
+        var rank0: [Int] = []
+        var rank1: [Int] = []
+        var rank2: [Int] = []
+        for index in rows.indices {
+            guard SearchCanonical.contains(blobs[index], query) else { continue }
+            let name = names[index]
+            if SearchCanonical.hasPrefix(name, query) {
+                rank0.append(index)
+            } else if SearchCanonical.contains(name, query) {
+                rank1.append(index)
+            } else {
+                rank2.append(index)
             }
         }
-        return result
+        return rank0 + rank1 + rank2
     }
 }
 

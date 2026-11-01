@@ -90,6 +90,9 @@ jobs:
 
       - name: Footprint census (real Swift parser over the whole corpus) + bundle index
         run: |
+          # pipefail so a census parse failure (exit 1) fails the
+          # step instead of being masked by tee.
+          set -o pipefail
           xcrun swiftc -O -o /tmp/FootprintCensus \
             App/PadCB/SExpr.swift \
             App/PadCB/KiCadFootprint.swift \
