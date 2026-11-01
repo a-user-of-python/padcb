@@ -29,6 +29,47 @@ PadCB bundles the complete **KiCad default symbol libraries**
   source code; only the UI layout/workflow concepts and the library *data*
   (under its license) are used.
 
+## Your own libraries & footprints (part 2)
+
+File sharing is enabled, and PadCB never uses the system document
+picker — everything flows through the app's Documents folders:
+
+- **Documents/Libraries/** — drop your own `.kicad_sym` symbol
+  libraries here (Files app ▸ PadCB ▸ Libraries). They appear in the
+  symbol chooser alongside the bundled ones (marked CUSTOM / shown as
+  "Name (Custom)"), fully searchable with previews, placeable and
+  wireable like bundled symbols. A custom library never shadows a
+  bundled one of the same name — both stay available. Malformed files
+  are skipped and reported on the home screen. Rescan from the
+  chooser's Rescan button.
+- **Documents/Footprints/** — drop `.kicad_mod` footprints here
+  (`.pretty`-style folders work too) and browse them, with rendered
+  top-view previews, in the home screen's Footprint Browser. When a
+  symbol's Footprint property ("Lib:Name") matches an imported
+  footprint, the chooser and the properties card say so.
+- **Documents/ConnectionTables/** — every schematic save also writes
+  an encrypted connection table here (AES-256-GCM, key in the device
+  Keychain): the netlist of what connects to what, for the future PCB
+  editor. The home screen's temporary "Debug: View Connections"
+  button decrypts and displays a saved table.
+
+## KiCad footprint libraries
+
+PadCB also bundles the complete **KiCad default footprint libraries**
+(`kicad-footprints`, `.kicad_mod` files), pinned to release **10.0.1**
+(commit `3d2b27e687a44c97f02109afb2acfeebbc8dd75f`).
+
+- Canonical source: https://gitlab.com/kicad/libraries/kicad-footprints
+- The build takes only the `*.pretty` library folders (15,430
+  footprints in 155 libraries) — 3D models are excluded — and bundles
+  the files verbatim; a CI-generated index lets the app list them all
+  and parse each footprint on demand. Before the app builds, the
+  app's own Swift parser must parse every one of the 15,430 files
+  cleanly (the full-corpus census gates the build).
+- **License**: same terms as the symbol libraries — CC BY-SA 4.0 with
+  the KiCad Library Exception. The license text ships in the bundle
+  (`Footprints/KICAD-FOOTPRINTS-LICENSE.md`).
+
 ## Building
 
 CI (GitHub Actions, standard macos-26 runner) downloads the pinned symbol
