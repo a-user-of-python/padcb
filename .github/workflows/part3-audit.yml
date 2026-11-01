@@ -77,10 +77,14 @@ jobs:
             --symbols-dir App/PadCB/Symbols \
             --footprint-index App/PadCB/Footprints/FootprintIndex.json \
             --out-dir /tmp/searchbench
-          xcrun swiftc -O -o /tmp/SearchBench \
+          # NOTE: the binary must NOT be named /tmp/SearchBench — the
+          # runner's case-insensitive /tmp makes that the same path as
+          # the fixtures directory /tmp/searchbench (link fails with
+          # "Is a directory").
+          xcrun swiftc -O -o /tmp/bench_search \
             App/PadCB/SearchEngine.swift \
             tools/SearchBench/main.swift
-          /tmp/SearchBench /tmp/searchbench/symbols.json /tmp/searchbench/footprints.json | tee /tmp/search-bench.txt
+          /tmp/bench_search /tmp/searchbench/symbols.json /tmp/searchbench/footprints.json | tee /tmp/search-bench.txt
 
       - name: MatchCensus (bundled-corpus coverage + cross-namespace fixtures)
         run: |

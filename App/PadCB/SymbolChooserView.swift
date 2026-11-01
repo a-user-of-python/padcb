@@ -521,15 +521,16 @@ struct SymbolChooserView: View {
         let match = FootprintMatcher.match(def: def, choiceKey: nil,
                                            entries: footprintStore.footprints)
         if let resolved = match.resolved {
-            let source: String
-            switch match.kind {
-            case .filterExact:
-                source = "from footprint filters"
-            case .instanceChoice:
-                source = "from selected footprint"
-            case .property, nil:
-                source = "from library reference"
-            }
+            // NOTE: computed in a plain closure — a bare `switch` inside
+            // a @ViewBuilder is parsed as a builder switch, not an
+            // imperative one (its assignment cases become () "views").
+            let source: String = {
+                switch match.kind {
+                case .filterExact: return "from footprint filters"
+                case .instanceChoice: return "from selected footprint"
+                case .property, nil: return "from library reference"
+                }
+            }()
             Text("Footprint: \(resolved.key) — \(source)")
                 .font(.caption)
                 .foregroundStyle(.green)
