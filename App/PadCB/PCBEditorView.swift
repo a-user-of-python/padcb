@@ -2007,8 +2007,8 @@ struct PCBEditorView: View {
                                     item: BoardGraphicItem) {
         if let path = graphicPath(item) {
             ctx.stroke(path, with: .color(.orange),
-                       style: StrokeStyle(lineWidth: 1.6, dash: [6, 4],
-                                          lineCap: .round, lineJoin: .round))
+                       style: StrokeStyle(lineWidth: 1.6, lineCap: .round,
+                                          lineJoin: .round, dash: [6, 4]))
         } else if item.kind == .text, let anchor = item.points.first {
             let centre = boardToScreen(anchor)
             let r = max(10, CGFloat(item.textSize * scale) / 2 + 4)
