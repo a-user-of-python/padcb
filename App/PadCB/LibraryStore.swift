@@ -3,7 +3,7 @@ import Combine
 
 /// Where a symbol library came from. Bundled libraries ship inside the
 /// app; custom libraries are user-supplied .kicad_sym files dropped into
-/// Documents/Libraries (file sharing — no system picker anywhere).
+/// Documents/Symbols (file sharing — no system picker anywhere).
 enum SymbolLibrarySource: String, Codable {
     case bundled
     case custom
@@ -55,10 +55,15 @@ private struct IndexCache: Codable {
 }
 
 /// Loads the bundled KiCad symbol libraries plus the user's own
-/// libraries from Documents/Libraries, builds (and caches) the chooser
+/// libraries from Documents/Symbols, builds (and caches) the chooser
 /// index, and hands out fully parsed libraries on demand.
 final class LibraryStore: ObservableObject {
     @Published var index: [SymbolIndexEntry] = []
+    /// Precomputed search index over `index` (rows in the same order,
+    /// fields [name, description, keywords]), rebuilt on every
+    /// publishIndex() so the chooser never re-filters the raw index
+    /// on the main thread (part 3 — see SearchEngine.swift).
+    @Published var symbolSearchIndex: SearchIndex = SearchIndex(rows: [])
     @Published var indexReady = false
     @Published var loadError: String?
     /// Bundled libraries whose header pass failed during the last build.
@@ -77,6 +82,11 @@ final class LibraryStore: ObservableObject {
     private var bundledEntries: [SymbolIndexEntry] = []
     private var customEntries: [SymbolIndexEntry] = []
     private var bundledReady = false
+    /// Notes from the one-time legacy-folder migration in bootstrap(),
+    /// held until the first custom-scan publish folds them into
+    /// `customLibraryIssues` (the scan's publish REPLACES that array,
+    /// so appending the notes directly in bootstrap would lose them).
+    private var pendingMigrationNotes: [String] = []
 
     // MARK: - Library keys
 
@@ -118,6 +128,20 @@ final class LibraryStore: ObservableObject {
         }
         didBootstrap = true
         lock.unlock()
+
+        // Folder rename (part 3): user symbol libraries live in
+        // Documents/Symbols now. Move any *.kicad_sym the user still
+        // has in the legacy Documents/Libraries folder BEFORE anything
+        // scans, and surface the migration notes alongside the custom
+        // scan's issues. The notes are appended now AND held in
+        // pendingMigrationNotes, because the scan's publish replaces
+        // customLibraryIssues wholesale — the publish folds the held
+        // notes back in (exactly once) so they survive it.
+        let migrationNotes = PadCBPaths.migrateLegacySymbolLibraries()
+        if !migrationNotes.isEmpty {
+            pendingMigrationNotes = migrationNotes
+            customLibraryIssues += migrationNotes
+        }
 
         PadCBPaths.ensureStandardDirectories()
 
@@ -206,17 +230,21 @@ final class LibraryStore: ObservableObject {
         }
     }
 
-    /// Merges bundled + custom entries into the published index.
+    /// Merges bundled + custom entries into the published index, and
+    /// rebuilds the precomputed search index over the merged rows.
     /// Main-actor only (all callers hop first).
     private func publishIndex() {
         index = bundledEntries + customEntries
+        symbolSearchIndex = SearchIndex(rows: index.map {
+            SearchRow(id: $0.id, fields: [$0.name, $0.description, $0.keywords])
+        })
         if bundledReady { indexReady = true }
         if !index.isEmpty { loadError = nil }
     }
 
     // MARK: - Custom (user) libraries
 
-    /// Re-scans Documents/Libraries/*.kicad_sym from disk: files added,
+    /// Re-scans Documents/Symbols/*.kicad_sym from disk: files added,
     /// replaced or deleted since the last scan take effect, malformed
     /// files are skipped and reported in `customLibraryIssues`, and any
     /// memoized parses of custom libraries are dropped. This is the
@@ -243,7 +271,11 @@ final class LibraryStore: ObservableObject {
                 self.lock.unlock()
 
                 self.customEntries = result.entries
-                self.customLibraryIssues = result.issues
+                // Fold in the bootstrap migration notes exactly once:
+                // this publish replaces the array, so anything appended
+                // earlier would otherwise be lost.
+                self.customLibraryIssues = self.pendingMigrationNotes + result.issues
+                self.pendingMigrationNotes = []
                 self.customLibraryCount = result.fileCount
                 self.isScanningCustomLibraries = false
                 self.publishIndex()
@@ -264,7 +296,7 @@ final class LibraryStore: ObservableObject {
     /// to the bundled corpus) so a malformed file is caught here —
     /// skipped + reported — instead of failing later in the chooser.
     private static func scanCustomLibraryFiles() -> CustomScanResult {
-        let dir = PadCBPaths.userLibrariesDirectory
+        let dir = PadCBPaths.userSymbolsDirectory
         PadCBPaths.ensureDirectory(dir)
         let fm = FileManager.default
         let urls = ((try? fm.contentsOfDirectory(
@@ -457,10 +489,10 @@ final class LibraryStore: ObservableObject {
         return urls.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    /// *.kicad_sym dropped into Documents/Libraries (top level only —
+    /// *.kicad_sym dropped into Documents/Symbols (top level only —
     /// that flat folder is the documented convention). Sorted by name.
     private static func discoverCustomSymbolFiles() -> [URL] {
-        let dir = PadCBPaths.userLibrariesDirectory
+        let dir = PadCBPaths.userSymbolsDirectory
         PadCBPaths.ensureDirectory(dir)
         let urls = (try? FileManager.default.contentsOfDirectory(
             at: dir, includingPropertiesForKeys: nil,

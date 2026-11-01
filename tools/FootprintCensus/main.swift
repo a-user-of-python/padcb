@@ -16,7 +16,10 @@ import Foundation
 /// - aggregates the parser's skipped-node counts (model/zone/…)
 ///   so the "not modelled" list is measured, not guessed;
 /// - writes the bundle index JSON the app loads at launch
-///   (group/name/file/description/tags/pad+graphic counts);
+///   (group/name/file/description/tags/pad+graphic counts, plus —
+///   part 3 — "distinctPads": the distinct NON-EMPTY pad number
+///   count per footprint, for CvPcb-style pin-count matching; the
+///   app's index-row decoding tolerates its absence);
 /// - exits 1 when any file failed, 0 when the census is clean.
 
 func jstr(_ s: String) -> String {
@@ -81,6 +84,7 @@ func relativePath(of url: URL) -> String {
 
 var groups = Set<String>()
 var totalPads = 0
+var totalDistinctPads = 0
 var totalGraphics = 0
 var totalThruHole = 0
 var totalCustomPads = 0
@@ -106,6 +110,12 @@ for url in urls {
             continue
         }
         if fp.name != baseName { nameMismatches += 1 }
+        // Distinct NON-EMPTY pad numbers — the CvPcb pin-count rule
+        // (part 3): unnumbered mechanical pads do not count as
+        // electrical pads. Same rule as FootprintStore /
+        // FootprintEntry.distinctPadCount in the app.
+        let distinctPads = Set(fp.pads.map(\.number).filter { !$0.isEmpty }).count
+        totalDistinctPads += distinctPads
         totalPads += fp.pads.count
         totalGraphics += fp.graphics.count
         totalThruHole += fp.pads.filter { $0.isThroughHole }.count
@@ -120,7 +130,8 @@ for url in urls {
             + "\"file\":\(jstr(relativePath(of: url))),"
             + "\"description\":\(jstr(fp.description)),"
             + "\"tags\":[\(fp.tags.map(jstr).joined(separator: ","))],"
-            + "\"pads\":\(fp.pads.count),\"graphics\":\(fp.graphics.count)}")
+            + "\"pads\":\(fp.pads.count),\"distinctPads\":\(distinctPads),"
+            + "\"graphics\":\(fp.graphics.count)}")
     } catch {
         failures.append("\(relativePath(of: url)): \(error)")
     }
@@ -138,6 +149,7 @@ print("libraries: \(groups.count)")
 print("footprints: \(urls.count)")
 print("parsed OK: \(indexRows.count)")
 print("pads: \(totalPads)")
+print("distinct pads (summed per footprint, non-empty numbers): \(totalDistinctPads)")
 print("graphics: \(totalGraphics)")
 print("through-hole pads: \(totalThruHole)")
 print("custom pads: \(totalCustomPads) (primitives: \(totalCustomPrimitives))")

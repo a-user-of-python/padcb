@@ -70,7 +70,7 @@ struct HomeView: View {
             .buttonStyle(.plain)
 
             NavigationLink {
-                PCBPlaceholderView()
+                PCBEditorView()
             } label: {
                 launcherRow(icon: "circuitboard",
                             title: "PCB Editor")
@@ -143,11 +143,11 @@ struct HomeView: View {
         VStack(spacing: 8) {
             symbolStatus
             if store.customLibraryCount > 0 {
-                statusLine("Your libraries: \(store.customLibraryCount) file\(store.customLibraryCount == 1 ? "" : "s") in Libraries folder",
+                statusLine("Your libraries: \(store.customLibraryCount) file\(store.customLibraryCount == 1 ? "" : "s") in Symbols folder",
                            color: .green.opacity(0.9))
             }
             if store.isScanningCustomLibraries {
-                statusLine("Scanning your Libraries folder…", color: .white.opacity(0.65))
+                statusLine("Scanning your Symbols folder…", color: .white.opacity(0.65))
             }
             ForEach(Array(store.customLibraryIssues.prefix(3).enumerated()), id: \.offset) { _, issue in
                 statusLine(issue, color: .orange.opacity(0.9))
@@ -156,7 +156,7 @@ struct HomeView: View {
             ForEach(Array(footprintStore.issues.prefix(3).enumerated()), id: \.offset) { _, issue in
                 statusLine(issue, color: .orange.opacity(0.9))
             }
-            Text("Add your own parts in the Files app: PadCB ▸ Libraries (.kicad_sym) · PadCB ▸ Footprints (.kicad_mod)")
+            Text("Add your own parts in the Files app: PadCB ▸ Symbols (.kicad_sym) · PadCB ▸ Footprints (.kicad_mod)")
                 .font(.caption)
                 .foregroundStyle(.white.opacity(0.45))
                 .lineLimit(2)

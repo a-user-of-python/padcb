@@ -4,7 +4,7 @@ import hashlib
 import os
 
 SWIFT_FILES = [
-    "PadCBApp.swift", "HomeView.swift", "PCBPlaceholderView.swift",
+    "PadCBApp.swift", "HomeView.swift",
     "SchematicEditorView.swift", "SymbolChooserView.swift", "FileListView.swift",
     "SchematicDocument.swift", "SchematicCanvasView.swift", "SymbolRenderer.swift",
     "SymbolDrawList.swift",
@@ -13,6 +13,9 @@ SWIFT_FILES = [
     "PadCBPaths.swift", "ConnectionTable.swift", "ConnectionTableStore.swift",
     "ConnectionDebugView.swift",
     "KiCadFootprint.swift", "FootprintStore.swift", "FootprintBrowserView.swift",
+    # Part 3: search engine, symbol<->footprint matcher, PCB board model + editor.
+    "SearchEngine.swift", "FootprintMatcher.swift",
+    "PCBBoardModel.swift", "PCBEditorView.swift",
 ]
 
 

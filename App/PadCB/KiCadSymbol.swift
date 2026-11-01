@@ -107,6 +107,58 @@ struct KiCadSymbolDef {
     var isPower: Bool {
         isPowerSymbol || (property("Reference") ?? "").hasPrefix("#")
     }
+
+    /// Footprint filter patterns: the tokens of the symbol property
+    /// "ki_fp_filters", split on whitespace (KiCad 10 stores the list
+    /// as one whitespace-separated property value; extends merge is the
+    /// usual property child-wins merge in KiCadLibrary.parse, matching
+    /// KiCad's LIB_SYMBOL::Flatten()). An empty / "~" value means the
+    /// symbol carries no filters. Part 3 (FootprintMatcher) interprets
+    /// these with KiCad's footprint_filter.cpp semantics.
+    var fpFilters: [String] {
+        guard let raw = property("ki_fp_filters") else { return [] }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, trimmed != "~" else { return [] }
+        return trimmed.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+    }
+
+    /// The distinct pin numbers across ALL units of this symbol
+    /// (unit 0 common pins included; a number shared by several units
+    /// counts once), sorted naturally: numeric numbers by value first,
+    /// non-numeric numbers after, alphabetically. Empty pin numbers are
+    /// excluded — an unnumbered pin is not an electrical connection,
+    /// mirroring the footprint side's distinct pad count rule
+    /// (FootprintStore / FootprintMatcher, part 3).
+    var distinctPinNumbers: [String] {
+        var seen = Set<String>()
+        for unit in units.values {
+            for pin in unit.pins where !pin.number.isEmpty {
+                seen.insert(pin.number)
+            }
+        }
+        return seen.sorted(by: KiCadSymbolDef.naturalPinNumberOrder)
+    }
+
+    /// Count of `distinctPinNumbers` — the symbol side of the
+    /// pin-count comparison (KiCad CvPcb FilterByPinCount compares
+    /// this against the footprint's distinct pad number count).
+    var distinctPinCount: Int { distinctPinNumbers.count }
+
+    /// Natural order for pin numbers: both numeric -> by value (ties
+    /// broken by the raw string, e.g. "01" vs "1"); a numeric number
+    /// sorts before a non-numeric one; otherwise plain string order.
+    static func naturalPinNumberOrder(_ a: String, _ b: String) -> Bool {
+        switch (Int(a), Int(b)) {
+        case let (x?, y?):
+            return x != y ? x < y : a < b
+        case (.some, nil):
+            return true
+        case (nil, .some):
+            return false
+        case (nil, nil):
+            return a < b
+        }
+    }
 }
 
 struct KiCadLibrary {

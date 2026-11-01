@@ -55,10 +55,20 @@ struct ConnectionComponent: Codable, Equatable {
     var value: String
     /// The symbol definition's Footprint property ("Lib:Name"), if any.
     var footprintReference: String?
-    /// Canonical key ("Group:Name") of the imported footprint the
-    /// reference resolved to at save time, or nil when no imported
-    /// footprint matches (yet).
+    /// Canonical key ("Group:Name", or "user:Group:Name" for a user
+    /// footprint) of the EFFECTIVE footprint at save time, or nil when
+    /// no imported footprint matches (yet). Effective means the
+    /// per-instance choice wins over the symbol's Footprint property
+    /// (part 3, FootprintMatcher).
     var resolvedFootprintKey: String?
+    /// How `resolvedFootprintKey` was resolved: a
+    /// FootprintMatchKind raw value ("instanceChoice" | "property" |
+    /// "filterExact"), or nil when nothing resolved. Part 3 addition:
+    /// an OPTIONAL field only — formatVersion stays 1 and tables
+    /// written before part 3 (no such key) still decode, with a nil
+    /// kind meaning the part-2 behaviour (resolution came from the
+    /// Footprint property).
+    var footprintMatchKind: String? = nil
 }
 
 struct ConnectionNet: Codable, Equatable {
@@ -96,14 +106,16 @@ enum ConnectionTableBuilder {
 
     /// Builds the table for `state`.
     /// - `resolveSymbol`: the editor passes LibraryStore.symbol.
-    /// - `resolveFootprint`: the editor passes
-    ///   FootprintStore.resolvedKey(forFootprintReference:); it receives
-    ///   the symbol's Footprint property and returns the imported
-    ///   footprint's canonical key when one matches.
+    /// - `resolveFootprint`: the editor passes a FootprintMatcher
+    ///   lookup over the placed instance + its definition (part 3);
+    ///   it returns the EFFECTIVE footprint's resolution key and how
+    ///   it resolved (a FootprintMatchKind raw value) — the instance's
+    ///   own footprintChoice wins over the symbol's Footprint
+    ///   property inside that closure.
     static func build(state: SchematicState,
                       sourceFileName: String,
                       resolveSymbol: (PlacedSymbol) -> KiCadSymbolDef?,
-                      resolveFootprint: (String?) -> String?) -> ConnectionTable {
+                      resolveFootprint: (PlacedSymbol, KiCadSymbolDef) -> (key: String?, kind: String?)) -> ConnectionTable {
         // 1. Endpoints: every pin of every placed symbol, in a
         //    deterministic order, via the renderer's own geometry.
         var endpoints: [ConnectionEndpoint] = []
@@ -123,6 +135,7 @@ enum ConnectionTableBuilder {
                 continue
             }
             let footprintReference = cleanedProperty(def.property("Footprint"))
+            let footprintResolution = resolveFootprint(placed, def)
             components.append(ConnectionComponent(
                 instanceID: placed.id,
                 reference: placed.reference,
@@ -131,7 +144,8 @@ enum ConnectionTableBuilder {
                 symbolName: placed.symbolName,
                 value: placed.value,
                 footprintReference: footprintReference,
-                resolvedFootprintKey: resolveFootprint(footprintReference)))
+                resolvedFootprintKey: footprintResolution.key,
+                footprintMatchKind: footprintResolution.kind))
 
             let powerName: String? = def.isPower
                 ? (placed.value.trimmingCharacters(in: .whitespaces).isEmpty

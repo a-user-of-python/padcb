@@ -20,6 +20,21 @@ struct SymbolChooserView: View {
     @State private var selectedEntry: SymbolIndexEntry? = nil
     @State private var def: KiCadSymbolDef? = nil
 
+    // Part 3: search and grouping are STATE, computed by the tasks
+    // below — never inside body. Before part 3 every body pass
+    // re-filtered all ~22.7k entries (3 localized compares each) and
+    // re-grouped + re-sorted them, which is what made search laggy.
+    /// Latest search results (power + library filter applied), in the
+    /// SearchIndex's ranked order. nil == browse mode (no query).
+    @State private var searchResults: [SymbolIndexEntry]? = nil
+    /// Browse-mode sections, rebuilt only when the index/scope changes.
+    @State private var groupedBrowse: [(library: String, entries: [SymbolIndexEntry])]? = nil
+    /// Library KEYS for the filter menu, rebuilt with the browse scope.
+    @State private var availableLibraries: [String] = []
+    /// id -> entry map used to turn SearchIndex row indices back into
+    /// entries without scanning the index.
+    @State private var entryByID: [String: SymbolIndexEntry] = [:]
+
     private static let searchRowCap = 800
 
     init(store: LibraryStore, powerOnly: Bool, onPick: @escaping (KiCadSymbolDef) -> Void) {
@@ -28,53 +43,87 @@ struct SymbolChooserView: View {
         self.onPick = onPick
     }
 
-    // MARK: - Filtering
-
-    /// Index entries after the power-only restriction and library filter,
-    /// but before the search text — the source for the library menu.
-    private var scopeEntries: [SymbolIndexEntry] {
-        store.index.filter { entry in
-            if powerOnly && entry.library != "power" { return false }
-            return true
-        }
-    }
-
-    /// Library KEYS (bundled base names, "user:<Name>" for custom
-    /// libraries), sorted by their display names.
-    private var availableLibraries: [String] {
-        Array(Set(scopeEntries.map(\.libraryKey)))
-            .sorted { LibraryStore.displayName(forLibraryKey: $0)
-                < LibraryStore.displayName(forLibraryKey: $1) }
-    }
+    // MARK: - Filtering (state-driven, part 3)
 
     private var isSearching: Bool {
         !searchText.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
-    private func matchesSearch(_ entry: SymbolIndexEntry, query: String) -> Bool {
-        entry.name.localizedCaseInsensitiveContains(query)
-            || entry.description.localizedCaseInsensitiveContains(query)
-            || entry.keywords.localizedCaseInsensitiveContains(query)
+    /// Cheap O(1) signature of everything the browse grouping and the
+    /// library menu depend on; the rebuild task re-runs only when
+    /// this string changes.
+    private var scopeSignature: String {
+        "\(store.index.count)|\(store.index.first?.id ?? "")|\(store.index.last?.id ?? "")|\(powerOnly)|\(libraryFilter ?? "")"
     }
 
-    /// Fully filtered entries (power + library + search).
-    private var filteredEntries: [SymbolIndexEntry] {
-        let query = searchText.trimmingCharacters(in: .whitespaces)
-        return scopeEntries.filter { entry in
+    /// Signature of everything a search run depends on. The entry-map
+    /// count is included so a search typed before the scope task has
+    /// built the map re-runs once the map exists, instead of landing
+    /// an empty result computed against an empty dictionary.
+    private var searchSignature: String {
+        "\(searchText)\u{1}\(libraryFilter ?? "")\u{1}\(powerOnly)\u{1}\(store.index.count)\u{1}\(entryByID.count)"
+    }
+
+    /// Rebuilds the browse grouping, the library menu list and the
+    /// id -> entry map from the current index + scope. Runs from a
+    /// .task keyed on scopeSignature — once per actual change, never
+    /// per body pass.
+    private func rebuildBrowseScope() {
+        let scoped = store.index.filter { entry in
+            !(powerOnly && entry.library != "power")
+        }
+        availableLibraries = Array(Set(scoped.map(\.libraryKey)))
+            .sorted { LibraryStore.displayName(forLibraryKey: $0)
+                < LibraryStore.displayName(forLibraryKey: $1) }
+        entryByID = Dictionary(store.index.map { ($0.id, $0) },
+                               uniquingKeysWith: { first, _ in first })
+        let filtered = scoped.filter { entry in
             if let libraryFilter, entry.libraryKey != libraryFilter { return false }
-            if !query.isEmpty && !matchesSearch(entry, query: query) { return false }
             return true
         }
-    }
-
-    private var groupedEntries: [(library: String, entries: [SymbolIndexEntry])] {
-        let grouped = Dictionary(grouping: filteredEntries, by: \.libraryKey)
-        return grouped.keys
+        let grouped = Dictionary(grouping: filtered, by: \.libraryKey)
+        groupedBrowse = grouped.keys
             .sorted { LibraryStore.displayName(forLibraryKey: $0)
                 < LibraryStore.displayName(forLibraryKey: $1) }
             .map { key in
                 (library: key, entries: grouped[key] ?? [])
             }
+    }
+
+    /// Debounced search: sleeps ~80 ms (cancellation kills stale runs),
+    /// runs the precomputed SearchIndex on a detached task, then
+    /// applies the library filter + power-only scope to the (small)
+    /// ranked result set and publishes on the main actor. The final
+    /// query check is a second stale guard: a result only lands when
+    /// the search field still holds the query it was computed for.
+    private func runSearch() async {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else {
+            searchResults = nil
+            return
+        }
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        guard !Task.isCancelled else { return }
+        let index = store.symbolSearchIndex
+        let byID = entryByID
+        let filter = libraryFilter
+        let power = powerOnly
+        let results = await Task.detached(priority: .userInitiated) { () -> [SymbolIndexEntry] in
+            let rowIndices = index.search(query)
+            var entries: [SymbolIndexEntry] = []
+            entries.reserveCapacity(rowIndices.count)
+            for rowIndex in rowIndices {
+                guard rowIndex >= 0, rowIndex < index.rows.count,
+                      let entry = byID[index.rows[rowIndex].id] else { continue }
+                if power && entry.library != "power" { continue }
+                if let filter, entry.libraryKey != filter { continue }
+                entries.append(entry)
+            }
+            return entries
+        }.value
+        guard !Task.isCancelled else { return }
+        guard searchText.trimmingCharacters(in: .whitespaces) == query else { return }
+        searchResults = results
     }
 
     // MARK: - Body
@@ -126,6 +175,12 @@ struct SymbolChooserView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .task(id: scopeSignature) {
+            rebuildBrowseScope()
+        }
+        .task(id: searchSignature) {
+            await runSearch()
+        }
         .task(id: selectedEntry?.id) {
             // Load (and parse, on first use) the full definition for the
             // preview pane whenever the selection changes.
@@ -212,7 +267,7 @@ struct SymbolChooserView: View {
         if store.isScanningCustomLibraries {
             HStack(spacing: 8) {
                 ProgressView().tint(.white)
-                Text("Scanning your Libraries folder…")
+                Text("Scanning your Symbols folder…")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
@@ -238,49 +293,81 @@ struct SymbolChooserView: View {
 
     // MARK: - List
 
+    private var noMatchesView: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 32, weight: .light))
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Text("No symbols match.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
     @ViewBuilder
     private var symbolList: some View {
-        if filteredEntries.isEmpty {
+        if isSearching {
+            if let results = searchResults {
+                if results.isEmpty {
+                    noMatchesView
+                } else {
+                    let capped = Array(results.prefix(Self.searchRowCap))
+                    List {
+                        Section {
+                            ForEach(capped) { entry in
+                                entryRow(entry)
+                            }
+                        } header: {
+                            if results.count > capped.count {
+                                Text("\(results.count.formatted()) matches — showing first \(capped.count). Refine your search.")
+                                    .lineLimit(2)
+                            } else {
+                                Text("\(results.count.formatted()) matches")
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                }
+            } else {
+                VStack(spacing: 10) {
+                    ProgressView()
+                        .tint(.white)
+                    Text("Searching…")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else if let groups = groupedBrowse {
+            if groups.isEmpty {
+                noMatchesView
+            } else {
+                List {
+                    ForEach(groups, id: \.library) { group in
+                        Section(LibraryStore.displayName(forLibraryKey: group.library)) {
+                            ForEach(group.entries) { entry in
+                                entryRow(entry)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.insetGrouped)
+            }
+        } else {
             VStack(spacing: 10) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 32, weight: .light))
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Text("No symbols match.")
+                ProgressView()
+                    .tint(.white)
+                Text("Loading symbols…")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-        } else if isSearching {
-            let capped = Array(filteredEntries.prefix(Self.searchRowCap))
-            List {
-                Section {
-                    ForEach(capped) { entry in
-                        entryRow(entry)
-                    }
-                } header: {
-                    if filteredEntries.count > capped.count {
-                        Text("\(filteredEntries.count.formatted()) matches — showing first \(capped.count). Refine your search.")
-                            .lineLimit(2)
-                    } else {
-                        Text("\(filteredEntries.count.formatted()) matches")
-                            .lineLimit(1)
-                    }
-                }
-            }
-            .listStyle(.insetGrouped)
-        } else {
-            List {
-                ForEach(groupedEntries, id: \.library) { group in
-                    Section(LibraryStore.displayName(forLibraryKey: group.library)) {
-                        ForEach(group.entries) { entry in
-                            entryRow(entry)
-                        }
-                    }
-                }
-            }
-            .listStyle(.insetGrouped)
         }
     }
 
@@ -345,21 +432,7 @@ struct SymbolChooserView: View {
                         if !entry.keywords.isEmpty {
                             metadataBlock("Keywords", entry.keywords)
                         }
-                        if let footprint = def.property("Footprint"),
-                           !footprint.isEmpty, footprint != "~" {
-                            metadataRow("Footprint", footprint)
-                            if let match = footprintStore.resolve(reference: footprint) {
-                                Text("Imported footprint available: \(match.key) — \(match.padCount) pads")
-                                    .font(.caption)
-                                    .foregroundStyle(.green)
-                                    .lineLimit(2)
-                            } else {
-                                Text("No imported footprint matches this reference yet — drop its .kicad_mod into the Footprints folder.")
-                                    .font(.caption)
-                                    .foregroundStyle(.orange)
-                                    .lineLimit(2)
-                            }
-                        }
+                        footprintMatchText(def: def)
                         if let url = entry.datasheetURL ?? datasheetURL(from: def) {
                             Link(destination: url) {
                                 HStack(spacing: 6) {
@@ -436,6 +509,41 @@ struct SymbolChooserView: View {
                                         scale: scale, showPinNumbers: true, showPinNames: true)
                 }
             }
+        }
+    }
+
+    /// Footprint line for the preview pane, from FootprintMatcher
+    /// (part 3): an exact property/filter resolution, or — when the
+    /// symbol itself assigns none — how many footprints its filters
+    /// match. Replaces the old FootprintStore.resolve-based text.
+    @ViewBuilder
+    private func footprintMatchText(def: KiCadSymbolDef) -> some View {
+        let match = FootprintMatcher.match(def: def, choiceKey: nil,
+                                           entries: footprintStore.footprints)
+        if let resolved = match.resolved {
+            let source: String
+            switch match.kind {
+            case .filterExact:
+                source = "from footprint filters"
+            case .instanceChoice:
+                source = "from selected footprint"
+            case .property, nil:
+                source = "from library reference"
+            }
+            Text("Footprint: \(resolved.key) — \(source)")
+                .font(.caption)
+                .foregroundStyle(.green)
+                .lineLimit(2)
+        } else if let first = match.candidates.first {
+            Text("No footprint assigned — \(match.candidates.count) match the symbol's filters (first: \(first.entry.key))")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .lineLimit(2)
+        } else {
+            Text("No matching footprint in the libraries.")
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .lineLimit(2)
         }
     }
 

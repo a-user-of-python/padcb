@@ -31,6 +31,15 @@ struct PlacedSymbol: Identifiable, Codable {
     var mirrorY: Bool
     var reference: String
     var value: String
+    /// Per-instance footprint choice (part 3): the
+    /// FootprintEntry.resolutionKey of the footprint the user picked
+    /// for THIS instance in the properties card, or nil to use the
+    /// automatic resolution (the symbol's Footprint property, then
+    /// its footprint filters — FootprintMatcher). Optional with a nil
+    /// default: synthesized Codable decodes it with decodeIfPresent,
+    /// so schematic JSON written before part 3 (no such key) still
+    /// loads, and existing PlacedSymbol constructions are unchanged.
+    var footprintChoice: String? = nil
 
     var origin: DPoint { DPoint(x: x, y: y) }
 }

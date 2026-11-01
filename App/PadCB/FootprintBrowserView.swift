@@ -16,27 +16,99 @@ struct FootprintBrowserView: View {
     @State private var selectedID: String? = nil
     @State private var loadedFootprint: KiCadFootprint? = nil
 
-    private var filtered: [FootprintEntry] {
-        let query = searchText.trimmingCharacters(in: .whitespaces).lowercased()
-        guard !query.isEmpty else { return store.footprints }
-        return store.footprints.filter { entry in
-            entry.name.lowercased().contains(query)
-                || entry.group.lowercased().contains(query)
-                || entry.description.lowercased().contains(query)
-                || entry.tags.joined(separator: " ").lowercased().contains(query)
-        }
+    // Part 3: search and grouping are STATE, computed by the tasks
+    // below — never inside body. Before part 3 every body pass
+    // re-filtered all ~15.4k entries (lowercasing four fields each),
+    // re-grouped them, and linearly scanned for the selection.
+    /// Latest search results in the SearchIndex's ranked order.
+    /// nil == browse mode (no query).
+    @State private var searchResults: [FootprintEntry]? = nil
+    /// Search results grouped for the list, built once per search
+    /// publish (not per body pass).
+    @State private var groupedSearch: [(group: String, entries: [FootprintEntry])]? = nil
+    /// Browse-mode sections, rebuilt only when the footprint set changes.
+    @State private var groupedBrowse: [(group: String, entries: [FootprintEntry])]? = nil
+    /// id -> entry map: selection lookup and search-result mapping
+    /// are dictionary hits, never linear scans.
+    @State private var entryByID: [String: FootprintEntry] = [:]
+    /// Precomputed search index over the current footprint set.
+    @State private var searchIndex: SearchIndex = SearchIndex(rows: [])
+
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespaces).isEmpty
     }
 
-    private var grouped: [(group: String, entries: [FootprintEntry])] {
-        let byGroup = Dictionary(grouping: filtered, by: \.group)
-        return byGroup.keys.sorted().map { (group: $0, entries: byGroup[$0] ?? []) }
+    /// The sections the list shows right now (cached state in both modes).
+    private var displayGroups: [(group: String, entries: [FootprintEntry])] {
+        isSearching ? (groupedSearch ?? []) : (groupedBrowse ?? [])
     }
 
     private var selected: FootprintEntry? {
-        if let selectedID, let match = store.footprints.first(where: { $0.id == selectedID }) {
+        if let selectedID, let match = entryByID[selectedID] {
             return match
         }
-        return filtered.first
+        return displayGroups.first?.entries.first
+    }
+
+    /// Cheap O(1) signature of the footprint set (user footprints are
+    /// listed first, bundled last — see FootprintStore.footprints).
+    private var footprintSignature: String {
+        let firstID = store.userFootprints.first?.id ?? store.bundledFootprints.first?.id ?? ""
+        let lastID = store.bundledFootprints.last?.id ?? store.userFootprints.last?.id ?? ""
+        return "\(store.userFootprints.count + store.bundledFootprints.count)|\(firstID)|\(lastID)"
+    }
+
+    private var searchSignature: String {
+        "\(searchText)\u{1}\(entryByID.count)"
+    }
+
+    private static func groupEntries(_ entries: [FootprintEntry])
+        -> [(group: String, entries: [FootprintEntry])] {
+        let byGroup = Dictionary(grouping: entries, by: \.group)
+        return byGroup.keys.sorted().map { (group: $0, entries: byGroup[$0] ?? []) }
+    }
+
+    /// Rebuilds the entry map, the search index and the browse
+    /// grouping from the store's current footprint set. Runs from a
+    /// .task keyed on footprintSignature — once per actual change.
+    private func rebuildFootprintScope() {
+        let all = store.footprints
+        entryByID = Dictionary(all.map { ($0.id, $0) },
+                               uniquingKeysWith: { first, _ in first })
+        searchIndex = SearchIndex(rows: all.map {
+            SearchRow(id: $0.id,
+                      fields: [$0.name, $0.group, $0.description,
+                               $0.tags.joined(separator: " ")])
+        })
+        groupedBrowse = Self.groupEntries(all)
+    }
+
+    /// Debounced search, mirroring SymbolChooserView: ~80 ms sleep,
+    /// the SearchIndex scan runs on a detached task, results are
+    /// mapped through the entry dictionary and published on the main
+    /// actor; cancellation plus a final query check keep stale
+    /// results from ever landing.
+    private func runSearch() async {
+        let query = searchText.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty else {
+            searchResults = nil
+            groupedSearch = nil
+            return
+        }
+        try? await Task.sleep(nanoseconds: 80_000_000)
+        guard !Task.isCancelled else { return }
+        let index = searchIndex
+        let byID = entryByID
+        let results = await Task.detached(priority: .userInitiated) { () -> [FootprintEntry] in
+            index.search(query).compactMap { rowIndex in
+                guard rowIndex >= 0, rowIndex < index.rows.count else { return nil }
+                return byID[index.rows[rowIndex].id]
+            }
+        }.value
+        guard !Task.isCancelled else { return }
+        guard searchText.trimmingCharacters(in: .whitespaces) == query else { return }
+        searchResults = results
+        groupedSearch = Self.groupEntries(results)
     }
 
     var body: some View {
@@ -74,6 +146,12 @@ struct FootprintBrowserView: View {
             }
         }
         .task { store.bootstrap() }
+        .task(id: footprintSignature) {
+            rebuildFootprintScope()
+        }
+        .task(id: searchSignature) {
+            await runSearch()
+        }
         .task(id: selected?.id) {
             // Bundled footprints parse on demand (the corpus is ~15k
             // files); user footprints arrive already parsed.
@@ -104,7 +182,7 @@ struct FootprintBrowserView: View {
                 .buttonStyle(.plain)
             }
             Spacer(minLength: 0)
-            Text("\(store.footprints.count) imported")
+            Text("\(store.userFootprints.count + store.bundledFootprints.count) imported")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
@@ -150,7 +228,7 @@ struct FootprintBrowserView: View {
                         Text("Skipped files")
                     }
                 }
-                ForEach(grouped, id: \.group) { group in
+                ForEach(displayGroups, id: \.group) { group in
                     Section(group.group) {
                         ForEach(group.entries) { entry in
                             Button {

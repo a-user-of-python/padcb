@@ -162,8 +162,18 @@ struct SchematicEditorView: View {
             resolveSymbol: { placed in
                 store.symbol(library: placed.library, name: placed.symbolName)
             },
-            resolveFootprint: { reference in
-                footprintStore.resolvedKey(forFootprintReference: reference)
+            resolveFootprint: { placed, def in
+                // Part 3: the EFFECTIVE footprint — the instance's own
+                // choice wins, then the symbol's Footprint property,
+                // then a single exact filter (FootprintMatcher). The
+                // recorded key is the entry's resolutionKey and the
+                // kind says how it resolved.
+                let match = FootprintMatcher.match(
+                    def: def,
+                    choiceKey: placed.footprintChoice,
+                    entries: footprintStore.footprints)
+                return (key: match.resolved?.resolutionKey,
+                        kind: match.kind?.rawValue)
             })
         do {
             try document.save(to: url)
@@ -463,9 +473,22 @@ private struct SymbolPropertiesCard: View {
 
     @State private var refDraft = ""
     @State private var valueDraft = ""
+    @State private var showFootprintChooser = false
 
     private var placed: PlacedSymbol? {
         document.state.symbols.first(where: { $0.id == placedID })
+    }
+
+    /// Part 3: the matcher result for this instance — the effective
+    /// footprint (instance choice > Footprint property > exact
+    /// filter) plus the ranked filter candidates, over the COMBINED
+    /// user + bundled footprint list (FootprintMatcher).
+    private var footprintMatch: FootprintMatch? {
+        guard let def, let placed else { return nil }
+        return FootprintMatcher.match(
+            def: def,
+            choiceKey: placed.footprintChoice,
+            entries: footprintStore.footprints)
     }
 
     private var def: KiCadSymbolDef? {
@@ -517,21 +540,7 @@ private struct SymbolPropertiesCard: View {
                     Divider()
                     readOnlyRow("Library", placed.map { LibraryStore.displayName(forLibraryKey: $0.library) } ?? "—")
                     readOnlyRow("Symbol", placed?.symbolName ?? "—")
-                    if let footprint = def?.property("Footprint"),
-                       !footprint.isEmpty, footprint != "~" {
-                        readOnlyRow("Footprint", footprint)
-                        if let match = footprintStore.resolve(reference: footprint) {
-                            Text("Imported footprint: \(match.key) (\(match.padCount) pads)")
-                                .font(.caption)
-                                .foregroundStyle(.green)
-                                .lineLimit(2)
-                        } else {
-                            Text("No imported footprint matches this reference yet.")
-                                .font(.caption)
-                                .foregroundStyle(.orange)
-                                .lineLimit(2)
-                        }
-                    }
+                    footprintSection
                     if let description = def?.property("Description"),
                        !description.isEmpty, description != "~" {
                         VStack(alignment: .leading, spacing: 2) {
@@ -571,6 +580,71 @@ private struct SymbolPropertiesCard: View {
         .shadow(color: .black.opacity(0.45), radius: 16, x: 0, y: 6)
         .onAppear { syncDrafts() }
         .onChange(of: placedID) { _, _ in syncDrafts() }
+        .sheet(isPresented: $showFootprintChooser) {
+            FootprintChoiceSheet(
+                candidates: footprintMatch?.candidates ?? [],
+                resolved: footprintMatch?.resolved,
+                choiceKey: placed?.footprintChoice,
+                pinCount: def?.distinctPinCount ?? 0,
+                onPick: { newChoice in
+                    // Like the reference/value edits, this writes
+                    // through mutate() directly — no undo step. That
+                    // is the existing part-1 gap for card edits; kept
+                    // consistent here rather than fixed one-off.
+                    mutate { $0.footprintChoice = newChoice }
+                })
+        }
+    }
+
+    // MARK: - Footprint association (part 3)
+
+    /// The effective footprint for this instance, how it resolved,
+    /// its distinct pad count against the symbol's distinct pin
+    /// count, and the button that opens the candidate picker.
+    @ViewBuilder
+    private var footprintSection: some View {
+        if let def, let match = footprintMatch {
+            VStack(alignment: .leading, spacing: 4) {
+                readOnlyRow("Footprint", match.resolved?.resolutionKey ?? "—")
+                Text(footprintResolutionText(match.kind))
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(match.resolved != nil ? Color.green : Color.orange)
+                    .lineLimit(1)
+                if let resolved = match.resolved {
+                    Text(footprintPadNote(resolved, def))
+                        .font(.caption)
+                        .foregroundStyle(resolved.distinctPadCount == def.distinctPinCount ? Color.secondary : Color.orange)
+                        .lineLimit(1)
+                }
+                Button {
+                    showFootprintChooser = true
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: "square.stack.3d.up")
+                            .lineLimit(1)
+                        Text("Choose Footprint…")
+                            .lineLimit(1)
+                    }
+                    .font(.callout.weight(.medium))
+                }
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    private func footprintResolutionText(_ kind: FootprintMatchKind?) -> String {
+        switch kind {
+        case .instanceChoice: return "Your chosen footprint"
+        case .property: return "From the symbol's Footprint property"
+        case .filterExact: return "From the symbol's footprint filters"
+        case nil: return "No footprint assigned"
+        }
+    }
+
+    private func footprintPadNote(_ resolved: FootprintEntry,
+                                  _ def: KiCadSymbolDef) -> String {
+        let matches = resolved.distinctPadCount == def.distinctPinCount
+        return "\(resolved.distinctPadCount) distinct pads · \(def.distinctPinCount) pins — \(matches ? "pin count matches" : "pin count differs")"
     }
 
     private var header: some View {
@@ -710,5 +784,153 @@ private struct SymbolPropertiesCard: View {
         copy.reference = document.nextReference(prefix: prefix)
         document.addSymbol(copy)
         onSelect(copy.id)
+    }
+}
+
+// MARK: - Footprint choice sheet (part 3)
+
+/// The "Choose Footprint…" picker for one placed instance: the
+/// automatic row (clears the per-instance choice), the currently
+/// resolved entry (badged, when it is not already in the candidate
+/// list), and every ranked ki_fp_filters candidate from the combined
+/// user + bundled list. Picking a row records that entry's
+/// resolutionKey as the instance's footprintChoice via `onPick`.
+private struct FootprintChoiceSheet: View {
+    var candidates: [FootprintCandidate]
+    var resolved: FootprintEntry?
+    var choiceKey: String?
+    var pinCount: Int
+    var onPick: (String?) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+
+    /// The resolved entry shown on its own when the filters did not
+    /// produce it (e.g. it came from the Footprint property).
+    private var resolvedStandalone: FootprintCandidate? {
+        guard let resolved,
+              !candidates.contains(where: {
+                  $0.entry.resolutionKey == resolved.resolutionKey
+              }) else { return nil }
+        return FootprintCandidate(
+            entry: resolved,
+            distinctPadCount: resolved.distinctPadCount,
+            pinCountMatches: resolved.distinctPadCount == pinCount)
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Text("Choose Footprint")
+                    .font(.headline)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+                Button("Close") { dismiss() }
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            Divider()
+            List {
+                Section {
+                    Button {
+                        onPick(nil)
+                        dismiss()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Text("Use automatic (property/filters)")
+                                .font(.callout.weight(.medium))
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            if choiceKey == nil {
+                                Image(systemName: "checkmark")
+                                    .lineLimit(1)
+                            }
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+                if let resolvedStandalone {
+                    Section {
+                        candidateRow(resolvedStandalone)
+                    } header: {
+                        Text("Assigned")
+                    }
+                }
+                if !candidates.isEmpty {
+                    Section {
+                        ForEach(candidates, id: \.entry.resolutionKey) { candidate in
+                            candidateRow(candidate)
+                        }
+                    } header: {
+                        Text("Filter matches")
+                    }
+                }
+                if candidates.isEmpty, resolvedStandalone == nil {
+                    Section {
+                        Text("No footprint-filter candidates for this symbol.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                    }
+                }
+            }
+            .listStyle(.insetGrouped)
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func candidateRow(_ candidate: FootprintCandidate) -> some View {
+        let entry = candidate.entry
+        let isResolved = resolved?.resolutionKey == entry.resolutionKey
+        return Button {
+            onPick(entry.resolutionKey)
+            dismiss()
+        } label: {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(entry.key)
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                    Text(entry.source == .user ? "YOURS" : "KiCad")
+                        .font(.caption2.weight(.bold))
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 2)
+                        .background(Color.white.opacity(0.14),
+                                    in: RoundedRectangle(cornerRadius: 4))
+                    if isResolved {
+                        Text("assigned")
+                            .font(.caption2.weight(.bold))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(Color.green.opacity(0.25),
+                                        in: RoundedRectangle(cornerRadius: 4))
+                    }
+                    Spacer(minLength: 0)
+                    if choiceKey == entry.resolutionKey {
+                        Image(systemName: "checkmark")
+                            .lineLimit(1)
+                    }
+                }
+                HStack(spacing: 8) {
+                    Text("\(candidate.distinctPadCount) distinct pads (\(entry.padCount) total)")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    if candidate.pinCountMatches {
+                        Text("pin count matches")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.green)
+                            .lineLimit(1)
+                    }
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }

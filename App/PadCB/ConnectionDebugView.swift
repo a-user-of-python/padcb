@@ -208,7 +208,12 @@ struct ConnectionDebugView: View {
             }
             if let footprint = component.footprintReference {
                 if let resolved = component.resolvedFootprintKey {
-                    Text("Footprint: \(footprint) → imported as \(resolved)")
+                    // Part 3: the recorded key is the EFFECTIVE one.
+                    // A nil footprintMatchKind is a pre-part-3 (v2.0)
+                    // table — its resolution came from the Footprint
+                    // property, so it displays exactly as before. A
+                    // per-instance choice is called out.
+                    Text("Footprint: \(footprint) → imported as \(resolved)\(component.footprintMatchKind == "instanceChoice" ? " (your choice)" : "")")
                         .font(.caption)
                         .foregroundStyle(.green)
                         .lineLimit(2)
@@ -218,6 +223,14 @@ struct ConnectionDebugView: View {
                         .foregroundStyle(.orange)
                         .lineLimit(2)
                 }
+            } else if let resolved = component.resolvedFootprintKey {
+                // No Footprint property, but an effective footprint was
+                // recorded (a per-instance choice, or a filter-exact
+                // resolution).
+                Text("Footprint: → imported as \(resolved)\(component.footprintMatchKind == "instanceChoice" ? " (your choice)" : "")")
+                    .font(.caption)
+                    .foregroundStyle(.green)
+                    .lineLimit(2)
             } else {
                 Text("Footprint: —")
                     .font(.caption)

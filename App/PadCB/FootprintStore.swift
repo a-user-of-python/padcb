@@ -29,6 +29,18 @@ struct FootprintEntry: Identifiable {
     var description: String
     var tags: [String]
     var padCount: Int
+    /// Count of DISTINCT pad numbers, for the CvPcb pin-count
+    /// comparison (KiCad FOOTPRINT_INFO::GetUniquePadCount vs the
+    /// symbol's distinct pin count). PadCB counts distinct NON-EMPTY
+    /// pad numbers only: KiCad counts distinct pad numbers as stored,
+    /// but unnumbered mechanical pads should not inflate the
+    /// electrical pad count — in PadCB's correspondence model
+    /// unnumbered pads are notes, not bindings. Defaults to 0 for
+    /// callers that construct entries without a parse/index value;
+    /// every store-produced entry sets it properly (user scan: from
+    /// the parse; bundled: from the index row, falling back to the
+    /// total pad count for index files written before part 3).
+    var distinctPadCount: Int = 0
     var graphicCount: Int
     /// The full parse. User footprints are parsed at scan time; bundled
     /// footprints are parsed on demand (see FootprintStore.footprint(for:))
@@ -60,6 +72,11 @@ private struct BundledFootprintIndexRow: Codable {
     var description: String
     var tags: [String]
     var pads: Int
+    /// Distinct NON-EMPTY pad numbers (part 3). Optional on purpose:
+    /// index JSONs written before part 3 have no such key and must
+    /// still decode (synthesized Codable decodes optionals with
+    /// decodeIfPresent); the loader falls back to the total pad count.
+    var distinctPads: Int?
     var graphics: Int
 }
 
@@ -120,9 +137,19 @@ final class FootprintStore: ObservableObject {
 
     // MARK: - On-demand parse
 
+    /// Distinct NON-EMPTY pad numbers of a parsed footprint — the
+    /// footprint side of the CvPcb pin-count comparison (see
+    /// FootprintEntry.distinctPadCount for the empty-number rule).
+    static func distinctPadCount(of footprint: KiCadFootprint) -> Int {
+        Set(footprint.pads.map(\.number).filter { !$0.isEmpty }).count
+    }
+
     /// The full parse for an entry. User entries carry it already;
     /// bundled entries are read + parsed here on first use and cached.
-    /// Returns nil when the file cannot be parsed.
+    /// Returns nil when the file cannot be parsed. (The entry's
+    /// distinctPadCount stays the value it was loaded with — the
+    /// bundled index row's count, or the scan-time parse count for
+    /// user entries; an on-demand parse does not rewrite it.)
     func footprint(for entry: FootprintEntry) -> KiCadFootprint? {
         if let parsed = entry.parsed { return parsed }
         if let cached = parsedCache[entry.resolutionKey] { return cached }
@@ -148,29 +175,22 @@ final class FootprintStore: ObservableObject {
     ///    straight into Documents/Footprints, whose group is
     ///    "Footprints" rather than the KiCad library name).
     /// Returns nil for an empty/"~" reference or no unambiguous match.
+    ///
+    /// Part 3: the algorithm lives in FootprintMatcher.resolveReference
+    /// (so the headless matcher + census share exactly one
+    /// implementation); this method delegates over `footprints` with
+    /// identical behaviour.
     func resolve(reference rawValue: String?) -> FootprintEntry? {
-        guard let raw = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty, raw != "~" else { return nil }
-        let all = footprints
+        FootprintMatcher.resolveReference(rawValue, entries: footprints)
+    }
 
-        var wantedName = raw
-        if let colon = raw.firstIndex(of: ":") {
-            let group = String(raw[raw.startIndex..<colon])
-            let name = String(raw[raw.index(after: colon)...])
-            let exact = all.filter {
-                $0.group.caseInsensitiveCompare(group) == .orderedSame
-                    && $0.name.caseInsensitiveCompare(name) == .orderedSame
-            }
-            if let user = exact.first(where: { $0.source == .user }) { return user }
-            if let bundled = exact.first { return bundled }
-            wantedName = name
-        }
-        let nameMatches = all.filter {
-            $0.name.caseInsensitiveCompare(wantedName) == .orderedSame
-        }
-        let userMatches = nameMatches.filter { $0.source == .user }
-        if userMatches.count == 1 { return userMatches[0] }
-        return nameMatches.count == 1 ? nameMatches[0] : nil
+    /// The entry recorded under a resolutionKey ("Group:Name" for a
+    /// bundled footprint, "user:Group:Name" for a user one), or nil.
+    /// Linear scan — the PCB model (part 3, Lane C) resolves the keys
+    /// stored in connection tables / PlacedSymbol.footprintChoice
+    /// through here.
+    func entry(forResolutionKey key: String) -> FootprintEntry? {
+        FootprintMatcher.entry(forResolutionKey: key, in: footprints)
     }
 
     /// The resolution key of the footprint a Footprint property
@@ -203,6 +223,11 @@ final class FootprintStore: ObservableObject {
                     description: row.description,
                     tags: row.tags,
                     padCount: row.pads,
+                    // Index files written before part 3 carry no
+                    // distinctPads; the total pad count is the
+                    // fallback (exact for footprints whose pads are
+                    // all numbered distinctly, the common case).
+                    distinctPadCount: row.distinctPads ?? row.pads,
                     graphicCount: row.graphics,
                     parsed: nil)
             }
@@ -286,6 +311,7 @@ final class FootprintStore: ObservableObject {
                     description: footprint.description,
                     tags: footprint.tags,
                     padCount: footprint.pads.count,
+                    distinctPadCount: Self.distinctPadCount(of: footprint),
                     graphicCount: footprint.graphics.count,
                     parsed: parseEagerly ? footprint : nil))
             } catch {
