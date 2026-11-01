@@ -34,14 +34,18 @@ PadCB bundles the complete **KiCad default symbol libraries**
 File sharing is enabled, and PadCB never uses the system document
 picker — everything flows through the app's Documents folders:
 
-- **Documents/Libraries/** — drop your own `.kicad_sym` symbol
-  libraries here (Files app ▸ PadCB ▸ Libraries). They appear in the
+- **Documents/Symbols/** — drop your own `.kicad_sym` symbol
+  libraries here (Files app ▸ PadCB ▸ Symbols). They appear in the
   symbol chooser alongside the bundled ones (marked CUSTOM / shown as
   "Name (Custom)"), fully searchable with previews, placeable and
   wireable like bundled symbols. A custom library never shadows a
   bundled one of the same name — both stay available. Malformed files
   are skipped and reported on the home screen. Rescan from the
-  chooser's Rescan button.
+  chooser's Rescan button. *(Renamed in part 3 — this folder was
+  Documents/Libraries in part 2. On launch, PadCB moves any
+  `.kicad_sym` files still in the old Libraries folder into Symbols
+  automatically; if a file of the same name exists in both, the
+  moved one is kept as "<Name> (Legacy)" so both stay usable.)*
 - **Documents/Footprints/** — drop `.kicad_mod` footprints here
   (`.pretty`-style folders work too) and browse them, with rendered
   top-view previews, in the home screen's Footprint Browser. When a
@@ -52,6 +56,35 @@ picker — everything flows through the app's Documents folders:
   Keychain): the netlist of what connects to what, for the future PCB
   editor. The home screen's temporary "Debug: View Connections"
   button decrypts and displays a saved table.
+
+## Part 3 — fast search, footprint matching, PCB editor
+
+- **Search is instant now.** The symbol chooser and footprint
+  browser search precomputed indexes off the main thread (typing is
+  debounced, grouping is cached). Measured on the full bundled
+  corpora against the previous implementation: median query time
+  124 ms → 2 ms (symbols) and 121 ms → 3 ms (footprints), with
+  identical result sets across a 132-query test battery.
+- **Symbols know their footprints.** Following KiCad's own model, a
+  symbol's Footprint property is the primary link and its
+  `ki_fp_filters` patterns define the candidates (pin count compared
+  against the footprint's *distinct* pad numbers). The properties
+  card shows the matched footprint and how it matched — and lets you
+  pick a different candidate for that placed part; the choice is
+  saved with the schematic. Matching works across bundled and
+  imported libraries in both directions. Corpus-wide, 17,970 of the
+  bundled symbols' Footprint properties resolve to a bundled
+  footprint, and 21,419 symbols have at least one filter candidate.
+- **The PCB editor reads the connection table.** Open it from the
+  home screen, pick a saved schematic's table, and it builds the
+  board: every component with its matched footprint drawn on the
+  board canvas, pads numbered and labelled with their nets — pin 1
+  is the real pad 1 from the footprint data. Each component's
+  pin→pad list is shown in full, and anything that doesn't line up
+  (a pin with no pad, a pad with no pin, an unresolved footprint)
+  is listed plainly under Problems. This part is a viewing shell
+  modelled on KiCad's PCB editor — placement, routing and editing
+  arrive in a later part.
 
 ## KiCad footprint libraries
 
