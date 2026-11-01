@@ -28,6 +28,7 @@ on:
       - "App/PadCB/ConnectionTable.swift"
       - "App/PadCB/PCBBoardModel.swift"
       - "App/PadCB/PCBBoardState.swift"
+      - "App/PadCB/PCBDesignChecks.swift"
       - "tools/SearchBench/**"
       - "tools/search_fixtures.py"
       - "tools/MatchCensus/**"
@@ -124,5 +125,6 @@ jobs:
             App/PadCB/PadCBPaths.swift \
             App/PadCB/PCBBoardModel.swift \
             App/PadCB/PCBBoardState.swift \
+            App/PadCB/PCBDesignChecks.swift \
             tools/BoardFixture/main.swift
           /tmp/BoardFixture tools/board-fixtures | tee /tmp/board-fixture.txt

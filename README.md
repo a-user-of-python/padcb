@@ -49,7 +49,8 @@ it ships.
 | **Part 1** (v1.3) | Schematic editor: KiCad-style canvas, toolbars, symbol chooser with previews, pin-to-pin drag wiring, labels, datasheets — with the full KiCad 10.0.1 symbol libraries bundled | ✅ Shipped |
 | **Part 2** (v2.0) | File sharing, your own imported symbol libraries, encrypted connection table saved with every schematic, `.kicad_mod` footprint parser + browser, full KiCad footprint libraries bundled | ✅ Shipped |
 | **Part 3** (v3.0) | Instant search, KiCad-model symbol↔footprint matching, PCB editor shell, and schematic→PCB correspondence (the PCB editor reads the connection table and binds every pin to its footprint pad) | ✅ Shipped |
-| **Part 4** (v4.0) | The PCB editor becomes a working editor: move/delete footprints, route resizeable traces (45° bends, per-net), draw lines/arcs/circles/text, highlight nets, real layer/object visibility, zoom to 6000%, and boards that persist per schematic and merge (never wipe) on Sync from Schematic | ✅ Shipped — **current** |
+| **Part 4** (v4.0) | The PCB editor becomes a working editor: move/delete footprints, route resizeable traces (45° bends, per-net), draw lines/arcs/circles/text, highlight nets, real layer/object visibility, zoom to 6000%, and boards that persist per schematic and merge (never wipe) on Sync from Schematic | ✅ Shipped |
+| **Part 5** (v5.0) | PCB depth pass: adjustable snap grid (in mils) on everything, multi-select with trace-length totals, any-layer active + configurable copper layer count, vias, copper fill zones, Flip Side (F.Cu↔B.Cu with true footprint mirroring), Pencil hover routing preview, bottom trace-width slider, and three checking tiers — live clearance check, a deterministic Manufacturing Check, and a Theory Check with an optional fully on-device AI pass | ✅ Shipped — **current** |
 | **Future** | KiCad `.kicad_sch` round-trip; PCB export (e.g. Gerber) | 🔜 Planned |
 
 Current limits: projects save in PadCB's own format (no `.kicad_sch`

@@ -24,6 +24,53 @@ import Foundation
 
 // MARK: - Board work items
 
+/// Which side of the board a footprint sits on (part 5). A footprint
+/// starts on the front; "Flip Side" moves it to the back, MIRRORED
+/// (KiCad's flip: local x negates through the footprint origin, pad
+/// angles negate, layers swap F.* <-> B.*) so it behaves as it
+/// physically would soldered on the other side.
+enum BoardSide: String, Codable, Equatable {
+    case front, back
+}
+
+/// One placed via (part 5): a plated hole that carries ONE net
+/// between copper layers. A via spans every copper layer of the
+/// board (through via), so it has a centre, an outer diameter and a
+/// drill — no layer of its own.
+struct BoardVia: Codable, Equatable, Identifiable {
+    var id: UUID
+    /// The net this via carries; nil = unconnected.
+    var netName: String?
+    /// Remembered net name when a merge finds the net gone (the
+    /// BoardTrace rule: kept, shown unconnected, rebinds on return).
+    var disconnectedNetName: String? = nil
+    var center: FPPoint
+    /// Outer (annular ring) diameter, mm.
+    var diameter: Double
+    /// Drill diameter, mm.
+    var drill: Double
+
+    /// Standard via sizes offered in the editor (diameter/drill, mm).
+    static let sizePresets: [(diameter: Double, drill: Double)] = [
+        (0.6, 0.3), (0.8, 0.4), (1.0, 0.5), (1.2, 0.6),
+    ]
+}
+
+/// One copper fill area / zone (part 5): a closed polygon on ONE
+/// copper layer that pours copper for ONE net.
+struct BoardZone: Codable, Equatable, Identifiable {
+    var id: UUID
+    /// The net this zone pours; nil = unconnected.
+    var netName: String?
+    /// Remembered net name when a merge finds the net gone.
+    var disconnectedNetName: String? = nil
+    /// Copper layer, e.g. "F.Cu".
+    var layer: String
+    /// Polygon vertices in board coordinates, at least 3. The
+    /// polygon closes implicitly (last point joins the first).
+    var points: [FPPoint]
+}
+
 /// One routed copper track: a polyline on one copper layer, bound to
 /// a net BY NAME. `width` is the copper width in mm — traces are
 /// resizeable: the width is data, edited in the editor's detail
@@ -82,7 +129,7 @@ struct BoardGraphicItem: Codable, Equatable, Identifiable {
 // MARK: - Board state
 
 /// The persisted board work for one connection table.
-struct BoardState: Codable, Equatable {
+struct BoardState: Equatable {
     var formatVersion: Int = 1
     /// Component placements by reference: the board-space position
     /// of the footprint's local origin (the same `origin` the board
@@ -101,7 +148,75 @@ struct BoardState: Codable, Equatable {
     /// removals and to prune placements of vanished parts.
     var knownReferences: [String] = []
 
+    // -- Part 5 additions (all decode as defaults when absent, so
+    // a board file written by v4.0/v4.0.1 loads unchanged) --
+
+    /// Placed vias.
+    var vias: [BoardVia] = []
+    /// Copper fill zones.
+    var zones: [BoardZone] = []
+    /// Component board sides by reference (absent = front).
+    var sides: [String: BoardSide] = [:]
+    /// Copper layer count for this board (2/4/6/8/16/32). The
+    /// part-4 default layer stack was F + In1 + In2 + B, so the
+    /// default here is 4: an old board keeps the exact layers it
+    /// was drawn with.
+    var copperLayerCount: Int = 4
+    /// Snap grid spacing for this board, in mils (1 mil = 0.0254
+    /// mm). 25 mil = 0.635 mm, KiCad's usual PCB grid.
+    var gridMil: Double = 25
+    /// Design clearance for this board, in mils: the minimum gap
+    /// the net-touch check demands between different nets' copper.
+    /// 8 mil is a common fab minimum.
+    var clearanceMil: Double = 8
+
     static let empty = BoardState()
+}
+
+// Codable is hand-rolled on the decode side: EVERY field goes
+// through decodeIfPresent so a file written before a field existed
+// (v4.0/v4.0.1 boards have no vias/zones/sides/settings keys at
+// all) decodes with the defaults above — additive format growth
+// can never strand a user's board work. Encoding stays
+// synthesized-equivalent (all fields written).
+extension BoardState: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case formatVersion, placements, excludedReferences, traces,
+             graphics, knownReferences, vias, zones, sides,
+             copperLayerCount, gridMil, clearanceMil
+    }
+
+    init(from decoder: Decoder) throws {
+        let box = try decoder.container(keyedBy: CodingKeys.self)
+        formatVersion = try box.decodeIfPresent(Int.self, forKey: .formatVersion) ?? 1
+        placements = try box.decodeIfPresent([String: FPPoint].self, forKey: .placements) ?? [:]
+        excludedReferences = try box.decodeIfPresent([String].self, forKey: .excludedReferences) ?? []
+        traces = try box.decodeIfPresent([BoardTrace].self, forKey: .traces) ?? []
+        graphics = try box.decodeIfPresent([BoardGraphicItem].self, forKey: .graphics) ?? []
+        knownReferences = try box.decodeIfPresent([String].self, forKey: .knownReferences) ?? []
+        vias = try box.decodeIfPresent([BoardVia].self, forKey: .vias) ?? []
+        zones = try box.decodeIfPresent([BoardZone].self, forKey: .zones) ?? []
+        sides = try box.decodeIfPresent([String: BoardSide].self, forKey: .sides) ?? [:]
+        copperLayerCount = try box.decodeIfPresent(Int.self, forKey: .copperLayerCount) ?? 4
+        gridMil = try box.decodeIfPresent(Double.self, forKey: .gridMil) ?? 25
+        clearanceMil = try box.decodeIfPresent(Double.self, forKey: .clearanceMil) ?? 8
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var box = encoder.container(keyedBy: CodingKeys.self)
+        try box.encode(formatVersion, forKey: .formatVersion)
+        try box.encode(placements, forKey: .placements)
+        try box.encode(excludedReferences, forKey: .excludedReferences)
+        try box.encode(traces, forKey: .traces)
+        try box.encode(graphics, forKey: .graphics)
+        try box.encode(knownReferences, forKey: .knownReferences)
+        try box.encode(vias, forKey: .vias)
+        try box.encode(zones, forKey: .zones)
+        try box.encode(sides, forKey: .sides)
+        try box.encode(copperLayerCount, forKey: .copperLayerCount)
+        try box.encode(gridMil, forKey: .gridMil)
+        try box.encode(clearanceMil, forKey: .clearanceMil)
+    }
 }
 
 /// Plain-JSON sidecar persistence: Documents/Boards/<stem>.board.json
@@ -210,10 +325,16 @@ enum PCBBoardMerger {
             }
         }
 
-        // -- Placements --
+        // -- Placements + sides (part 5: a flipped component stays
+        // flipped across opens and syncs — side is board state,
+        // matched by reference exactly like placement) --
         for index in model.components.indices {
-            if let placement = state.placements[model.components[index].reference] {
+            let reference = model.components[index].reference
+            if let placement = state.placements[reference] {
                 model.components[index].origin = placement
+            }
+            if let side = state.sides[reference] {
+                model.components[index].side = side
             }
         }
 
@@ -241,7 +362,69 @@ enum PCBBoardMerger {
             }
             traces.append(trace)
         }
+
+        // -- Vias + zones (part 5): the same net-binding rule --
+        var vias: [BoardVia] = []
+        for var via in state.vias {
+            if let net = via.netName, !validNets.contains(net) {
+                via.disconnectedNetName = net
+                via.netName = nil
+            } else if via.netName == nil,
+                      let lost = via.disconnectedNetName,
+                      validNets.contains(lost) {
+                via.netName = lost
+                via.disconnectedNetName = nil
+            }
+            if let lost = via.disconnectedNetName {
+                problems.append(
+                    "A via at (\(formatMM(via.center.x)), \(formatMM(via.center.y))) lost its net "
+                    + "\(lost) — that net is no longer in the schematic, so the "
+                    + "via is unconnected. It has not been deleted.")
+            }
+            vias.append(via)
+        }
+        var zones: [BoardZone] = []
+        for var zone in state.zones {
+            if let net = zone.netName, !validNets.contains(net) {
+                zone.disconnectedNetName = net
+                zone.netName = nil
+            } else if zone.netName == nil,
+                      let lost = zone.disconnectedNetName,
+                      validNets.contains(lost) {
+                zone.netName = lost
+                zone.disconnectedNetName = nil
+            }
+            if let lost = zone.disconnectedNetName {
+                problems.append(
+                    "The copper fill on \(zone.layer) lost its net "
+                    + "\(lost) — that net is no longer in the schematic, so the "
+                    + "fill is unconnected. It has not been deleted.")
+            }
+            zones.append(zone)
+        }
+
+        // -- Items on copper layers the board no longer has (part
+        // 5, layer-count reduction): traces/zones on a removed inner
+        // layer are KEPT (never silently dropped), hidden by the
+        // layer stack, and named here until the count is restored
+        // or the item is deleted. --
+        let liveLayers = Set(BoardLayers.copperLayers(count: state.copperLayerCount))
+        for trace in traces where !liveLayers.contains(trace.layer) {
+            problems.append(
+                "A trace sits on \(trace.layer), which this board no longer has "
+                + "(\(state.copperLayerCount) copper layers). It is kept but "
+                + "hidden — raise the copper layer count or delete it.")
+        }
+        for zone in zones where !liveLayers.contains(zone.layer) {
+            problems.append(
+                "A copper fill sits on \(zone.layer), which this board no longer has "
+                + "(\(state.copperLayerCount) copper layers). It is kept but "
+                + "hidden — raise the copper layer count or delete it.")
+        }
+
         model.traces = traces
+        model.vias = vias
+        model.zones = zones
         model.graphics = state.graphics
         model.boardProblems = problems
 
@@ -255,6 +438,14 @@ enum PCBBoardMerger {
         canonical.traces = traces
         canonical.graphics = state.graphics
         canonical.knownReferences = baseReferences
+        canonical.vias = vias
+        canonical.zones = zones
+        canonical.sides = state.sides.filter {
+            baseReferenceSet.contains($0.key)
+        }
+        canonical.copperLayerCount = state.copperLayerCount
+        canonical.gridMil = state.gridMil
+        canonical.clearanceMil = state.clearanceMil
         return (model, report, canonical)
     }
 
@@ -283,14 +474,34 @@ struct BoardVisibility: Equatable {
     var showText = true
     var showDimensions = true
 
+    /// The board's copper layer count (part 5): the copper stack —
+    /// and therefore the "*.Cu" wildcard and orphan-layer hiding —
+    /// follows it. Defaults to the part-4 four-layer stack.
+    var copperLayerCount: Int = 4
+
+    /// The part-4 copper stack (count 4), kept for the editor's
+    /// static references.
     static let copperLayers = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
 
+    /// This board's copper stack.
+    var copperLayers: [String] {
+        BoardLayers.copperLayers(count: copperLayerCount)
+    }
+
+    /// Is `layer` part of this board's layer stack at all? A layer
+    /// outside the stack (e.g. In2.Cu on a 2-layer board) is never
+    /// shown — items on it are kept but hidden (part 5).
+    func layerExists(_ layer: String) -> Bool {
+        BoardLayers.allLayers(copperCount: copperLayerCount).contains(layer)
+    }
+
     /// Is one layer name shown? The KiCad wildcard "*.Cu" counts as
-    /// shown when ANY copper layer is shown.
+    /// shown when ANY of the board's copper layers is shown.
     func layerShown(_ layer: String) -> Bool {
         if layer == "*.Cu" {
-            return Self.copperLayers.contains { !hiddenLayers.contains($0) }
+            return copperLayers.contains { !hiddenLayers.contains($0) }
         }
+        guard layerExists(layer) else { return false }
         return !hiddenLayers.contains(layer)
     }
 
@@ -320,6 +531,16 @@ struct BoardVisibility: Equatable {
         showTracks && layerShown(trace.layer)
     }
 
+    /// A via spans the whole copper stack: it shows when the Vias
+    /// class is on and at least one copper layer is shown.
+    func viaShown(_ via: BoardVia) -> Bool {
+        showVias && copperLayers.contains { !hiddenLayers.contains($0) }
+    }
+
+    func zoneShown(_ zone: BoardZone) -> Bool {
+        showZones && layerShown(zone.layer)
+    }
+
     func boardGraphicShown(_ item: BoardGraphicItem) -> Bool {
         guard layerShown(item.layer) else { return false }
         return item.kind == .text ? showText : showDrawings
@@ -332,22 +553,28 @@ struct BoardVisibility: Equatable {
 /// rows map 1:1 onto PadCB's selectable classes.
 struct BoardSelectionFilter: Equatable {
     enum ItemKind {
-        case component, trace, graphic, text
+        case component, trace, graphic, text, via, zone
     }
 
     var components = true
     var traces = true
     var graphics = true
     var text = true
+    var vias = true
+    var zones = true
 
     /// The "All items" row: on exactly when every class is on.
-    var allItems: Bool { components && traces && graphics && text }
+    var allItems: Bool {
+        components && traces && graphics && text && vias && zones
+    }
 
     mutating func setAll(_ on: Bool) {
         components = on
         traces = on
         graphics = on
         text = on
+        vias = on
+        zones = on
     }
 
     func allows(_ kind: ItemKind) -> Bool {
@@ -356,6 +583,8 @@ struct BoardSelectionFilter: Equatable {
         case .trace: return traces
         case .graphic: return graphics
         case .text: return text
+        case .via: return vias
+        case .zone: return zones
         }
     }
 }
@@ -389,11 +618,16 @@ enum BoardCanvasMetrics {
 enum BoardGeometry {
 
     /// Board-space bounds of one placed component (its footprint's
-    /// bounds at its origin, or the placeholder box).
+    /// bounds at its origin, or the placeholder box). A back-side
+    /// footprint's bounds are the MIRRORED front bounds.
     static func componentBounds(_ component: BoardComponent)
         -> (minX: Double, minY: Double, maxX: Double, maxY: Double) {
         if let footprint = component.footprint {
             let b = footprint.bounds
+            if component.side == .back {
+                return (component.origin.x - b.maxX, component.origin.y + b.minY,
+                        component.origin.x - b.minX, component.origin.y + b.maxY)
+            }
             return (component.origin.x + b.minX, component.origin.y + b.minY,
                     component.origin.x + b.maxX, component.origin.y + b.maxY)
         }
@@ -402,10 +636,114 @@ enum BoardGeometry {
                 component.origin.y + component.boundsSize.h)
     }
 
-    /// Board-space centre of one pad of a placed component.
+    /// The layer a front-side layer becomes when flipped to the
+    /// back (and vice versa): F.* <-> B.*; "*.Cu" and unprefixed
+    /// layers (Edge.Cuts, Dwgs.User…) do not change.
+    static func flippedLayerName(_ layer: String) -> String {
+        if layer.hasPrefix("F.") { return "B." + layer.dropFirst(2) }
+        if layer.hasPrefix("B.") { return "F." + layer.dropFirst(2) }
+        return layer
+    }
+
+    /// A footprint-local point in board space for this component,
+    /// honouring its side: back-side local points are MIRRORED
+    /// across the vertical axis through the origin (x negates).
+    static func localToBoard(_ component: BoardComponent,
+                             _ point: FPPoint) -> FPPoint {
+        if component.side == .back {
+            return FPPoint(x: component.origin.x - point.x,
+                           y: component.origin.y + point.y)
+        }
+        return FPPoint(x: component.origin.x + point.x,
+                       y: component.origin.y + point.y)
+    }
+
+    /// The pad as it physically sits for this component: for a
+    /// back-side footprint the pad is mirrored (centre x negates,
+    /// rotation negates — pads are 180°-symmetric, so negation is
+    /// the mirror), the drill offset mirrors, and its layers swap
+    /// front<->back. For a front-side component this is the pad
+    /// itself. Every consumer (drawing, hit-testing, checks) works
+    /// with THIS pad so the flip is true everywhere at once.
+    static func boardPad(_ component: BoardComponent,
+                         _ pad: KiCadFootprintPad) -> KiCadFootprintPad {
+        guard component.side == .back else { return pad }
+        var flipped = pad
+        flipped.x = -pad.x
+        flipped.rotation = -pad.rotation
+        flipped.layers = pad.layers.map { flippedLayerName($0) }
+        if var drill = pad.drill {
+            drill.offsetX = -drill.offsetX
+            flipped.drill = drill
+        }
+        // Custom-pad primitives live in pad-local coordinates; the
+        // negated rotation above carries them with the mirror.
+        return flipped
+    }
+
+    /// A footprint graphic as it sits for this component: points
+    /// mirrored (x negates) and layer flipped for back-side parts.
+    /// Text graphics also negate their rotation; the canvas draws
+    /// back-side text with a horizontal mirror so the LETTERS read
+    /// mirrored, as they do on a real board's back.
+    static func boardGraphic(_ component: BoardComponent,
+                             _ graphic: KiCadFootprintGraphic)
+        -> KiCadFootprintGraphic {
+        guard component.side == .back else { return graphic }
+        func mirror(_ p: FPPoint) -> FPPoint { FPPoint(x: -p.x, y: p.y) }
+        switch graphic {
+        case .line(let a, let b, let layer, let w, let t, let f):
+            return .line(start: mirror(a), end: mirror(b),
+                         layer: flippedLayerName(layer),
+                         strokeWidth: w, strokeType: t, fill: f)
+        case .rect(let a, let b, let layer, let w, let t, let f):
+            return .rect(start: mirror(a), end: mirror(b),
+                         layer: flippedLayerName(layer),
+                         strokeWidth: w, strokeType: t, fill: f)
+        case .circle(let c, let r, let layer, let w, let t, let f):
+            return .circle(center: mirror(c), radius: r,
+                           layer: flippedLayerName(layer),
+                           strokeWidth: w, strokeType: t, fill: f)
+        case .arc(let a, let m, let b, let layer, let w, let t, let f):
+            return .arc(start: mirror(a), mid: mirror(m), end: mirror(b),
+                        layer: flippedLayerName(layer),
+                        strokeWidth: w, strokeType: t, fill: f)
+        case .poly(let points, let layer, let w, let t, let f):
+            return .poly(points: points.map(mirror),
+                         layer: flippedLayerName(layer),
+                         strokeWidth: w, strokeType: t, fill: f)
+        case .curve(let p1, let p2, let p3, let p4, let layer, let w, let t, let f):
+            return .curve(p1: mirror(p1), p2: mirror(p2),
+                          p3: mirror(p3), p4: mirror(p4),
+                          layer: flippedLayerName(layer),
+                          strokeWidth: w, strokeType: t, fill: f)
+        case .text(var text):
+            text.x = -text.x
+            text.rotation = -text.rotation
+            text.layer = flippedLayerName(text.layer)
+            return .text(text)
+        }
+    }
+
+    /// Board-space centre of one pad of a placed component. Pass
+    /// the RAW pad (straight from `footprint.pads`): the mirror
+    /// for a back-side component is applied here, exactly once.
+    /// (For size/rotation/layers use `boardPad`, whose centre is
+    /// the same point minus the origin.)
     static func padCenter(_ component: BoardComponent,
                           _ pad: KiCadFootprintPad) -> FPPoint {
-        FPPoint(x: component.origin.x + pad.x, y: component.origin.y + pad.y)
+        localToBoard(component, FPPoint(x: pad.x, y: pad.y))
+    }
+
+    /// Board-space outline corners of one pad (raw pad in, flipped
+    /// as the component's side demands).
+    static func padOutline(_ component: BoardComponent,
+                           _ pad: KiCadFootprintPad) -> [FPPoint] {
+        let effective = boardPad(component, pad)
+        return effective.outlineCorners.map {
+            FPPoint(x: component.origin.x + $0.x,
+                    y: component.origin.y + $0.y)
+        }
     }
 
     /// The net a pad carries, via the component's pin binding of the
@@ -427,11 +765,12 @@ enum BoardGeometry {
         for component in model.components {
             guard let footprint = component.footprint else { continue }
             for pad in footprint.pads {
+                let effective = boardPad(component, pad)
                 let centre = padCenter(component, pad)
-                let halfW = pad.width / 2 + tolerance
-                let halfH = pad.height / 2 + tolerance
+                let halfW = effective.width / 2 + tolerance
+                let halfH = effective.height / 2 + tolerance
                 let local = FPPoint(x: point.x - centre.x, y: point.y - centre.y)
-                    .rotated(degrees: -pad.rotation)
+                    .rotated(degrees: -effective.rotation)
                 guard abs(local.x) <= halfW, abs(local.y) <= halfH else { continue }
                 let distance = centre.distance(to: point)
                 if best == nil || distance < best!.distance {
@@ -525,6 +864,71 @@ enum BoardGeometry {
         for item in model.graphics.reversed()
         where graphicHit(item, point: point, tolerance: tolerance) {
             return item
+        }
+        return nil
+    }
+
+    /// A via is hit when the point falls within its annular ring
+    /// (or the tap tolerance, whichever reaches further).
+    static func viaHit(_ via: BoardVia, point: FPPoint,
+                       tolerance: Double) -> Bool {
+        via.center.distance(to: point) <= max(tolerance, via.diameter / 2)
+    }
+
+    static func viaAt(_ model: BoardModel, point: FPPoint,
+                      tolerance: Double) -> BoardVia? {
+        for via in model.vias.reversed()
+        where viaHit(via, point: point, tolerance: tolerance) {
+            return via
+        }
+        return nil
+    }
+
+    /// Point-in-polygon (even-odd ray cast). The polygon closes
+    /// implicitly. Points exactly on an edge count as inside.
+    static func pointInPolygon(_ point: FPPoint, polygon: [FPPoint]) -> Bool {
+        guard polygon.count >= 3 else { return false }
+        for index in polygon.indices {
+            let a = polygon[index]
+            let b = polygon[(index + 1) % polygon.count]
+            if distance(point: point, segmentStart: a, segmentEnd: b) < 1e-9 {
+                return true
+            }
+        }
+        var inside = false
+        var previous = polygon[polygon.count - 1]
+        for current in polygon {
+            if (current.y > point.y) != (previous.y > point.y) {
+                let crossX = (previous.x - current.x) * (point.y - current.y)
+                    / (previous.y - current.y) + current.x
+                if point.x < crossX { inside.toggle() }
+            }
+            previous = current
+        }
+        return inside
+    }
+
+    /// A zone is hit when the point is inside its polygon (or
+    /// within the tap tolerance of its outline).
+    static func zoneHit(_ zone: BoardZone, point: FPPoint,
+                        tolerance: Double) -> Bool {
+        if pointInPolygon(point, polygon: zone.points) { return true }
+        guard zone.points.count >= 2 else { return false }
+        for index in zone.points.indices {
+            let a = zone.points[index]
+            let b = zone.points[(index + 1) % zone.points.count]
+            if distance(point: point, segmentStart: a, segmentEnd: b) <= tolerance {
+                return true
+            }
+        }
+        return false
+    }
+
+    static func zoneAt(_ model: BoardModel, point: FPPoint,
+                       tolerance: Double) -> BoardZone? {
+        for zone in model.zones.reversed()
+        where zoneHit(zone, point: point, tolerance: tolerance) {
+            return zone
         }
         return nil
     }

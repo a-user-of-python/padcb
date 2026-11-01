@@ -19,6 +19,9 @@ SWIFT_FILES = [
     # Part 4: persisted board state (placements/traces/graphics),
     # sync merge, visibility/filter predicates, board geometry.
     "PCBBoardState.swift",
+    # Part 5: design checks (units/grid/layers, connectivity,
+    # clearance, manufacturing, theory) + the on-device AI bridge.
+    "PCBDesignChecks.swift", "TheoryAIBridge.swift",
 ]
 
 

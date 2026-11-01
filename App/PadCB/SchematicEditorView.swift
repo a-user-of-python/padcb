@@ -223,13 +223,17 @@ struct SchematicEditorView: View {
                 HStack(spacing: 6) {
                     Image(systemName: "pencil")
                         .lineLimit(1)
+                    // Capped + tail-truncated (part 5 polish): the
+                    // button used to be fixed-size, so a long title
+                    // could push the whole top bar off the panel.
                     Text(document.state.title)
                         .font(.headline)
                         .lineLimit(1)
+                        .truncationMode(.tail)
+                        .frame(maxWidth: 280, alignment: .leading)
                 }
             }
             .buttonStyle(.plain)
-            .fixedSize(horizontal: true, vertical: false)
 
             Spacer(minLength: 0)
         }

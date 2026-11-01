@@ -1,26 +1,39 @@
 import SwiftUI
 
-/// PCB editor (part 4) — a WORKING editor modelled on KiCad 10's PCB
-/// editor (pcbnew): merged title/table bar on top, menu strip, icon
-/// strip, tool rail on the left, board canvas in the centre,
-/// Layers / Objects / Components panels on the right, KiCad-style
-/// status bar along the bottom.
+/// PCB editor (parts 4 + 5) — a WORKING editor modelled on KiCad
+/// 10's PCB editor (pcbnew): merged title/table bar on top, menu
+/// strip, icon strip, tool rail on the left, board canvas in the
+/// centre, Layers / Objects / Components panels on the right,
+/// KiCad-style status bar along the bottom.
 ///
 /// Everything visible does something real:
 /// - The board is built from a saved connection table (the same
 ///   tables the schematic editor writes on every save) and "Sync
 ///   from Schematic" merges a re-read of that table into the board
 ///   (see PCBBoardState.swift for the merge rules).
-/// - Select: tap selects components / traces / graphics; dragging a
-///   component MOVES it (drag elsewhere pans). Delete removes the
-///   selected item (a deleted footprint is excluded; a later Sync
-///   restores it and says so).
+/// - Select: tap selects components / traces / vias / zones /
+///   graphics; the Multi toggle makes taps ADD to the selection
+///   (mixed selections allowed; a trace subtotal shows whenever
+///   traces are selected). Dragging a selected component moves the
+///   selected components together. Delete removes the selection.
 /// - Route Tracks lays real, resizeable copper traces with KiCad's
-///   45° bend rule; Draw Line / Arc / Circle and Text place real
-///   board graphics; Highlight Net lights every pad and trace of a
-///   net. Layer eyes, object toggles and the selection filter all
-///   drive BoardVisibility / BoardSelectionFilter — the same
-///   predicates the BoardFixture harness asserts.
+///   45° bend rule; a width slider lives at the bottom while the
+///   tool is active; Apple Pencil hover previews the next segment.
+///   Place Via and Fill Zone add real vias and copper fills. Draw
+///   Line / Arc / Circle and Text place real board graphics on the
+///   ACTIVE layer (any layer can be active; routing and vias still
+///   need a copper layer and say so).
+/// - Flip Side / Change Layer moves footprints and traces between
+///   F.Cu and B.Cu only; footprints mirror KiCad-style (pads,
+///   silkscreen and text mirror; pin↔pad bindings stay exact).
+/// - The snap grid is adjustable IN MILS and applies to every
+///   placement and move; the copper layer count is configurable
+///   per board (items on removed layers are kept, hidden and
+///   listed in Problems — never silently dropped).
+/// - Checking, three tiers: the clearance (net-touch) check feeds
+///   Problems live; "Manufacturing Check" runs a deterministic
+///   rule set; "Theory Check" runs deterministic heuristics plus
+///   an optional, fully on-device AI pass (see PCBDesignChecks).
 /// - All board work persists per schematic table as a JSON sidecar
 ///   in Documents/Boards and reloads on open.
 ///
@@ -42,6 +55,8 @@ struct PCBEditorView: View {
         case drawArc = "Draw Arc"
         case drawCircle = "Draw Circle"
         case text = "Text"
+        case placeVia = "Place Via"
+        case fillZone = "Fill Zone"
 
         var icon: String {
             switch self {
@@ -53,19 +68,31 @@ struct PCBEditorView: View {
             case .drawArc: return "moon"
             case .drawCircle: return "circle"
             case .text: return "textformat"
+            case .placeVia: return "circle.circle"
+            case .fillZone: return "hexagon"
             }
         }
     }
 
-    /// What the canvas has selected — exactly one board item.
-    enum BoardSelection: Equatable {
+    /// What the canvas has selected — one board item. The editor
+    /// keeps a SET of these (multi-select, part 5) plus a primary
+    /// (the most recently tapped) whose detail the panel shows.
+    enum BoardSelection: Equatable, Hashable {
         case component(String)
         case trace(UUID)
         case graphic(UUID)
+        case via(UUID)
+        case zone(UUID)
     }
 
     private enum DragMode {
-        case undecided, pan, moveComponent
+        case undecided, pan, moveComponents, moveVia
+    }
+
+    /// Which chooser the net-picker sheet is serving.
+    private enum NetChoicePurpose {
+        case via(FPPoint)
+        case zone
     }
 
     // Table / model state. `baseModel` is the builder's output for
@@ -91,11 +118,24 @@ struct PCBEditorView: View {
     @State private var offset: CGPoint = CGPoint(x: 30, y: 30)
     @State private var dragStartOffset: CGPoint? = nil
     @State private var dragMode: DragMode = .undecided
-    @State private var movingReference: String? = nil
-    @State private var moveStartOrigin: FPPoint? = nil
-    @State private var movePreviewOrigin: FPPoint? = nil
+    /// Group move (part 5): every selected component's start origin,
+    /// and the live preview origins while dragging.
+    @State private var moveStartOrigins: [String: FPPoint] = [:]
+    @State private var movePreviewOrigins: [String: FPPoint] = [:]
+    @State private var movingViaID: UUID? = nil
+    @State private var moveViaStart: FPPoint? = nil
+    @State private var moveViaPreview: FPPoint? = nil
+    /// In Multi mode, the component a press started on: if the
+    /// press ends as a tap, it toggles; if it becomes a drag, the
+    /// selected group moves. (Decided at drag end — see canvasDrag.)
+    @State private var dragTapReference: String? = nil
     @State private var pinchStartScale: Double? = nil
     @State private var cursorBoard: FPPoint? = nil
+    /// Apple Pencil hover position (part 5) — the prospective
+    /// routing/drawing point when no touch is down. Nil without a
+    /// pencil (or mouse) over the canvas; everything degrades to
+    /// the plain touch behaviour.
+    @State private var hoverBoard: FPPoint? = nil
     @State private var canvasSize: CGSize = .zero
     @State private var showGrid = true
     @State private var highlightActiveLayer = false
@@ -105,16 +145,29 @@ struct PCBEditorView: View {
     @State private var activePanelTab = "Layers"
     @State private var visibility = BoardVisibility()
     @State private var selectionFilter = BoardSelectionFilter()
-    @State private var selection: BoardSelection? = nil
+    @State private var selections: Set<BoardSelection> = []
+    @State private var primarySelection: BoardSelection? = nil
+    @State private var multiSelect = false
     @State private var highlightedNet: String? = nil
-    @State private var activeCopperLayer = "F.Cu"
-    @State private var drawLayer = "Dwgs.User"
+    /// The ACTIVE layer (part 5): any layer can be active — draw
+    /// tools draw here; routing/vias require a copper layer.
+    @State private var activeLayer = "F.Cu"
+    /// Snap-to-grid master switch (the spacing itself is board
+    /// state: `boardState.gridMil`, adjustable in mils).
+    @State private var snapEnabled = true
 
     // Routing state (Route Tracks tool)
     @State private var routePoints: [FPPoint] = []
     @State private var routeNet: String? = nil
     @State private var currentTrackWidth: Double = 0.25
     @AppStorage("padcb.defaultTrackWidth") private var defaultTrackWidth: Double = 0.25
+
+    // Via placement state
+    @State private var currentViaDiameter = 0.8
+    @State private var currentViaDrill = 0.4
+
+    // Zone drawing state: vertices collected toward a fill.
+    @State private var zonePoints: [FPPoint] = []
 
     // Draw-tool state: taps collected toward a line / arc / circle
     @State private var pendingPoints: [FPPoint] = []
@@ -124,56 +177,167 @@ struct PCBEditorView: View {
     @State private var showTextPrompt = false
     // Board statistics alert
     @State private var showStats = false
+    // Checker sheets + net picker + custom-value alerts (part 5)
+    @State private var showManufacturing = false
+    @State private var showTheory = false
+    @State private var netChoicePurpose: NetChoicePurpose? = nil
+    @State private var showGridCustom = false
+    @State private var showClearanceCustom = false
+    @State private var customValueDraft = ""
 
-    private static let gridSize = 2.54 // mm, KiCad's default course grid
-    private static let snapMM = 0.127  // placement/routing snap (5 mil)
+    // Checker caches, recomputed whenever the model changes
+    // (connectivity feeds pin status + Inspect; clearance feeds
+    // Problems). See refreshChecks().
+    @State private var connectivity: [String: NetConnectivity] = [:]
+    @State private var clearanceViolations: [ClearanceViolation] = []
 
-    private static let layerRows: [(name: String, color: Color)] = [
-        ("F.Cu", Color(red: 0.85, green: 0.25, blue: 0.2)),
-        ("In1.Cu", Color(red: 0.9, green: 0.6, blue: 0.2)),
-        ("In2.Cu", Color(red: 0.6, green: 0.75, blue: 0.25)),
-        ("B.Cu", Color(red: 0.25, green: 0.45, blue: 0.9)),
-        ("F.Adhes", Color(red: 0.7, green: 0.3, blue: 0.7)),
-        ("B.Adhes", Color(red: 0.45, green: 0.3, blue: 0.7)),
-        ("F.Paste", Color(red: 0.6, green: 0.6, blue: 0.65)),
-        ("B.Paste", Color(red: 0.5, green: 0.55, blue: 0.7)),
-        ("F.SilkS", Color(red: 0.95, green: 0.9, blue: 0.6)),
-        ("B.SilkS", Color(red: 0.6, green: 0.75, blue: 0.75)),
-        ("F.Mask", Color(red: 0.55, green: 0.2, blue: 0.55)),
-        ("B.Mask", Color(red: 0.25, green: 0.35, blue: 0.6)),
-        ("Dwgs.User", Color(red: 0.65, green: 0.65, blue: 0.65)),
-        ("Edge.Cuts", Color(red: 0.95, green: 0.85, blue: 0.2)),
-        ("F.CrtYd", Color(red: 0.8, green: 0.8, blue: 0.8)),
-        ("B.CrtYd", Color(red: 0.55, green: 0.55, blue: 0.55)),
-        ("F.Fab", Color(red: 0.75, green: 0.75, blue: 0.7)),
-        ("B.Fab", Color(red: 0.5, green: 0.55, blue: 0.55)),
+    /// Per-layer display colours. Copper rows are generated from
+    /// the board's copper count (inner layers cycle the palette);
+    /// the named rows keep the part-4 colours.
+    private static let namedLayerColors: [String: Color] = [
+        "F.Cu": Color(red: 0.85, green: 0.25, blue: 0.2),
+        "B.Cu": Color(red: 0.25, green: 0.45, blue: 0.9),
+        "F.Adhes": Color(red: 0.7, green: 0.3, blue: 0.7),
+        "B.Adhes": Color(red: 0.45, green: 0.3, blue: 0.7),
+        "F.Paste": Color(red: 0.6, green: 0.6, blue: 0.65),
+        "B.Paste": Color(red: 0.5, green: 0.55, blue: 0.7),
+        "F.SilkS": Color(red: 0.95, green: 0.9, blue: 0.6),
+        "B.SilkS": Color(red: 0.6, green: 0.75, blue: 0.75),
+        "F.Mask": Color(red: 0.55, green: 0.2, blue: 0.55),
+        "B.Mask": Color(red: 0.25, green: 0.35, blue: 0.6),
+        "Dwgs.User": Color(red: 0.65, green: 0.65, blue: 0.65),
+        "Edge.Cuts": Color(red: 0.95, green: 0.85, blue: 0.2),
+        "F.CrtYd": Color(red: 0.8, green: 0.8, blue: 0.8),
+        "B.CrtYd": Color(red: 0.55, green: 0.55, blue: 0.55),
+        "F.Fab": Color(red: 0.75, green: 0.75, blue: 0.7),
+        "B.Fab": Color(red: 0.5, green: 0.55, blue: 0.55),
+    ]
+    private static let innerCopperPalette: [Color] = [
+        Color(red: 0.9, green: 0.6, blue: 0.2),
+        Color(red: 0.6, green: 0.75, blue: 0.25),
+        Color(red: 0.3, green: 0.7, blue: 0.6),
+        Color(red: 0.65, green: 0.45, blue: 0.85),
     ]
 
-    private static let drawingLayers = ["Dwgs.User", "Edge.Cuts",
-                                        "F.SilkS", "B.SilkS", "F.Fab", "B.Fab"]
+    /// Colour for an inner copper layer ("In3.Cu"): cycles the
+    /// inner palette by layer number.
+    private static func innerCopperColor(_ name: String) -> Color {
+        let digits = name.dropFirst(2).dropLast(3) // "In3.Cu" -> "3"
+        let number = Int(digits) ?? 1
+        return innerCopperPalette[(number - 1) % innerCopperPalette.count]
+    }
+
+    /// The Layers-panel rows for the CURRENT board: its copper
+    /// stack first, then the fixed non-copper layers.
+    private var layerRows: [(name: String, color: Color)] {
+        let copper = BoardLayers.copperLayers(count: boardState.copperLayerCount)
+        return copper.map { name in
+            (name, Self.namedLayerColors[name] ?? Self.innerCopperColor(name))
+        } + BoardLayers.nonCopperLayers.map { name in
+            (name, Self.namedLayerColors[name] ?? .gray)
+        }
+    }
+
+    private func layerColor(_ name: String) -> Color {
+        Self.namedLayerColors[name] ?? layerRows.first { $0.name == name }?.color
+            ?? Color(red: 0.85, green: 0.3, blue: 0.25)
+    }
+
+    // MARK: - Selection helpers (multi-select, part 5)
 
     private var selectedComponent: BoardComponent? {
-        guard case .component(let reference)? = selection else { return nil }
+        guard case .component(let reference)? = primarySelection else { return nil }
         return model?.components.first { $0.reference == reference }
     }
 
     private var selectedTrace: BoardTrace? {
-        guard case .trace(let id)? = selection else { return nil }
+        guard case .trace(let id)? = primarySelection else { return nil }
         return model?.traces.first { $0.id == id }
     }
 
     private var selectedGraphic: BoardGraphicItem? {
-        guard case .graphic(let id)? = selection else { return nil }
+        guard case .graphic(let id)? = primarySelection else { return nil }
         return model?.graphics.first { $0.id == id }
+    }
+
+    private var selectedVia: BoardVia? {
+        guard case .via(let id)? = primarySelection else { return nil }
+        return model?.vias.first { $0.id == id }
+    }
+
+    private var selectedZone: BoardZone? {
+        guard case .zone(let id)? = primarySelection else { return nil }
+        return model?.zones.first { $0.id == id }
+    }
+
+    private var selectedTraces: [BoardTrace] {
+        guard let model else { return [] }
+        return model.traces.filter {
+            selections.contains(.trace($0.id))
+        }
+    }
+
+    private func selectOnly(_ item: BoardSelection?) {
+        selections = item.map { [$0] } ?? []
+        primarySelection = item
+    }
+
+    private func toggleSelection(_ item: BoardSelection) {
+        if selections.contains(item) {
+            selections.remove(item)
+            if primarySelection == item { primarySelection = selections.first }
+        } else {
+            selections.insert(item)
+            primarySelection = item
+        }
+    }
+
+    /// Tap semantics shared by the select tool: with Multi on, taps
+    /// toggle; off, a tap replaces the selection (v4 behaviour).
+    private func applyTapSelection(_ item: BoardSelection) {
+        if multiSelect { toggleSelection(item) } else { selectOnly(item) }
+    }
+
+    private func clearSelection() {
+        selections = []
+        primarySelection = nil
+    }
+
+    /// "3 objects · 2 traces · 25.40 mm · 1000 mil total" — the
+    /// traces subtotal Sean pinned: shown whenever the selection
+    /// contains traces, in single AND mixed selections.
+    private var selectionSummaryText: String? {
+        guard !selections.isEmpty else { return nil }
+        var text = selections.count == 1 ? "1 object" : "\(selections.count) objects"
+        let traces = selectedTraces
+        if !traces.isEmpty {
+            let total = traces.reduce(0) { $0 + $1.length }
+            text += " · \(traces.count) trace\(traces.count == 1 ? "" : "s")"
+                + " · \(BoardUnits.formatLength(mm: total)) total"
+        }
+        return text
     }
 
     private var problemCount: Int {
         guard let model else { return 0 }
         return model.globalAnomalies.count + model.boardProblems.count
             + model.components.reduce(0) { $0 + $1.anomalies.count }
+            + clearanceViolations.count
     }
 
     private var routingActive: Bool { !routePoints.isEmpty }
+    private var zoneActive: Bool { !zonePoints.isEmpty }
+
+    /// The snap grid in board state is in MILS (Sean's unit); the
+    /// canvas works in mm.
+    private var gridMM: Double { BoardUnits.mm(fromMil: boardState.gridMil) }
+
+    /// Snap a placement point to the user's grid when snapping is
+    /// on. Pad centres are NEVER routed through here (they stay
+    /// exact — see the routing code).
+    private func snapPoint(_ point: FPPoint) -> FPPoint {
+        snapEnabled ? BoardGrid.snap(point, gridMil: boardState.gridMil) : point
+    }
 
     var body: some View {
         ZStack {
@@ -184,6 +348,10 @@ struct PCBEditorView: View {
                 iconStrip
                 Divider()
                 centre
+                if activeTool == .route {
+                    Divider()
+                    routeWidthBar
+                }
                 Divider()
                 statusBar
             }
@@ -211,25 +379,96 @@ struct PCBEditorView: View {
             Button("Place") { placeText() }
             Button("Cancel", role: .cancel) { textAnchor = nil }
         } message: {
-            Text("The text is drawn on \(drawLayer) at the tapped point.")
+            Text("The text is drawn on \(activeLayer) at the tapped point.")
         }
         .alert("Board Statistics", isPresented: $showStats) {
             Button("OK", role: .cancel) {}
         } message: {
             Text(statsText)
         }
+        .alert("Custom Grid Spacing", isPresented: $showGridCustom) {
+            TextField("Spacing in mils", text: $customValueDraft)
+                .keyboardType(.decimalPad)
+            Button("Set Grid") {
+                if let mils = Double(customValueDraft), mils > 0, mils <= 1000 {
+                    setGridMil(mils)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Snap grid spacing, in mils (1 mil = 0.0254 mm).")
+        }
+        .alert("Custom Clearance", isPresented: $showClearanceCustom) {
+            TextField("Clearance in mils", text: $customValueDraft)
+                .keyboardType(.decimalPad)
+            Button("Set Clearance") {
+                if let mils = Double(customValueDraft), mils > 0, mils <= 200 {
+                    setClearanceMil(mils)
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Minimum gap between different nets' copper, in mils. The clearance check and the fill rendering use it.")
+        }
+        .sheet(isPresented: $showManufacturing) {
+            manufacturingSheet
+        }
+        .sheet(isPresented: $showTheory) {
+            theorySheet
+        }
+        .sheet(isPresented: Binding(
+            get: { netChoicePurpose != nil },
+            set: { if !$0 { netChoicePurpose = nil } }
+        )) {
+            netPickerSheet
+        }
     }
 
     private var statsText: String {
         guard let model else { return "No board loaded." }
         let connected = model.traces.filter { $0.netName != nil }.count
-        return """
+        var text = """
         \(model.components.count) components · \(model.netCount) nets
         \(model.traces.count) traces (\(connected) connected)
+        \(model.vias.count) vias · \(model.zones.count) copper fills
         \(model.graphics.count) board graphics
         \(problemCount) problems
-        Board state: Documents/Boards/\(tableStem).board.json
         """
+        let routedNets = model.netNames.filter {
+            (connectivity[$0]?.traceLength ?? 0) > 0
+        }.sorted()
+        if !routedNets.isEmpty {
+            text += "\n\nRouted length per net:"
+            for net in routedNets {
+                let info = connectivity[net]!
+                text += "\n\(net): \(BoardUnits.formatLength(mm: info.traceLength))"
+                    + " · \(info.routedPadCount)/\(info.padCount) pads routed"
+            }
+        }
+        text += "\n\nBoard state: Documents/Boards/\(tableStem).board.json"
+        return text
+    }
+
+    // MARK: - Checker caches
+
+    /// Recompute connectivity + clearance from the current model.
+    /// Called after every model change (load, sync, mutation) so
+    /// pin status, Problems and Inspect always read fresh truth.
+    private func refreshChecks() {
+        guard let model else {
+            connectivity = [:]
+            clearanceViolations = []
+            return
+        }
+        connectivity = BoardConnectivity.analyze(
+            model: model, copperCount: boardState.copperLayerCount)
+        clearanceViolations = BoardClearance.violations(
+            model: model, copperCount: boardState.copperLayerCount,
+            clearanceMM: BoardUnits.mm(fromMil: boardState.clearanceMil))
+    }
+
+    private var manufacturingSettings: ManufacturingSettings {
+        ManufacturingSettings(clearanceMil: boardState.clearanceMil)
     }
 
     // MARK: - Centre (empty / loading / error / editor)
@@ -418,8 +657,14 @@ struct PCBEditorView: View {
                 redoStack = []
                 cancelInProgress()
                 highlightedNet = nil
-                selection = result.merged.components.first
-                    .map { BoardSelection.component($0.reference) }
+                visibility.copperLayerCount = result.canonical.copperLayerCount
+                if !BoardLayers.layerExists(activeLayer,
+                                             copperCount: result.canonical.copperLayerCount) {
+                    activeLayer = "F.Cu"
+                }
+                refreshChecks()
+                selectOnly(result.merged.components.first
+                    .map { BoardSelection.component($0.reference) })
             }
         } catch {
             if selectedURL == url {
@@ -505,15 +750,21 @@ struct PCBEditorView: View {
                 suppressTaskLoad = true
                 selectedURL = url
             }
-            // Selection survives only if its item still exists.
-            if let selection, !selectionExists(selection, in: built.merged) {
-                self.selection = built.merged.components.first
-                    .map { BoardSelection.component($0.reference) }
+            // Selection survives only for items that still exist.
+            selections = selections.filter { selectionExists($0, in: built.merged) }
+            if let primarySelection,
+               !selectionExists(primarySelection, in: built.merged) {
+                self.primarySelection = selections.first
+            }
+            if selections.isEmpty {
+                selectOnly(built.merged.components.first
+                    .map { BoardSelection.component($0.reference) })
             }
             if let highlightedNet,
                !built.merged.netNames.contains(highlightedNet) {
                 self.highlightedNet = nil
             }
+            refreshChecks()
             setStatus(Self.syncSummary(previous: previous, current: built.merged,
                                        report: built.report))
         } catch {
@@ -533,6 +784,10 @@ struct PCBEditorView: View {
             return model.traces.contains { $0.id == id }
         case .graphic(let id):
             return model.graphics.contains { $0.id == id }
+        case .via(let id):
+            return model.vias.contains { $0.id == id }
+        case .zone(let id):
+            return model.zones.contains { $0.id == id }
         }
     }
 
@@ -594,9 +849,15 @@ struct PCBEditorView: View {
         boardState = merged.stateToSave
         model = merged.model
         try? BoardStateStore.save(boardState, tableStem: tableStem)
-        if let selection, !selectionExists(selection, in: merged.model) {
-            self.selection = nil
+        visibility.copperLayerCount = merged.stateToSave.copperLayerCount
+        selections = selections.filter {
+            selectionExists($0, in: merged.model)
         }
+        if let primarySelection,
+           !selectionExists(primarySelection, in: merged.model) {
+            self.primarySelection = selections.first
+        }
+        refreshChecks()
     }
 
     private func undo() {
@@ -617,6 +878,7 @@ struct PCBEditorView: View {
         routePoints = []
         routeNet = nil
         pendingPoints = []
+        zonePoints = []
         textAnchor = nil
     }
 
@@ -624,6 +886,9 @@ struct PCBEditorView: View {
         if routingActive {
             cancelInProgress()
             setStatus("Routing cancelled.")
+        } else if zoneActive {
+            zonePoints = []
+            setStatus("Fill cancelled.")
         } else if !pendingPoints.isEmpty {
             pendingPoints = []
             setStatus("Drawing cancelled.")
@@ -631,7 +896,38 @@ struct PCBEditorView: View {
             highlightedNet = nil
             setStatus("Net highlight cleared.")
         } else {
-            selection = nil
+            clearSelection()
+        }
+    }
+
+    // MARK: - Board settings (grid / clearance / copper count)
+
+    private func setGridMil(_ mils: Double) {
+        mutateBoard { $0.gridMil = mils }
+        setStatus("Snap grid set to \(BoardUnits.formatMil(mils)) mil "
+                  + "(\(PCBBoardMerger.formatMM(BoardUnits.mm(fromMil: mils))) mm).")
+    }
+
+    private func setClearanceMil(_ mils: Double) {
+        mutateBoard { $0.clearanceMil = mils }
+        setStatus("Clearance set to \(BoardUnits.formatMil(mils)) mil — "
+                  + "the clearance check re-ran.")
+    }
+
+    private func setCopperLayerCount(_ count: Int) {
+        mutateBoard { $0.copperLayerCount = count }
+        if !BoardLayers.layerExists(activeLayer, copperCount: count) {
+            activeLayer = "F.Cu"
+        }
+        let orphans = model?.boardProblems.filter {
+            $0.contains("which this board no longer has") } ?? []
+        if orphans.isEmpty {
+            setStatus("Board now has \(count) copper layers.")
+        } else {
+            setStatus("Board now has \(count) copper layers — "
+                      + "\(orphans.count) item(s) sit on layers outside the stack; "
+                      + "they're kept, hidden, and listed in Problems.",
+                      warning: true)
         }
     }
 
@@ -639,6 +935,7 @@ struct PCBEditorView: View {
 
     private func setTool(_ tool: PCBTool) {
         if tool != .route, routingActive { cancelInProgress() }
+        if tool != .fillZone, zoneActive { zonePoints = [] }
         if tool != activeTool { pendingPoints = [] }
         activeTool = tool
     }
@@ -663,8 +960,10 @@ struct PCBEditorView: View {
                 Button("Redo") { redo() }
                     .disabled(redoStack.isEmpty)
                 Divider()
+                Button(flipActionTitle) { flipSelection() }
+                    .disabled(!canFlipSelection)
                 Button("Delete Selection") { deleteSelection() }
-                    .disabled(selection == nil)
+                    .disabled(selections.isEmpty)
                 Button("Clear Net Highlight") { highlightedNet = nil }
                     .disabled(highlightedNet == nil)
             }
@@ -674,16 +973,24 @@ struct PCBEditorView: View {
                 Button("Fit Board") { fitBoard() }
                 Divider()
                 Button(showGrid ? "✓ Grid" : "Grid") { showGrid.toggle() }
+                Button(snapEnabled ? "✓ Snap to Grid" : "Snap to Grid") {
+                    snapEnabled.toggle()
+                }
+                Button(multiSelect ? "✓ Multi-Select" : "Multi-Select") {
+                    multiSelect.toggle()
+                }
                 Button(highlightActiveLayer
                        ? "✓ Highlight Active Layer" : "Highlight Active Layer") {
                     highlightActiveLayer.toggle()
                 }
                 Button("Show All Layers & Objects") {
-                    visibility = BoardVisibility()
+                    visibility = BoardVisibility(
+                        copperLayerCount: boardState.copperLayerCount)
                 }
             }
             Menu("Place") {
-                ForEach([PCBTool.route, .drawLine, .drawArc, .drawCircle, .text],
+                ForEach([PCBTool.route, .drawLine, .drawArc, .drawCircle,
+                         .text, .placeVia, .fillZone],
                         id: \.rawValue) { tool in
                     Button(activeTool == tool ? "✓ \(tool.rawValue)" : tool.rawValue) {
                         setTool(tool)
@@ -716,6 +1023,10 @@ struct PCBEditorView: View {
                 Button("Clear Highlight") { highlightedNet = nil }
                     .disabled(highlightedNet == nil)
                 Divider()
+                Button("Manufacturing Check") { showManufacturing = true }
+                    .disabled(model == nil)
+                Button("Theory Check") { showTheory = true }
+                    .disabled(model == nil)
                 Button("Show Problems") { activePanelTab = "Components" }
                 Button("Board Statistics") { showStats = true }
                     .disabled(model == nil)
@@ -728,6 +1039,42 @@ struct PCBEditorView: View {
                 }
             }
             Menu("Preferences") {
+                Menu("Grid Spacing") {
+                    ForEach(BoardGrid.presetMils, id: \.self) { mils in
+                        Button(boardState.gridMil == mils
+                               ? "✓ \(BoardUnits.formatMil(mils)) mil"
+                               : "\(BoardUnits.formatMil(mils)) mil") {
+                            setGridMil(mils)
+                        }
+                    }
+                    Divider()
+                    Button("Custom…") {
+                        customValueDraft = BoardUnits.formatMil(boardState.gridMil)
+                        showGridCustom = true
+                    }
+                }
+                Menu("Clearance") {
+                    ForEach([4.0, 6.0, 8.0, 10.0, 12.0, 20.0], id: \.self) { mils in
+                        Button(boardState.clearanceMil == mils
+                               ? "✓ \(BoardUnits.formatMil(mils)) mil"
+                               : "\(BoardUnits.formatMil(mils)) mil") {
+                            setClearanceMil(mils)
+                        }
+                    }
+                    Divider()
+                    Button("Custom…") {
+                        customValueDraft = BoardUnits.formatMil(boardState.clearanceMil)
+                        showClearanceCustom = true
+                    }
+                }
+                Menu("Copper Layers") {
+                    ForEach(BoardLayers.copperCountChoices, id: \.self) { count in
+                        Button(boardState.copperLayerCount == count
+                               ? "✓ \(count) layers" : "\(count) layers") {
+                            setCopperLayerCount(count)
+                        }
+                    }
+                }
                 Menu("Default Track Width") {
                     ForEach(BoardGeometry.trackWidthPresets, id: \.self) { width in
                         Button(defaultTrackWidth == width
@@ -738,12 +1085,16 @@ struct PCBEditorView: View {
                         }
                     }
                 }
-                Menu("Draw Layer") {
-                    ForEach(Self.drawingLayers, id: \.self) { layer in
-                        Button(drawLayer == layer ? "✓ \(layer)" : layer) {
-                            drawLayer = layer
+                Menu("Active Layer") {
+                    ForEach(BoardLayers.allLayers(
+                        copperCount: boardState.copperLayerCount), id: \.self) { layer in
+                        Button(activeLayer == layer ? "✓ \(layer)" : layer) {
+                            activeLayer = layer
                         }
                     }
+                }
+                Button(snapEnabled ? "✓ Snap to Grid" : "Snap to Grid") {
+                    snapEnabled.toggle()
                 }
                 Button(showGrid ? "✓ Grid" : "Grid") { showGrid.toggle() }
             }
@@ -781,15 +1132,19 @@ struct PCBEditorView: View {
             iconButton("arrow.up.left.and.arrow.down.right", "Fit") { fitBoard() }
             Divider().frame(height: 26)
             iconButton("grid", "Grid", active: showGrid) { showGrid.toggle() }
+            iconButton("grid.circle", "Snap", active: snapEnabled) {
+                snapEnabled.toggle()
+            }
             iconButton("square.stack.3d.up", "Highlight layer",
                        active: highlightActiveLayer) {
                 highlightActiveLayer.toggle()
             }
             Divider().frame(height: 26)
             Menu {
-                ForEach(Self.drawingLayers, id: \.self) { layer in
-                    Button(drawLayer == layer ? "✓ \(layer)" : layer) {
-                        drawLayer = layer
+                ForEach(BoardLayers.allLayers(
+                    copperCount: boardState.copperLayerCount), id: \.self) { layer in
+                    Button(activeLayer == layer ? "✓ \(layer)" : layer) {
+                        activeLayer = layer
                     }
                 }
             } label: {
@@ -797,7 +1152,7 @@ struct PCBEditorView: View {
                     Image(systemName: "pencil.and.ruler")
                         .font(.system(size: 16, weight: .medium))
                         .lineLimit(1)
-                    Text(drawLayer)
+                    Text(activeLayer)
                         .font(.caption2)
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
@@ -813,6 +1168,15 @@ struct PCBEditorView: View {
                 iconButton("xmark.circle", "Cancel") {
                     cancelInProgress()
                     setStatus("Routing cancelled.")
+                }
+            }
+            if zoneActive {
+                Divider().frame(height: 26)
+                iconButton("checkmark.circle", "Finish fill",
+                           disabled: zonePoints.count < 3) { finishZone() }
+                iconButton("xmark.circle", "Cancel") {
+                    zonePoints = []
+                    setStatus("Fill cancelled.")
                 }
             }
             Spacer(minLength: 0)
@@ -853,11 +1217,36 @@ struct PCBEditorView: View {
     // Part 4 layout fix: the rail is 96 pt wide and labels may wrap
     // to two lines — at the old 72 pt with single-line fixed-size
     // labels, "Highlight Net", "Route Tracks" and "Draw Circle" were
-    // clipped mid-word on Sean's iPad.
+    // clipped mid-word on Sean's iPad. Part 5 adds the Multi toggle
+    // at the top and the Place Via / Fill Zone tools at the bottom.
     private var toolRail: some View {
         VStack(spacing: 2) {
+            Button {
+                multiSelect.toggle()
+            } label: {
+                VStack(spacing: 2) {
+                    Image(systemName: multiSelect
+                          ? "checkmark.square.fill" : "square.dashed")
+                        .font(.system(size: 17, weight: .medium))
+                        .lineLimit(1)
+                    Text("Multi")
+                        .font(.caption2)
+                        .multilineTextAlignment(.center)
+                        .lineLimit(2)
+                }
+                .foregroundStyle(multiSelect ? Color.white : .white.opacity(0.75))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 2)
+                .background(multiSelect
+                            ? Color.accentColor.opacity(0.35) : Color.clear,
+                            in: RoundedRectangle(cornerRadius: 7))
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Divider().padding(.vertical, 4)
             ForEach(Array(PCBTool.allCases.enumerated()), id: \.offset) { index, tool in
-                if index == 3 {
+                if index == 3 || index == 8 {
                     Divider().padding(.vertical, 4)
                 }
                 Button {
@@ -889,6 +1278,38 @@ struct PCBEditorView: View {
         .padding(.horizontal, 4)
         .frame(width: 96)
         .background(Color(white: 0.10))
+    }
+
+    // MARK: - Route width bar (part 5: slider at the bottom)
+
+    /// Shown while Route Tracks is active: a live width slider
+    /// (Sean asked for it at the BOTTOM) with mm + mils readout.
+    /// The detail panel's numeric control still works too.
+    private var routeWidthBar: some View {
+        HStack(spacing: 12) {
+            Text("Track width")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Slider(value: Binding(
+                get: { currentTrackWidth },
+                set: { currentTrackWidth = $0; defaultTrackWidth = $0 }
+            ), in: 0.1...2.0, step: 0.01)
+            Text(BoardUnits.formatLength(mm: currentTrackWidth))
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            if routingActive {
+                Button("Finish Track") { finishRoute() }
+                    .buttonStyle(.borderedProminent)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .background(Color(white: 0.11))
     }
 
     // MARK: - Right panels
@@ -923,18 +1344,39 @@ struct PCBEditorView: View {
             }
         }
         .background(Color(white: 0.10))
-        .onChange(of: selection) { _, newValue in
+        .onChange(of: primarySelection) { _, newValue in
             if case .trace(let id)? = newValue,
                let trace = model.traces.first(where: { $0.id == id }) {
                 widthDraft = PCBBoardMerger.formatMM(trace.width)
+            }
+            if case .via(let id)? = newValue,
+               let via = model.vias.first(where: { $0.id == id }) {
+                viaDiameterDraft = PCBBoardMerger.formatMM(via.diameter)
+                viaDrillDraft = PCBBoardMerger.formatMM(via.drill)
             }
         }
     }
 
     private var layersPanel: some View {
         VStack(alignment: .leading, spacing: 2) {
-            panelHeader("Layers")
-            ForEach(Self.layerRows, id: \.name) { row in
+            HStack(spacing: 8) {
+                panelHeader("Layers")
+                Spacer(minLength: 0)
+                Menu {
+                    ForEach(BoardLayers.copperCountChoices, id: \.self) { count in
+                        Button(boardState.copperLayerCount == count
+                               ? "✓ \(count) layers" : "\(count) layers") {
+                            setCopperLayerCount(count)
+                        }
+                    }
+                } label: {
+                    Text("\(boardState.copperLayerCount) copper")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(Color.accentColor)
+                        .lineLimit(1)
+                }
+            }
+            ForEach(layerRows, id: \.name) { row in
                 HStack(spacing: 8) {
                     RoundedRectangle(cornerRadius: 3)
                         .fill(row.color)
@@ -943,8 +1385,7 @@ struct PCBEditorView: View {
                         .font(.callout)
                         .foregroundStyle(.white.opacity(0.9))
                         .lineLimit(1)
-                    if BoardVisibility.copperLayers.contains(row.name),
-                       activeCopperLayer == row.name {
+                    if activeLayer == row.name {
                         Text("ACTIVE")
                             .font(.caption2.weight(.bold))
                             .foregroundStyle(Color.accentColor)
@@ -969,17 +1410,16 @@ struct PCBEditorView: View {
                 .padding(.vertical, 2)
                 .contentShape(Rectangle())
                 .onTapGesture {
-                    // Tapping a copper layer's row makes it the
-                    // active routing layer (KiCad's convention).
-                    if BoardVisibility.copperLayers.contains(row.name) {
-                        activeCopperLayer = row.name
-                    }
+                    // Tapping a row makes it the ACTIVE layer (part
+                    // 5: any layer can be active — draw tools draw
+                    // here; routing and vias need copper).
+                    activeLayer = row.name
                 }
             }
-            Text("Eyes hide/show layers on the canvas. Tap a copper layer to make it the active routing layer.")
+            Text("Eyes hide/show layers. Tap a row to make it the active layer — drawings and text land there; routing and vias need a copper layer. The copper count is this board's; items stranded on removed layers stay on the board, hidden, and are listed in Problems.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(3)
+                .lineLimit(6)
         }
     }
 
@@ -1010,10 +1450,10 @@ struct PCBEditorView: View {
             checkRow("Dimensions", isOn: visibility.showDimensions) {
                 visibility.showDimensions.toggle()
             }
-            Text("These filter the canvas immediately. (No vias, zones or dimensions exist on this board yet — their switches are live for when they do.)")
+            Text("These filter the canvas immediately. Vias and fills are placed with the Place Via and Fill Zone tools. (PadCB doesn't draw dimensions yet — that switch is ready for when it does.)")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(4)
+                .lineLimit(5)
         }
     }
 
@@ -1022,7 +1462,7 @@ struct PCBEditorView: View {
             panelHeader("Components")
             ForEach(model.components, id: \.reference) { component in
                 Button {
-                    selection = .component(component.reference)
+                    selectOnly(.component(component.reference))
                 } label: {
                     VStack(alignment: .leading, spacing: 1) {
                         HStack(spacing: 8) {
@@ -1035,6 +1475,12 @@ struct PCBEditorView: View {
                                 .font(.callout)
                                 .foregroundStyle(.white.opacity(0.75))
                                 .lineLimit(1)
+                            if component.side == .back {
+                                Text("BACK")
+                                    .font(.caption2.weight(.bold))
+                                    .foregroundStyle(Color(red: 0.45, green: 0.65, blue: 1))
+                                    .lineLimit(1)
+                            }
                             Spacer(minLength: 0)
                         }
                         if let key = component.footprintKey {
@@ -1052,7 +1498,7 @@ struct PCBEditorView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .padding(.horizontal, 8)
                     .padding(.vertical, 5)
-                    .background(selection == .component(component.reference)
+                    .background(selections.contains(.component(component.reference))
                                 ? Color.accentColor.opacity(0.30) : Color.white.opacity(0.05),
                                 in: RoundedRectangle(cornerRadius: 7))
                     .contentShape(Rectangle())
@@ -1069,27 +1515,76 @@ struct PCBEditorView: View {
         }
     }
 
-    private func problemsPanel(model: BoardModel) -> some View {
-        let lines: [String] = model.boardProblems
-            + model.globalAnomalies
-            + model.components.flatMap { component in
-                component.anomalies.map { "\(component.reference): \($0)" }
+    /// One Problems line; clearance entries carry canvas
+    /// highlights so tapping one selects the offending copper.
+    private struct ProblemEntry {
+        var text: String
+        var highlights: [CheckHighlight] = []
+    }
+
+    private func problemEntries(model: BoardModel) -> [ProblemEntry] {
+        var entries = model.boardProblems.map { ProblemEntry(text: $0) }
+        entries += model.globalAnomalies.map { ProblemEntry(text: $0) }
+        entries += model.components.flatMap { component in
+            component.anomalies.map {
+                ProblemEntry(text: "\(component.reference): \($0)")
             }
+        }
+        entries += clearanceViolations.map {
+            ProblemEntry(text: "Clearance: \($0.message)", highlights: $0.highlights)
+        }
+        return entries
+    }
+
+    private func problemsPanel(model: BoardModel) -> some View {
+        let entries = problemEntries(model: model)
         return VStack(alignment: .leading, spacing: 4) {
-            panelHeader("Problems")
-            if lines.isEmpty {
-                Text("No problems: every pin has a pad and every pad has a pin.")
+            HStack(spacing: 8) {
+                panelHeader("Problems")
+                Spacer(minLength: 0)
+                Button("Manufacturing Check") { showManufacturing = true }
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            if entries.isEmpty {
+                Text("No problems: every pin has a pad, every pad has a pin, and no two nets' copper comes within \(BoardUnits.formatMil(boardState.clearanceMil)) mil.")
                     .font(.callout)
                     .foregroundStyle(.green.opacity(0.9))
-                    .lineLimit(3)
+                    .lineLimit(4)
             } else {
-                ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                    Text(line)
-                        .font(.callout)
-                        .foregroundStyle(.orange)
-                        .lineLimit(4)
+                ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
+                    if entry.highlights.isEmpty {
+                        Text(entry.text)
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                            .lineLimit(4)
+                    } else {
+                        Button {
+                            selections = Set(entry.highlights.map(selectionForHighlight))
+                            primarySelection = entry.highlights.first
+                                .map(selectionForHighlight)
+                            setStatus("Clearance problem selected on the canvas.")
+                        } label: {
+                            Text(entry.text)
+                                .font(.callout)
+                                .foregroundStyle(.orange)
+                                .multilineTextAlignment(.leading)
+                                .lineLimit(4)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .buttonStyle(.plain)
+                    }
                 }
             }
+        }
+    }
+
+    private func selectionForHighlight(_ highlight: CheckHighlight) -> BoardSelection {
+        switch highlight {
+        case .component(let reference): return .component(reference)
+        case .trace(let id): return .trace(id)
+        case .via(let id): return .via(id)
+        case .zone(let id): return .zone(id)
         }
     }
 
@@ -1104,6 +1599,12 @@ struct PCBEditorView: View {
             }
             checkRow("Tracks", isOn: selectionFilter.traces) {
                 selectionFilter.traces.toggle()
+            }
+            checkRow("Vias", isOn: selectionFilter.vias) {
+                selectionFilter.vias.toggle()
+            }
+            checkRow("Zones", isOn: selectionFilter.zones) {
+                selectionFilter.zones.toggle()
             }
             checkRow("Graphics", isOn: selectionFilter.graphics) {
                 selectionFilter.graphics.toggle()
@@ -1149,21 +1650,64 @@ struct PCBEditorView: View {
 
     @ViewBuilder
     private var detailPanel: some View {
-        if let component = selectedComponent {
-            componentDetail(component)
-        } else if let trace = selectedTrace {
-            traceDetail(trace)
-        } else if let graphic = selectedGraphic {
-            graphicDetail(graphic)
-        } else if routingActive {
-            routingDetail
-        } else {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Tap a component, track or graphic to select it. With Select active, drag a component to move it; Route Tracks starts by tapping a pad.")
-                    .font(.callout)
+        VStack(alignment: .leading, spacing: 6) {
+            if selections.count > 1, let summary = selectionSummaryText {
+                Text(summary)
+                    .font(.callout.weight(.bold))
+                    .foregroundStyle(.white)
+                    .lineLimit(3)
+                Text("The item below is the last one tapped. Delete removes the whole selection; dragging moves the selected components together (tracks stay put).")
+                    .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
+                HStack(spacing: 8) {
+                    Button("Flip Side") { flipSelection() }
+                        .buttonStyle(.bordered)
+                        .disabled(!canFlipSelection)
+                    Button(role: .destructive) { deleteSelection() } label: {
+                        Label("Delete All", systemImage: "trash")
+                            .lineLimit(1)
+                    }
+                    .buttonStyle(.bordered)
+                }
+                Divider()
             }
+            if let component = selectedComponent {
+                componentDetail(component)
+            } else if let trace = selectedTrace {
+                traceDetail(trace)
+            } else if let via = selectedVia {
+                viaDetail(via)
+            } else if let zone = selectedZone {
+                zoneDetail(zone)
+            } else if let graphic = selectedGraphic {
+                graphicDetail(graphic)
+            } else if routingActive {
+                routingDetail
+            } else if zoneActive {
+                zoneDetailPending
+            } else {
+                Text("Tap a component, track, via, fill or graphic to select it. Turn on Multi to select several at once. With Select active, drag a component to move it; Route Tracks starts by tapping a pad.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(5)
+            }
+        }
+    }
+
+    private var zoneDetailPending: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Drawing a fill")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            Text("\(zonePoints.count) corner(s) placed on \(activeLayer). Tap more corners, then Finish (in the top strip) and pick the fill's net.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .lineLimit(4)
+            Button("Finish Fill") { finishZone() }
+                .buttonStyle(.borderedProminent)
+                .disabled(zonePoints.count < 3)
         }
     }
 
@@ -1185,6 +1729,18 @@ struct PCBEditorView: View {
             detailRow("Footprint", component.footprintKey ?? "— none —")
             detailRow("Chosen by", matchKindWords(component.matchKind))
             detailRow("Position", "\(fmt(component.origin.x)), \(fmt(component.origin.y)) mm")
+            detailRow("Side", component.side == .front
+                      ? "Front (F.Cu)" : "Back (B.Cu) — mirrored")
+            Button {
+                flipSelection()
+            } label: {
+                Label(component.side == .front ? "Flip to Back (B.Cu)"
+                      : "Flip to Front (F.Cu)", systemImage: "arrow.2.squarepath")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            .padding(.top, 2)
 
             Text("Pins → pads")
                 .font(.callout.weight(.semibold))
@@ -1198,9 +1754,11 @@ struct PCBEditorView: View {
                     .lineLimit(2)
             }
             ForEach(Array(component.pins.enumerated()), id: \.offset) { _, pin in
-                Text(pinRowText(pin))
+                let status = BoardPinStatus.status(of: pin, in: component,
+                                                   connectivity: connectivity)
+                Text(pinRowText(pin, status: status))
                     .font(.callout)
-                    .foregroundStyle(.white.opacity(0.92))
+                    .foregroundStyle(pinRowColor(status))
                     .lineLimit(2)
             }
             ForEach(Array(component.anomalies.enumerated()), id: \.offset) { _, anomaly in
@@ -1219,6 +1777,14 @@ struct PCBEditorView: View {
         }
     }
 
+    private func pinRowColor(_ status: PinConnectionStatus) -> Color {
+        switch status {
+        case .connected: return .white.opacity(0.92)
+        case .disconnected: return .orange.opacity(0.95)
+        case .unrouted: return Color(red: 1, green: 0.85, blue: 0.3)
+        }
+    }
+
     private func traceDetail(_ trace: BoardTrace) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Track")
@@ -1229,7 +1795,24 @@ struct PCBEditorView: View {
                       ?? trace.disconnectedNetName.map { "was \($0) — unconnected" }
                       ?? "Unconnected")
             detailRow("Layer", trace.layer)
-            detailRow("Length", "\(fmt(trace.length)) mm")
+            detailRow("Length", BoardUnits.formatLength(mm: trace.length))
+            if BoardLayers.flipDestinations.contains(trace.layer) {
+                Button {
+                    flipSelection()
+                } label: {
+                    Label("Move to \(trace.layer == "F.Cu" ? "B.Cu" : "F.Cu")",
+                          systemImage: "arrow.2.squarepath")
+                        .font(.callout.weight(.semibold))
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+                .padding(.top, 2)
+            } else {
+                Text("This track is on an inner layer — Flip Side only moves tracks between F.Cu and B.Cu.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
             Text("Width (mm)")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.85))
@@ -1278,6 +1861,82 @@ struct PCBEditorView: View {
         }
     }
 
+    private func viaDetail(_ via: BoardVia) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Via")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            detailRow("Net", via.netName
+                      ?? via.disconnectedNetName.map { "was \($0) — unconnected" }
+                      ?? "Unconnected")
+            detailRow("Position", "\(fmt(via.center.x)), \(fmt(via.center.y)) mm")
+            detailRow("Spans", "All \(boardState.copperLayerCount) copper layers")
+            Text("Size (mm)")
+                .font(.callout.weight(.semibold))
+                .foregroundStyle(.white.opacity(0.85))
+                .lineLimit(1)
+                .padding(.top, 4)
+            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()),
+                                GridItem(.flexible()), GridItem(.flexible())],
+                      spacing: 6) {
+                ForEach(Array(BoardVia.sizePresets.enumerated()), id: \.offset) { _, preset in
+                    Button {
+                        setViaSize(via, diameter: preset.diameter, drill: preset.drill)
+                    } label: {
+                        Text("\(PCBBoardMerger.formatMM(preset.diameter))/\(PCBBoardMerger.formatMM(preset.drill))")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 5)
+                            .background(abs(via.diameter - preset.diameter) < 0.001
+                                        ? Color.accentColor.opacity(0.4)
+                                        : Color.white.opacity(0.08),
+                                        in: RoundedRectangle(cornerRadius: 6))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            HStack(spacing: 8) {
+                Text("Ø").font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                TextField("Diameter", text: $viaDiameterDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.decimalPad)
+                    .onSubmit { applyViaDrafts(via) }
+                Text("drill").font(.callout).foregroundStyle(.secondary).lineLimit(1)
+                TextField("Drill", text: $viaDrillDraft)
+                    .textFieldStyle(.roundedBorder)
+                    .keyboardType(.decimalPad)
+                    .onSubmit { applyViaDrafts(via) }
+            }
+            Text("Diameter/drill in mm. A via connects its net across every copper layer — it can't be flipped to one side.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(3)
+            deleteSelectionButton("Delete Via")
+        }
+    }
+
+    private func zoneDetail(_ zone: BoardZone) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Copper Fill")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            detailRow("Net", zone.netName
+                      ?? zone.disconnectedNetName.map { "was \($0) — unconnected" }
+                      ?? "Unconnected")
+            detailRow("Layer", zone.layer)
+            detailRow("Corners", "\(zone.points.count)")
+            Text("The fill renders under tracks and pads, keeping the board clearance (\(BoardUnits.formatMil(boardState.clearanceMil)) mil) around other nets' copper.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(4)
+            deleteSelectionButton("Delete Fill")
+        }
+    }
+
     private func graphicDetail(_ graphic: BoardGraphicItem) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text(graphic.kind == .text ? "Text" : "Graphic")
@@ -1302,37 +1961,10 @@ struct PCBEditorView: View {
                 .font(.title3.weight(.bold))
                 .foregroundStyle(.white)
                 .lineLimit(2)
-            Text("\(routePoints.count) point(s) laid on \(activeCopperLayer). Tap waypoints (they bend at 45°), then tap the target pad — or Finish to end the track here.")
+            Text("\(routePoints.count) point(s) laid on \(activeLayer). Tap waypoints (they bend at 45°), then tap the target pad — or Finish to end the track here. The width slider is at the bottom of the screen.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                .lineLimit(4)
-            Text("Track width (mm)")
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.white.opacity(0.85))
-                .lineLimit(1)
-                .padding(.top, 4)
-            LazyVGrid(columns: [GridItem(.flexible()), GridItem(.flexible()),
-                                GridItem(.flexible()), GridItem(.flexible())],
-                      spacing: 6) {
-                ForEach(BoardGeometry.trackWidthPresets, id: \.self) { width in
-                    Button {
-                        currentTrackWidth = width
-                        defaultTrackWidth = width
-                    } label: {
-                        Text(PCBBoardMerger.formatMM(width))
-                            .font(.callout.weight(.semibold))
-                            .foregroundStyle(.white)
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity)
-                            .padding(.vertical, 5)
-                            .background(abs(currentTrackWidth - width) < 0.001
-                                        ? Color.accentColor.opacity(0.4)
-                                        : Color.white.opacity(0.08),
-                                        in: RoundedRectangle(cornerRadius: 6))
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
+                .lineLimit(5)
             HStack(spacing: 8) {
                 Button("Finish Track") { finishRoute() }
                     .buttonStyle(.borderedProminent)
@@ -1368,6 +2000,31 @@ struct PCBEditorView: View {
         setStatus("Track width set to \(PCBBoardMerger.formatMM(width)) mm.")
     }
 
+    private func setViaSize(_ via: BoardVia, diameter: Double, drill: Double) {
+        mutateBoard { state in
+            if let index = state.vias.firstIndex(where: { $0.id == via.id }) {
+                state.vias[index].diameter = diameter
+                state.vias[index].drill = drill
+            }
+        }
+        viaDiameterDraft = PCBBoardMerger.formatMM(diameter)
+        viaDrillDraft = PCBBoardMerger.formatMM(drill)
+        currentViaDiameter = diameter
+        currentViaDrill = drill
+        setStatus("Via size set to \(PCBBoardMerger.formatMM(diameter)) mm "
+                  + "with a \(PCBBoardMerger.formatMM(drill)) mm drill.")
+    }
+
+    private func applyViaDrafts(_ via: BoardVia) {
+        guard let diameter = Double(viaDiameterDraft),
+              let drill = Double(viaDrillDraft),
+              diameter > 0.1, drill > 0.05, drill < diameter else {
+            setStatus("Via sizes need a drill smaller than the diameter.", warning: true)
+            return
+        }
+        setViaSize(via, diameter: diameter, drill: drill)
+    }
+
     private func detailRow(_ label: String, _ value: String) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Text(label)
@@ -1394,8 +2051,12 @@ struct PCBEditorView: View {
         }
     }
 
-    /// "pin 1 — IN_A — net NET_A — pad 1 (1.60×1.60 mm, drill 0.80)"
-    private func pinRowText(_ pin: BoardPinBinding) -> String {
+    /// "pin 1 — IN_A — net NET_A — pad 1 (…)" with the part-5
+    /// connection status appended: DISCONNECTED when the pin has
+    /// no net at all, UNROUTED when its net exists but no copper
+    /// reaches the pad.
+    private func pinRowText(_ pin: BoardPinBinding,
+                            status: PinConnectionStatus) -> String {
         var text = "pin \(pin.pinNumber)"
         if !pin.pinName.isEmpty { text += " — \(pin.pinName)" }
         text += " — net \(pin.netName ?? "—")"
@@ -1409,11 +2070,220 @@ struct PCBEditorView: View {
         } else {
             text += " — pad —"
         }
+        switch status {
+        case .disconnected: text += " — DISCONNECTED"
+        case .unrouted(let net): text += " — UNROUTED (\(net) has no copper path here)"
+        case .connected: break
+        }
         return text
     }
 
     private func fmt(_ value: Double) -> String {
         String(format: "%.2f", value)
+    }
+
+    // MARK: - Checker sheets (part 5)
+
+    private var manufacturingSheet: some View {
+        let report = model.map {
+            BoardManufacturing.check(model: $0,
+                                     copperCount: boardState.copperLayerCount,
+                                     settings: manufacturingSettings,
+                                     connectivity: connectivity)
+        }
+        return NavigationStack {
+            List {
+                Section {
+                    Text(report.map {
+                        $0.allPassed
+                            ? "All \($0.rules.count) rules pass — this board is inside the current manufacturing limits."
+                            : "\($0.failedCount) of \($0.rules.count) rules fail. The failing rules list what and where below."
+                    } ?? "No board loaded.")
+                        .font(.callout)
+                } header: {
+                    Text("Result")
+                }
+                Section {
+                    Text("Limits in force: clearance \(BoardUnits.formatMil(manufacturingSettings.clearanceMil)) mil · min track \(BoardUnits.formatMil(manufacturingSettings.minTraceWidthMil)) mil · min via drill \(BoardUnits.formatMil(manufacturingSettings.minViaDrillMil)) mil · min via diameter \(BoardUnits.formatMil(manufacturingSettings.minViaDiameterMil)) mil. Clearance is adjustable in Preferences.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Settings")
+                }
+                if let report {
+                    ForEach(report.rules, id: \.name) { rule in
+                        Section {
+                            if rule.violations.isEmpty {
+                                Text(rule.detail)
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(Array(rule.violations.prefix(12).enumerated()),
+                                        id: \.offset) { _, violation in
+                                    Text(violation)
+                                        .font(.callout)
+                                }
+                                if rule.violations.count > 12 {
+                                    Text("…and \(rule.violations.count - 12) more")
+                                        .font(.callout)
+                                        .foregroundStyle(.secondary)
+                                }
+                            }
+                        } header: {
+                            HStack(spacing: 6) {
+                                Image(systemName: rule.passed
+                                      ? "checkmark.circle.fill" : "xmark.circle.fill")
+                                    .foregroundStyle(rule.passed ? .green : .red)
+                                Text(rule.name)
+                            }
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Manufacturing Check")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showManufacturing = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Theory check sheet (heuristics + optional on-device AI)
+
+    @State private var aiReviewText: String? = nil
+    @State private var aiBusy = false
+
+    private var theorySheet: some View {
+        let findings = model.map {
+            BoardTheory.findings(model: $0, connectivity: connectivity)
+        } ?? []
+        let availability = PCBTheoryAI.availability
+        return NavigationStack {
+            List {
+                Section {
+                    if findings.isEmpty {
+                        Text("The deterministic checks found nothing theory-shaped to flag: no loose power pins, no single-pin nets, no ground/supply mixups, no unrouted nets.")
+                            .font(.callout)
+                    } else {
+                        ForEach(Array(findings.enumerated()), id: \.offset) { _, finding in
+                            HStack(alignment: .top, spacing: 8) {
+                                Image(systemName: finding.severity == .warning
+                                      ? "exclamationmark.triangle.fill" : "info.circle")
+                                    .foregroundStyle(finding.severity == .warning
+                                                     ? .orange : .secondary)
+                                Text(finding.message)
+                                    .font(.callout)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Theory check (deterministic)")
+                } footer: {
+                    Text("These findings come from fixed rules over the connection table and the board — same input, same output, every time.")
+                }
+                Section {
+                    switch availability {
+                    case .available:
+                        Text("An on-device model is available. It receives ONLY the short text summary below — generated on this iPad from the board — and runs entirely on-device. Nothing is uploaded.")
+                            .font(.callout)
+                        if let model {
+                            let summary = BoardSummaryText.make(
+                                model: model, connectivity: connectivity,
+                                manufacturing: BoardManufacturing.check(
+                                    model: model,
+                                    copperCount: boardState.copperLayerCount,
+                                    settings: manufacturingSettings,
+                                    connectivity: connectivity),
+                                theory: findings)
+                            DisclosureGroup("The exact summary it sees") {
+                                Text(summary)
+                                    .font(.caption.monospaced())
+                                    .textSelection(.enabled)
+                            }
+                            Button {
+                                aiBusy = true
+                                aiReviewText = nil
+                                Task {
+                                    aiReviewText = await PCBTheoryAI.review(summary: summary)
+                                    aiBusy = false
+                                }
+                            } label: {
+                                Label("Ask on-device AI", systemImage: "sparkles")
+                            }
+                            .disabled(aiBusy)
+                            if aiBusy {
+                                ProgressView("Thinking on-device…")
+                            }
+                            if let aiReviewText {
+                                Text(aiReviewText)
+                                    .font(.callout)
+                                    .textSelection(.enabled)
+                            }
+                        }
+                    case .unavailable(let reason):
+                        Text("On-device AI isn't available: \(reason) The deterministic findings above still work.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("On-device AI (experimental, advisory)")
+                } footer: {
+                    Text("AI suggestions are advisory only — the deterministic checks are the authority.")
+                }
+            }
+            .navigationTitle("Theory Check")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showTheory = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Net picker sheet (via + zone placement)
+
+    private var netPickerSheet: some View {
+        NavigationStack {
+            List {
+                if let model {
+                    if model.netNames.isEmpty {
+                        Text("This board has no nets — the schematic's pins aren't connected to anything yet.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(model.netNames, id: \.self) { net in
+                        Button(net) { chooseNet(net) }
+                            .font(.callout.weight(.semibold))
+                    }
+                }
+            }
+            .navigationTitle(netChoicePurpose.map {
+                switch $0 {
+                case .via: return "Via — choose a net"
+                case .zone: return "Fill — choose a net"
+                }
+            } ?? "Choose a net")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { netChoicePurpose = nil }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func chooseNet(_ net: String) {
+        guard let purpose = netChoicePurpose else { return }
+        netChoicePurpose = nil
+        switch purpose {
+        case .via(let point):
+            placeVia(net: net, at: point)
+        case .zone:
+            commitZone(net: net)
+        }
     }
 
     // MARK: - Status bar
@@ -1425,9 +2295,14 @@ struct PCBEditorView: View {
                 .foregroundStyle(.white.opacity(0.85))
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
-            Text("Grid \(fmt(Self.gridSize)) mm")
+            Text("Grid \(BoardUnits.formatMil(boardState.gridMil)) mil (\(PCBBoardMerger.formatMM(gridMM)) mm)")
                 .font(.callout)
                 .foregroundStyle(.white.opacity(0.6))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Text(snapEnabled ? "Snap on" : "Snap off")
+                .font(.callout)
+                .foregroundStyle(snapEnabled ? .white.opacity(0.6) : .orange.opacity(0.9))
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
             Text("Zoom \(BoardCanvasMetrics.percent(forScale: scale))%")
@@ -1436,13 +2311,14 @@ struct PCBEditorView: View {
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
             Menu {
-                ForEach(BoardVisibility.copperLayers, id: \.self) { layer in
-                    Button(activeCopperLayer == layer ? "✓ \(layer)" : layer) {
-                        activeCopperLayer = layer
+                ForEach(BoardLayers.allLayers(
+                    copperCount: boardState.copperLayerCount), id: \.self) { layer in
+                    Button(activeLayer == layer ? "✓ \(layer)" : layer) {
+                        activeLayer = layer
                     }
                 }
             } label: {
-                Text(activeCopperLayer)
+                Text(activeLayer)
                     .font(.callout.weight(.semibold))
                     .foregroundStyle(.white.opacity(0.9))
                     .lineLimit(1)
@@ -1474,6 +2350,9 @@ struct PCBEditorView: View {
 
     /// Draft text for the trace-width field (synced on selection).
     @State private var widthDraft = ""
+    /// Draft text for the via diameter / drill fields.
+    @State private var viaDiameterDraft = ""
+    @State private var viaDrillDraft = ""
 
     private func boardToScreen(_ p: FPPoint) -> CGPoint {
         CGPoint(x: offset.x + CGFloat(p.x * scale),
@@ -1528,6 +2407,13 @@ struct PCBEditorView: View {
             include(FPPoint(x: b.maxX, y: b.maxY))
         }
         for trace in model.traces { for point in trace.points { include(point) } }
+        for via in model.vias {
+            include(FPPoint(x: via.center.x - via.diameter / 2,
+                            y: via.center.y - via.diameter / 2))
+            include(FPPoint(x: via.center.x + via.diameter / 2,
+                            y: via.center.y + via.diameter / 2))
+        }
+        for zone in model.zones { for point in zone.points { include(point) } }
         for item in model.graphics {
             for point in item.points { include(point) }
             if item.kind == .circle {
@@ -1558,15 +2444,28 @@ struct PCBEditorView: View {
             .contentShape(Rectangle())
             .gesture(canvasDrag)
             .simultaneousGesture(canvasMagnify)
+            // Apple Pencil hover (part 5): while routing or
+            // drawing, the prospective segment follows the pencil
+            // BEFORE it touches. No pencil = no events = the plain
+            // touch behaviour, unchanged.
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    hoverBoard = screenToBoard(location)
+                case .ended:
+                    hoverBoard = nil
+                }
+            }
             .onAppear { canvasSize = geo.size }
             .onChange(of: geo.size) { _, newSize in canvasSize = newSize }
         }
     }
 
     /// One drag gesture, tool-dependent: with Select, a drag that
-    /// starts on a component moves it (live preview, committed on
-    /// release); any other drag pans. A press that barely moves is
-    /// a tap and goes to the active tool.
+    /// starts on a component moves the selected components (live
+    /// preview, committed on release); a drag starting on a via
+    /// moves the via; any other drag pans. A press that barely
+    /// moves is a tap and goes to the active tool.
     private var canvasDrag: some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
@@ -1574,14 +2473,48 @@ struct PCBEditorView: View {
                 if dragMode == .undecided {
                     dragStartOffset = offset
                     let startBoard = screenToBoard(value.startLocation)
+                    // A via's hit area is tiny and precise, so it
+                    // wins over a footprint's broad bounds.
                     if activeTool == .select, let model,
-                       visibility.showFootprints, selectionFilter.allows(.component),
-                       let component = BoardGeometry.componentAt(model, point: startBoard) {
-                        dragMode = .moveComponent
-                        movingReference = component.reference
-                        moveStartOrigin = component.origin
-                        movePreviewOrigin = component.origin
-                        selection = .component(component.reference)
+                       selectionFilter.allows(.via),
+                       let via = BoardGeometry.viaAt(model, point: startBoard,
+                                                     tolerance: tapToleranceMM),
+                       visibility.viaShown(via) {
+                        dragMode = .moveVia
+                        movingViaID = via.id
+                        moveViaStart = via.center
+                        moveViaPreview = via.center
+                    } else if activeTool == .select, let model,
+                              visibility.showFootprints,
+                              selectionFilter.allows(.component),
+                              let component = BoardGeometry.componentAt(
+                                  model, point: startBoard) {
+                        if multiSelect
+                            && !selections.contains(.component(component.reference)) {
+                            // Multi: pressing an UNSELECTED part is
+                            // a tap (toggle) or a pan — never a move.
+                            dragMode = .pan
+                        } else {
+                            dragMode = .moveComponents
+                            dragTapReference = component.reference
+                            if !multiSelect {
+                                selectOnly(.component(component.reference))
+                            }
+                            moveStartOrigins = [:]
+                            movePreviewOrigins = [:]
+                            for item in selections {
+                                if case .component(let reference) = item,
+                                   let member = model.components.first(
+                                       where: { $0.reference == reference }) {
+                                    moveStartOrigins[reference] = member.origin
+                                    movePreviewOrigins[reference] = member.origin
+                                }
+                            }
+                            if moveStartOrigins.isEmpty {
+                                moveStartOrigins[component.reference] = component.origin
+                                movePreviewOrigins[component.reference] = component.origin
+                            }
+                        }
                     } else {
                         dragMode = .pan
                     }
@@ -1592,12 +2525,30 @@ struct PCBEditorView: View {
                         offset = CGPoint(x: start.x + value.translation.width,
                                          y: start.y + value.translation.height)
                     }
-                case .moveComponent:
-                    if let start = moveStartOrigin {
+                case .moveComponents:
+                    let delta = FPPoint(
+                        x: Double(value.translation.width) / scale,
+                        y: Double(value.translation.height) / scale)
+                    // Snap the drag ANCHOR (the first member) to the
+                    // grid; the whole group follows by the same
+                    // delta so relative positions never distort.
+                    if let anchor = moveStartOrigins.keys.sorted().first,
+                       let start = moveStartOrigins[anchor] {
+                        let snappedAnchor = snapPoint(FPPoint(x: start.x + delta.x,
+                                                              y: start.y + delta.y))
+                        let applied = FPPoint(x: snappedAnchor.x - start.x,
+                                              y: snappedAnchor.y - start.y)
+                        for (reference, origin) in moveStartOrigins {
+                            movePreviewOrigins[reference] = FPPoint(
+                                x: origin.x + applied.x, y: origin.y + applied.y)
+                        }
+                    }
+                case .moveVia:
+                    if let start = moveViaStart {
                         let moved = FPPoint(
                             x: start.x + Double(value.translation.width) / scale,
                             y: start.y + Double(value.translation.height) / scale)
-                        movePreviewOrigin = BoardGeometry.snapped(moved, grid: Self.snapMM)
+                        moveViaPreview = snapPoint(moved)
                     }
                 case .undecided:
                     break
@@ -1607,28 +2558,53 @@ struct PCBEditorView: View {
                 cursorBoard = screenToBoard(value.location)
                 let moved = hypot(value.translation.width, value.translation.height)
                 if moved < 5 {
-                    // A tap: undo the micro-pan; a tap that started a
-                    // move already selected the component.
+                    // A tap. A pan-tap undoes its micro-pan and goes
+                    // to the active tool; a move-mode tap resolves
+                    // its deferred selection (Multi toggles; the
+                    // single-select case was applied at drag start).
                     if dragMode == .pan, let start = dragStartOffset {
                         offset = start
-                    }
-                    if dragMode != .moveComponent {
                         handleTap(at: screenToBoard(value.location))
+                    } else if dragMode == .moveComponents {
+                        if multiSelect, let reference = dragTapReference {
+                            toggleSelection(.component(reference))
+                        }
+                    } else if dragMode == .moveVia, let id = movingViaID {
+                        applyTapSelection(.via(id))
                     }
-                } else if dragMode == .moveComponent,
-                          let reference = movingReference,
-                          let origin = movePreviewOrigin,
-                          let start = moveStartOrigin, origin != start {
+                } else if dragMode == .moveComponents {
+                    let changes = movePreviewOrigins.filter { preview in
+                        moveStartOrigins[preview.key] != preview.value
+                    }
+                    if !changes.isEmpty {
+                        mutateBoard { state in
+                            for (reference, origin) in changes {
+                                state.placements[reference] = origin
+                            }
+                        }
+                        setStatus(changes.count == 1
+                                  ? "\(changes.keys.first!) moved — its position is saved with the board."
+                                  : "\(changes.count) components moved together — saved with the board.")
+                    }
+                } else if dragMode == .moveVia,
+                          let id = movingViaID, let centre = moveViaPreview,
+                          let start = moveViaStart, centre != start {
                     mutateBoard { state in
-                        state.placements[reference] = origin
+                        if let index = state.vias.firstIndex(where: { $0.id == id }) {
+                            state.vias[index].center = centre
+                        }
                     }
-                    setStatus("\(reference) moved — its position is saved with the board.")
+                    if !multiSelect { selectOnly(.via(id)) }
+                    setStatus("Via moved — saved with the board.")
                 }
                 dragMode = .undecided
                 dragStartOffset = nil
-                movingReference = nil
-                moveStartOrigin = nil
-                movePreviewOrigin = nil
+                moveStartOrigins = [:]
+                movePreviewOrigins = [:]
+                movingViaID = nil
+                moveViaStart = nil
+                moveViaPreview = nil
+                dragTapReference = nil
             }
     }
 
@@ -1656,10 +2632,14 @@ struct PCBEditorView: View {
             handleDeleteTap(model: model, point: point)
         case .route:
             handleRouteTap(model: model, point: point)
+        case .placeVia:
+            handleViaTap(model: model, point: point)
+        case .fillZone:
+            handleZoneTap(point: point)
         case .drawLine, .drawArc, .drawCircle:
             handleDrawTap(point: point)
         case .text:
-            textAnchor = BoardGeometry.snapped(point, grid: Self.snapMM)
+            textAnchor = snapPoint(point)
             textDraft = ""
             showTextPrompt = true
         }
@@ -1667,12 +2647,28 @@ struct PCBEditorView: View {
 
     private func handleSelectTap(model: BoardModel, point: FPPoint) {
         let tolerance = tapToleranceMM
+        if selectionFilter.allows(.via),
+           let via = model.vias.reversed().first(where: {
+               visibility.viaShown($0)
+                   && BoardGeometry.viaHit($0, point: point, tolerance: tolerance)
+           }) {
+            applyTapSelection(.via(via.id))
+            return
+        }
         if selectionFilter.allows(.trace),
            let trace = model.traces.reversed().first(where: {
                visibility.traceShown($0)
                    && BoardGeometry.traceHit($0, point: point, tolerance: tolerance)
            }) {
-            selection = .trace(trace.id)
+            applyTapSelection(.trace(trace.id))
+            return
+        }
+        if selectionFilter.allows(.zone),
+           let zone = model.zones.reversed().first(where: {
+               visibility.zoneShown($0)
+                   && BoardGeometry.zoneHit($0, point: point, tolerance: tolerance)
+           }) {
+            applyTapSelection(.zone(zone.id))
             return
         }
         if let graphic = model.graphics.reversed().first(where: {
@@ -1680,22 +2676,26 @@ struct PCBEditorView: View {
                 && selectionFilter.allows($0.kind == .text ? .text : .graphic)
                 && BoardGeometry.graphicHit($0, point: point, tolerance: tolerance)
         }) {
-            selection = .graphic(graphic.id)
+            applyTapSelection(.graphic(graphic.id))
             return
         }
         if visibility.showFootprints, selectionFilter.allows(.component),
            let component = BoardGeometry.componentAt(model, point: point) {
-            selection = .component(component.reference)
+            applyTapSelection(.component(component.reference))
             return
         }
-        selection = nil
+        // Empty space: a plain tap clears; with Multi on the
+        // selection is kept (Esc clears) so building a selection
+        // never loses it to a stray tap.
+        if !multiSelect { clearSelection() }
     }
 
     private func handleHighlightTap(model: BoardModel, point: FPPoint) {
         guard visibility.showFootprints, visibility.showPads,
               let hit = BoardGeometry.padAt(model, point: point,
                                             tolerance: tapToleranceMM),
-              visibility.padShown(hit.pad) else {
+              visibility.padShown(BoardGeometry.boardPad(hit.component, hit.pad))
+        else {
             highlightedNet = nil
             setStatus("Net highlight cleared.")
             return
@@ -1712,11 +2712,27 @@ struct PCBEditorView: View {
 
     private func handleDeleteTap(model: BoardModel, point: FPPoint) {
         let tolerance = tapToleranceMM
+        if let via = model.vias.reversed().first(where: {
+            visibility.viaShown($0)
+                && BoardGeometry.viaHit($0, point: point, tolerance: tolerance)
+        }) {
+            selectOnly(.via(via.id))
+            deleteSelection()
+            return
+        }
         if let trace = model.traces.reversed().first(where: {
             visibility.traceShown($0)
                 && BoardGeometry.traceHit($0, point: point, tolerance: tolerance)
         }) {
-            selection = .trace(trace.id)
+            selectOnly(.trace(trace.id))
+            deleteSelection()
+            return
+        }
+        if let zone = model.zones.reversed().first(where: {
+            visibility.zoneShown($0)
+                && BoardGeometry.zoneHit($0, point: point, tolerance: tolerance)
+        }) {
+            selectOnly(.zone(zone.id))
             deleteSelection()
             return
         }
@@ -1724,41 +2740,141 @@ struct PCBEditorView: View {
             visibility.boardGraphicShown($0)
                 && BoardGeometry.graphicHit($0, point: point, tolerance: tolerance)
         }) {
-            selection = .graphic(graphic.id)
+            selectOnly(.graphic(graphic.id))
             deleteSelection()
             return
         }
         if visibility.showFootprints,
            let component = BoardGeometry.componentAt(model, point: point) {
-            selection = .component(component.reference)
+            selectOnly(.component(component.reference))
             deleteSelection()
         }
     }
 
+    /// Delete the WHOLE selection (part 5: group delete covers
+    /// components, traces, vias, zones and graphics together).
     private func deleteSelection() {
-        guard let selection else { return }
-        switch selection {
-        case .component(let reference):
-            self.selection = nil
-            mutateBoard { state in
-                if !state.excludedReferences.contains(reference) {
-                    state.excludedReferences.append(reference)
+        guard !selections.isEmpty else { return }
+        let doomed = selections
+        clearSelection()
+        var removedComponents: [String] = []
+        var counts: [String] = []
+        mutateBoard { state in
+            for item in doomed {
+                switch item {
+                case .component(let reference):
+                    if !state.excludedReferences.contains(reference) {
+                        state.excludedReferences.append(reference)
+                        removedComponents.append(reference)
+                    }
+                case .trace(let id):
+                    if state.traces.contains(where: { $0.id == id }) {
+                        state.traces.removeAll { $0.id == id }
+                        counts.append("track")
+                    }
+                case .graphic(let id):
+                    if state.graphics.contains(where: { $0.id == id }) {
+                        state.graphics.removeAll { $0.id == id }
+                        counts.append("graphic")
+                    }
+                case .via(let id):
+                    if state.vias.contains(where: { $0.id == id }) {
+                        state.vias.removeAll { $0.id == id }
+                        counts.append("via")
+                    }
+                case .zone(let id):
+                    if state.zones.contains(where: { $0.id == id }) {
+                        state.zones.removeAll { $0.id == id }
+                        counts.append("fill")
+                    }
                 }
             }
-            setStatus("\(reference) removed from the board. Sync from Schematic brings it back.")
-        case .trace(let id):
-            self.selection = nil
-            mutateBoard { state in
-                state.traces.removeAll { $0.id == id }
-            }
-            setStatus("Track deleted.")
-        case .graphic(let id):
-            self.selection = nil
-            mutateBoard { state in
-                state.graphics.removeAll { $0.id == id }
-            }
-            setStatus("Graphic deleted.")
         }
+        var parts: [String] = []
+        if !removedComponents.isEmpty {
+            parts.append("\(removedComponents.joined(separator: ", ")) removed from the board (Sync from Schematic brings them back)")
+        }
+        if !counts.isEmpty {
+            parts.append("\(counts.count) item(s) deleted (\(counts.joined(separator: ", ")))")
+        }
+        setStatus(parts.isEmpty ? "Nothing deleted." : parts.joined(separator: " · "))
+    }
+
+    // MARK: - Flip Side / Change Layer (part 5, Sean 18:32)
+
+    /// The flip destinations are pinned: exactly F.Cu and B.Cu
+    /// (BoardLayers.flipDestinations, asserted by BoardFixture).
+    private var flippableSelections: (components: [String], traces: [BoardTrace]) {
+        guard let model else { return ([], []) }
+        var components: [String] = []
+        var traces: [BoardTrace] = []
+        for item in selections {
+            switch item {
+            case .component(let reference): components.append(reference)
+            case .trace(let id):
+                if let trace = model.traces.first(where: { $0.id == id }),
+                   BoardLayers.flipDestinations.contains(trace.layer) {
+                    traces.append(trace)
+                }
+            case .graphic, .via, .zone: break
+            }
+        }
+        return (components, traces)
+    }
+
+    private var canFlipSelection: Bool {
+        let parts = flippableSelections
+        return !parts.components.isEmpty || !parts.traces.isEmpty
+    }
+
+    private var flipActionTitle: String {
+        let parts = flippableSelections
+        if parts.components.count == 1, parts.traces.isEmpty,
+           let model,
+           let component = model.components.first(
+               where: { $0.reference == parts.components[0] }) {
+            return component.side == .front ? "Flip to Back (B.Cu)" : "Flip to Front (F.Cu)"
+        }
+        return "Flip Side / Change Layer"
+    }
+
+    /// Footprints mirror to the other side (their `sides` entry
+    /// toggles — pad geometry derives from the side, so pin↔pad
+    /// bindings stay exact); traces keep their coordinates and only
+    /// change layer. Vias span layers, zones and non-copper
+    /// graphics aren't copper objects — they're skipped and the
+    /// status line says so.
+    private func flipSelection() {
+        let parts = flippableSelections
+        guard !parts.components.isEmpty || !parts.traces.isEmpty else {
+            setStatus("Nothing to flip — vias span all layers, and fills and drawings aren't flipped. Select a footprint or an F.Cu/B.Cu track.",
+                      warning: true)
+            return
+        }
+        let traceIDs = Set(parts.traces.map(\.id))
+        mutateBoard { state in
+            for reference in parts.components {
+                state.sides[reference] =
+                    (state.sides[reference] ?? .front) == .front ? .back : .front
+            }
+            for index in state.traces.indices where traceIDs.contains(state.traces[index].id) {
+                state.traces[index].layer =
+                    BoardGeometry.flippedLayerName(state.traces[index].layer)
+            }
+        }
+        var summary: [String] = []
+        if !parts.components.isEmpty {
+            summary.append("\(parts.components.joined(separator: ", ")) flipped "
+                           + "to the \(parts.components.first.map { reference in model?.components.first { $0.reference == reference }?.side == .back ? "back" : "front" } ?? "")")
+        }
+        if !parts.traces.isEmpty {
+            summary.append("\(parts.traces.count) track(s) moved between F.Cu and B.Cu (coordinates unchanged)")
+        }
+        let skipped = selections.count - parts.components.count - parts.traces.count
+        if skipped > 0 {
+            summary.append("\(skipped) item(s) skipped — only footprints and F.Cu/B.Cu tracks flip")
+        }
+        setStatus(summary.joined(separator: " · "))
     }
 
     // MARK: - Routing (Route Tracks)
@@ -1767,6 +2883,13 @@ struct PCBEditorView: View {
         let padHit = BoardGeometry.padAt(model, point: point,
                                           tolerance: tapToleranceMM)
         if !routingActive {
+            // Routing needs copper (part 5): say so instead of
+            // quietly laying a track on silk.
+            guard BoardLayers.isCopper(activeLayer) else {
+                setStatus("Routing needs a copper layer — the active layer is \(activeLayer). Switch to F.Cu or B.Cu first.",
+                          warning: true)
+                return
+            }
             guard let padHit else {
                 setStatus("Tap a pad to start the track.", warning: true)
                 return
@@ -1775,7 +2898,7 @@ struct PCBEditorView: View {
             routePoints = [BoardGeometry.padCenter(padHit.component, padHit.pad)]
             if let net = padHit.netName {
                 setStatus("Routing \(net) from \(padHit.component.reference) pad "
-                          + "\(padHit.pad.number) on \(activeCopperLayer) — tap "
+                          + "\(padHit.pad.number) on \(activeLayer) — tap "
                           + "waypoints, then the target pad.")
             } else {
                 setStatus("Routing an unconnected track from \(padHit.component.reference) "
@@ -1793,7 +2916,7 @@ struct PCBEditorView: View {
             appendRoutePoint(BoardGeometry.padCenter(padHit.component, padHit.pad))
             finishRoute()
         } else {
-            appendRoutePoint(BoardGeometry.snapped(point, grid: Self.snapMM))
+            appendRoutePoint(snapPoint(point))
         }
     }
 
@@ -1822,29 +2945,109 @@ struct PCBEditorView: View {
             return
         }
         let trace = BoardTrace(id: UUID(), netName: routeNet,
-                               layer: activeCopperLayer,
+                               layer: activeLayer,
                                width: currentTrackWidth, points: cleaned)
         mutateBoard { state in state.traces.append(trace) }
-        selection = .trace(trace.id)
+        selectOnly(.trace(trace.id))
         cancelInProgress()
         setStatus("Track added on \(trace.layer) — \(trace.netName ?? "unconnected"), "
-                  + "\(PCBBoardMerger.formatMM(trace.width)) mm wide. "
+                  + "\(PCBBoardMerger.formatMM(trace.width)) mm wide, "
+                  + "\(BoardUnits.formatLength(mm: trace.length)) long. "
                   + "Select it any time to change its width.")
+    }
+
+    // MARK: - Vias (Place Via)
+
+    private func handleViaTap(model: BoardModel, point: FPPoint) {
+        guard BoardLayers.isCopper(activeLayer) else {
+            setStatus("Vias need a copper layer — the active layer is \(activeLayer). Switch to a copper layer first.",
+                      warning: true)
+            return
+        }
+        let snapped = snapPoint(point)
+        // Net resolution: a tapped pad's net wins; else the
+        // highlighted net; else ask.
+        if let hit = BoardGeometry.padAt(model, point: point,
+                                         tolerance: tapToleranceMM) {
+            if let net = hit.netName {
+                placeVia(net: net, at: snapped)
+            } else {
+                setStatus("\(hit.component.reference) pad \(hit.pad.number) is on no net — pick the via's net.",
+                          warning: true)
+                netChoicePurpose = .via(snapped)
+            }
+            return
+        }
+        if let highlightedNet {
+            placeVia(net: highlightedNet, at: snapped)
+            return
+        }
+        if model.netNames.count == 1, let only = model.netNames.first {
+            placeVia(net: only, at: snapped)
+            return
+        }
+        if model.netNames.isEmpty {
+            setStatus("This board has no nets yet — a via needs a net.", warning: true)
+            return
+        }
+        netChoicePurpose = .via(snapped)
+    }
+
+    private func placeVia(net: String, at point: FPPoint) {
+        let via = BoardVia(id: UUID(), netName: net, center: point,
+                           diameter: currentViaDiameter, drill: currentViaDrill)
+        mutateBoard { state in state.vias.append(via) }
+        selectOnly(.via(via.id))
+        setStatus("Via placed on \(net) — \(PCBBoardMerger.formatMM(via.diameter)) mm, "
+                  + "drill \(PCBBoardMerger.formatMM(via.drill)) mm, spanning all copper layers.")
+    }
+
+    // MARK: - Copper fill zones (Fill Zone)
+
+    private func handleZoneTap(point: FPPoint) {
+        guard BoardLayers.isCopper(activeLayer) else {
+            setStatus("A copper fill needs a copper layer — the active layer is \(activeLayer). Switch to a copper layer first.",
+                      warning: true)
+            return
+        }
+        zonePoints.append(snapPoint(point))
+    }
+
+    private func finishZone() {
+        guard zonePoints.count >= 3 else {
+            setStatus("A fill needs at least three corners.", warning: true)
+            return
+        }
+        guard let model, !model.netNames.isEmpty else {
+            setStatus("This board has no nets — a fill needs a net.", warning: true)
+            return
+        }
+        netChoicePurpose = .zone
+    }
+
+    private func commitZone(net: String) {
+        guard zonePoints.count >= 3 else { return }
+        let zone = BoardZone(id: UUID(), netName: net, layer: activeLayer,
+                             points: zonePoints)
+        mutateBoard { state in state.zones.append(zone) }
+        selectOnly(.zone(zone.id))
+        zonePoints = []
+        setStatus("Copper fill added on \(zone.layer) for \(net) — it renders under tracks and pads, keeping the board clearance around other nets.")
     }
 
     // MARK: - Drawing tools (line / arc / circle / text)
 
     private func handleDrawTap(point: FPPoint) {
-        pendingPoints.append(BoardGeometry.snapped(point, grid: Self.snapMM))
+        pendingPoints.append(snapPoint(point))
         switch activeTool {
         case .drawLine where pendingPoints.count == 2:
             createGraphic(BoardGraphicItem(id: UUID(), kind: .line,
-                                           layer: drawLayer, points: pendingPoints))
+                                           layer: activeLayer, points: pendingPoints))
         case .drawCircle where pendingPoints.count == 2:
             let radius = pendingPoints[0].distance(to: pendingPoints[1])
             if radius > 0.05 {
                 createGraphic(BoardGraphicItem(id: UUID(), kind: .circle,
-                                               layer: drawLayer,
+                                               layer: activeLayer,
                                                points: [pendingPoints[0]],
                                                radius: radius))
             } else {
@@ -1854,7 +3057,7 @@ struct PCBEditorView: View {
             }
         case .drawArc where pendingPoints.count == 3:
             createGraphic(BoardGraphicItem(id: UUID(), kind: .arc,
-                                           layer: drawLayer, points: pendingPoints))
+                                           layer: activeLayer, points: pendingPoints))
         default:
             break
         }
@@ -1862,7 +3065,7 @@ struct PCBEditorView: View {
 
     private func createGraphic(_ item: BoardGraphicItem) {
         mutateBoard { state in state.graphics.append(item) }
-        selection = .graphic(item.id)
+        selectOnly(.graphic(item.id))
         pendingPoints = []
         setStatus("\(item.kind.rawValue.capitalized) drawn on \(item.layer).")
     }
@@ -1873,7 +3076,7 @@ struct PCBEditorView: View {
             textAnchor = nil
             return
         }
-        createGraphic(BoardGraphicItem(id: UUID(), kind: .text, layer: drawLayer,
+        createGraphic(BoardGraphicItem(id: UUID(), kind: .text, layer: activeLayer,
                                        points: [anchor], text: text, textSize: 1.5))
         textAnchor = nil
     }
@@ -1881,10 +3084,17 @@ struct PCBEditorView: View {
     // MARK: - Board drawing
 
     private func displayOrigin(_ component: BoardComponent) -> FPPoint {
-        if movingReference == component.reference, let preview = movePreviewOrigin {
+        if let preview = movePreviewOrigins[component.reference] {
             return preview
         }
         return component.origin
+    }
+
+    private func displayViaCenter(_ via: BoardVia) -> FPPoint {
+        if movingViaID == via.id, let preview = moveViaPreview {
+            return preview
+        }
+        return via.center
     }
 
     private func drawBoard(ctx: GraphicsContext, size: CGSize, model: BoardModel) {
@@ -1898,14 +3108,21 @@ struct PCBEditorView: View {
             && visibility.boardGraphicShown(item) {
             drawBoardGraphic(&ctx, item: item)
         }
-        // Copper.
-        for trace in model.traces where visibility.traceShown(trace) {
-            drawTrace(&ctx, trace: trace)
+        // Copper fills (part 5) under traces and pads, with the
+        // clearance gap cut around foreign-net copper.
+        for zone in model.zones where visibility.zoneShown(zone) {
+            drawZone(&ctx, zone: zone, model: model)
+        }
+        // Copper traces, batched by style (part 5, item 3).
+        drawAllTraces(&ctx, model: model)
+        // Vias (part 5) sit on the copper they connect.
+        for via in model.vias where visibility.viaShown(via) {
+            drawVia(&ctx, via: via)
         }
         // Components (their own graphics + pads, visibility-filtered).
         for component in model.components {
             drawComponent(&ctx, component: component,
-                          selected: selection == .component(component.reference))
+                          selected: selections.contains(.component(component.reference)))
         }
         // Board text items.
         for item in model.graphics where item.kind == .text
@@ -1918,15 +3135,16 @@ struct PCBEditorView: View {
             drawGraphicOverlay(&ctx, item: graphic)
         }
         // In-progress previews.
-        drawPreviews(&ctx)
+        drawPreviews(&ctx, model: model)
     }
 
     private func drawGridDots(_ ctx: inout GraphicsContext, size: CGSize) {
-        var step = Self.gridSize
+        // The dot grid follows the USER's snap grid (part 5): the
+        // base step is the grid itself, doubled/halved only to stay
+        // readable at the current zoom (v4 behaviour, new base).
+        var step = gridMM
         while step * scale < 9 { step *= 2 }
-        // Deep zoom (part 4): subdivide so the grid stays useful all
-        // the way to 6000 % instead of dots 380 pt apart.
-        while step * scale > 90, step > 0.16 { step /= 2 }
+        while step * scale > 90, step > 0.02 { step /= 2 }
         let topLeft = screenToBoard(.zero)
         let bottomRight = screenToBoard(CGPoint(x: size.width, y: size.height))
         var path = Path()
@@ -1944,43 +3162,189 @@ struct PCBEditorView: View {
     }
 
     private func copperColor(_ layer: String) -> Color {
-        Self.layerRows.first { $0.name == layer }?.color
-            ?? Color(red: 0.85, green: 0.3, blue: 0.25)
+        layerColor(layer)
     }
 
-    private func drawTrace(_ ctx: inout GraphicsContext, trace: BoardTrace) {
-        guard trace.points.count > 1 else { return }
+    // MARK: Trace drawing — batched (part 5, item 3)
+    //
+    // Part 4 stroked every segment of every trace as its own
+    // GraphicsContext call. Part 5 builds ONE Path per
+    // (colour, alpha, width, dash) bucket across the whole board
+    // and strokes each bucket once — same pixels, a fraction of
+    // the draw calls. Selected traces keep their individual white
+    // underlay pass (there are only ever a few).
+
+    private struct TraceStyleKey: Hashable {
+        var colorName: String
+        var alphaSteps: Int
+        var widthSteps: Int
+        var dashed: Bool
+    }
+
+    private func drawAllTraces(_ ctx: inout GraphicsContext, model: BoardModel) {
+        var buckets: [TraceStyleKey: Path] = [:]
+        var bucketOrder: [TraceStyleKey] = []
+        for trace in model.traces where visibility.traceShown(trace) {
+            guard trace.points.count > 1 else { continue }
+            let isSelected = selections.contains(.trace(trace.id))
+            var path = Path()
+            for (index, point) in trace.points.enumerated() {
+                let screen = boardToScreen(point)
+                if index == 0 { path.move(to: screen) } else { path.addLine(to: screen) }
+            }
+            let width = max(1.2, CGFloat(trace.width * scale))
+            if isSelected {
+                ctx.stroke(path, with: .color(.white.opacity(0.85)),
+                           style: StrokeStyle(lineWidth: width + 3, lineCap: .round,
+                                              lineJoin: .round))
+            }
+            var colorName = trace.layer
+            var alpha = 1.0
+            if trace.netName == nil {
+                if trace.disconnectedNetName != nil { colorName = "__grey" }
+                alpha = 0.75
+            }
+            if trace.layer != activeLayer { alpha *= 0.55 }
+            if let highlightedNet {
+                alpha *= (trace.netName == highlightedNet) ? 1.0 : 0.18
+            }
+            let key = TraceStyleKey(
+                colorName: colorName,
+                alphaSteps: Int((alpha * 100).rounded()),
+                widthSteps: Int((width * 10).rounded()),
+                dashed: trace.disconnectedNetName != nil)
+            if buckets[key] == nil { bucketOrder.append(key) }
+            buckets[key]?.addPath(path)
+            if buckets[key] == nil { buckets[key] = path }
+        }
+        for key in bucketOrder {
+            guard let path = buckets[key] else { continue }
+            let color = key.colorName == "__grey"
+                ? Color(white: 0.55) : copperColor(key.colorName)
+            var style = StrokeStyle(
+                lineWidth: CGFloat(key.widthSteps) / 10,
+                lineCap: .round, lineJoin: .round)
+            if key.dashed { style.dash = [8, 5] }
+            ctx.opacity = Double(key.alphaSteps) / 100
+            ctx.stroke(path, with: .color(color), style: style)
+            ctx.opacity = 1
+        }
+    }
+
+    // MARK: Vias + zones drawing (part 5)
+
+    private func drawVia(_ ctx: inout GraphicsContext, via: BoardVia) {
+        let centreBoard = displayViaCenter(via)
+        let centre = boardToScreen(centreBoard)
+        let r = CGFloat(via.diameter / 2 * scale)
+        let drillR = CGFloat(via.drill / 2 * scale)
+        var alpha = 1.0
+        if let highlightedNet, via.netName != highlightedNet { alpha *= 0.3 }
+        ctx.opacity = alpha
+        // Annulus in the F.Cu colour (a via lives on every copper
+        // layer at once), drill in board background.
+        ctx.fill(Path(ellipseIn: CGRect(x: centre.x - r, y: centre.y - r,
+                                        width: 2 * r, height: 2 * r)),
+                 with: .color(copperColor("F.Cu")))
+        ctx.fill(Path(ellipseIn: CGRect(x: centre.x - drillR, y: centre.y - drillR,
+                                        width: 2 * drillR, height: 2 * drillR)),
+                 with: .color(Color(red: 0.043, green: 0.055, blue: 0.043)))
+        ctx.opacity = 1
+        if selections.contains(.via(via.id)) {
+            ctx.stroke(Path(ellipseIn: CGRect(x: centre.x - r - 3, y: centre.y - r - 3,
+                                              width: 2 * r + 6, height: 2 * r + 6)),
+                       with: .color(.white.opacity(0.9)),
+                       style: StrokeStyle(lineWidth: 1.6, dash: [6, 4]))
+        }
+        if let net = via.netName {
+            ctx.draw(Text(net)
+                .font(.system(size: max(7, min(11, scale * 1.1)), weight: .semibold))
+                .foregroundColor(Color(red: 0.55, green: 0.95, blue: 0.85)
+                    .opacity(alpha)),
+                     at: CGPoint(x: centre.x, y: centre.y + r + 2),
+                     anchor: UnitPoint(x: 0.5, y: 0))
+        }
+    }
+
+    /// A copper fill: the polygon filled in its layer colour UNDER
+    /// everything else copper, with the board clearance cut around
+    /// foreign-net copper (pads, traces, vias on the same layer).
+    /// The cuts are clipped to the polygon, so nothing outside the
+    /// fill is touched. Same-net copper needs no gap and gets none.
+    private func drawZone(_ ctx: inout GraphicsContext, zone: BoardZone,
+                          model: BoardModel) {
+        guard zone.points.count >= 3 else { return }
         var path = Path()
-        for (index, point) in trace.points.enumerated() {
+        for (index, point) in zone.points.enumerated() {
             let screen = boardToScreen(point)
             if index == 0 { path.move(to: screen) } else { path.addLine(to: screen) }
         }
-        let width = max(1.2, CGFloat(trace.width * scale))
-        let style = StrokeStyle(lineWidth: width, lineCap: .round, lineJoin: .round)
-
-        if selection == .trace(trace.id) {
-            ctx.stroke(path, with: .color(.white.opacity(0.85)),
-                       style: StrokeStyle(lineWidth: width + 3, lineCap: .round,
-                                          lineJoin: .round))
-        }
-        var color = copperColor(trace.layer)
-        var alpha = 1.0
-        if trace.netName == nil {
-            color = trace.disconnectedNetName != nil
-                ? Color(white: 0.55) : copperColor(trace.layer)
-            alpha = 0.75
-        }
-        if trace.layer != activeCopperLayer { alpha *= 0.55 }
-        if let highlightedNet {
-            alpha *= (trace.netName == highlightedNet) ? 1.0 : 0.18
-        }
-        var strokeStyle = style
-        if trace.disconnectedNetName != nil {
-            strokeStyle.dash = [8, 5]
-        }
+        path.closeSubpath()
+        var alpha = 0.45
+        if let highlightedNet, zone.netName != highlightedNet { alpha *= 0.4 }
         ctx.opacity = alpha
-        ctx.stroke(path, with: .color(color), style: strokeStyle)
+        ctx.fill(path, with: .color(copperColor(zone.layer)))
         ctx.opacity = 1
+
+        // Clearance cuts, clipped to the fill.
+        let clearance = BoardUnits.mm(fromMil: boardState.clearanceMil)
+        ctx.saveGState()
+        ctx.clip(to: path)
+        let background = Color(red: 0.043, green: 0.055, blue: 0.043)
+        for component in model.components {
+            guard let footprint = component.footprint else { continue }
+            var display = component
+            display.origin = displayOrigin(component)
+            for pad in footprint.pads where !pad.number.isEmpty {
+                let effective = BoardGeometry.boardPad(display, pad)
+                guard effective.layers.contains(zone.layer)
+                        || effective.layers.contains("*.Cu") else { continue }
+                let padNet = BoardGeometry.netName(component, pad)
+                guard padNet != zone.netName else { continue }
+                let corners = BoardGeometry.padOutline(display, pad)
+                guard corners.count >= 3 else { continue }
+                var outline = Path()
+                for (index, corner) in corners.enumerated() {
+                    let screen = boardToScreen(corner)
+                    if index == 0 { outline.move(to: screen) }
+                    else { outline.addLine(to: screen) }
+                }
+                outline.closeSubpath()
+                ctx.stroke(outline, with: .color(background),
+                           style: StrokeStyle(
+                               lineWidth: CGFloat(2 * clearance * scale),
+                               lineCap: .round, lineJoin: .round))
+                ctx.fill(outline, with: .color(background))
+            }
+        }
+        for trace in model.traces
+        where trace.layer == zone.layer && trace.netName != zone.netName
+            && trace.points.count > 1 {
+            var line = Path()
+            for (index, point) in trace.points.enumerated() {
+                let screen = boardToScreen(point)
+                if index == 0 { line.move(to: screen) } else { line.addLine(to: screen) }
+            }
+            ctx.stroke(line, with: .color(background),
+                       style: StrokeStyle(
+                           lineWidth: CGFloat((trace.width + 2 * clearance) * scale),
+                           lineCap: .round, lineJoin: .round))
+        }
+        for via in model.vias where via.netName != zone.netName {
+            let centre = boardToScreen(via.center)
+            let r = CGFloat((via.diameter / 2 + clearance) * scale)
+            ctx.fill(Path(ellipseIn: CGRect(x: centre.x - r, y: centre.y - r,
+                                            width: 2 * r, height: 2 * r)),
+                     with: .color(background))
+        }
+        ctx.restoreGState()
+
+        ctx.stroke(path, with: .color(copperColor(zone.layer).opacity(0.9)),
+                   style: StrokeStyle(lineWidth: 1.2))
+        if selections.contains(.zone(zone.id)) {
+            ctx.stroke(path, with: .color(.white.opacity(0.9)),
+                       style: StrokeStyle(lineWidth: 1.8, dash: [7, 4]))
+        }
     }
 
     private func drawBoardGraphic(_ ctx: inout GraphicsContext,
@@ -1996,11 +3360,40 @@ struct PCBEditorView: View {
             }
         case .text:
             guard let anchor = item.points.first, !item.text.isEmpty else { return }
-            ctx.draw(Text(item.text)
-                .font(.system(size: max(7, CGFloat(item.textSize * scale))))
-                .foregroundColor(color),
-                     at: boardToScreen(anchor), anchor: .center)
+            let screenAnchor = boardToScreen(anchor)
+            // Text on a back layer reads mirrored, as it does on a
+            // real board viewed from the front.
+            if item.layer.hasPrefix("B.") {
+                drawMirroredText(&ctx, item.text,
+                                 size: max(7, CGFloat(item.textSize * scale)),
+                                 color: color, at: screenAnchor,
+                                 anchor: .center, axisX: screenAnchor.x)
+            } else {
+                ctx.draw(Text(item.text)
+                    .font(.system(size: max(7, CGFloat(item.textSize * scale))))
+                    .foregroundColor(color),
+                         at: screenAnchor, anchor: .center)
+            }
         }
+    }
+
+    /// Draw text as the mirror image of drawing it at `point` with
+    /// `anchor` unmirrored, mirrored around the vertical line
+    /// x = axisX — how back-side lettering actually looks through
+    /// the board. (The transform does all the work; the point and
+    /// anchor stay exactly as the front-side call would use.)
+    private func drawMirroredText(_ ctx: inout GraphicsContext, _ text: String,
+                                  size: CGFloat, color: Color, at point: CGPoint,
+                                  anchor: UnitPoint, axisX: CGFloat,
+                                  bold: Bool = false) {
+        ctx.saveGState()
+        ctx.translateBy(x: 2 * axisX, y: 0)
+        ctx.scaleBy(x: -1, y: 1)
+        ctx.draw(Text(text)
+            .font(.system(size: size, weight: bold ? .bold : .regular))
+            .foregroundColor(color),
+                 at: point, anchor: anchor)
+        ctx.restoreGState()
     }
 
     private func drawGraphicOverlay(_ ctx: inout GraphicsContext,
@@ -2049,15 +3442,21 @@ struct PCBEditorView: View {
         }
     }
 
-    private func drawPreviews(_ ctx: inout GraphicsContext) {
-        // Routing: laid points + the 45° preview to the cursor.
+    private func drawPreviews(_ ctx: inout GraphicsContext, model: BoardModel) {
+        // The pointer for previews: the touch point while touching,
+        // else the Apple Pencil hover point (part 5). The
+        // prospective point follows the same rules as a tap would:
+        // grid snap for free points.
+        let pointer = cursorBoard ?? hoverBoard
+        // Routing: laid points + the 45° preview to the pointer.
         if routingActive {
             var points = routePoints
-            if let cursor = cursorBoard, let last = points.last {
-                if let corner = BoardGeometry.routeCorner(from: last, to: cursor) {
+            if let pointer, let last = points.last {
+                let prospective = snapPoint(pointer)
+                if let corner = BoardGeometry.routeCorner(from: last, to: prospective) {
                     points.append(corner)
                 }
-                points.append(cursor)
+                points.append(prospective)
             }
             var path = Path()
             for (index, point) in points.enumerated() {
@@ -2075,8 +3474,28 @@ struct PCBEditorView: View {
                          with: .color(.white))
             }
         }
-        // Draw tools: the shape so far, to the cursor.
-        if !pendingPoints.isEmpty, let cursor = cursorBoard {
+        // Zone drawing: vertices so far + preview edge.
+        if zoneActive {
+            var points = zonePoints
+            if let pointer { points.append(snapPoint(pointer)) }
+            var path = Path()
+            for (index, point) in points.enumerated() {
+                let screen = boardToScreen(point)
+                if index == 0 { path.move(to: screen) } else { path.addLine(to: screen) }
+            }
+            if zonePoints.count >= 3 { path.closeSubpath() }
+            ctx.stroke(path, with: .color(.white.opacity(0.85)),
+                       style: StrokeStyle(lineWidth: 1.4, dash: [5, 4]))
+            for point in zonePoints {
+                let screen = boardToScreen(point)
+                ctx.fill(Path(ellipseIn: CGRect(x: screen.x - 3, y: screen.y - 3,
+                                                width: 6, height: 6)),
+                         with: .color(.white))
+            }
+        }
+        // Draw tools: the shape so far, to the pointer.
+        if !pendingPoints.isEmpty, let pointer {
+            let cursor = snapPoint(pointer)
             var path = Path()
             switch activeTool {
             case .drawLine:
@@ -2136,12 +3555,15 @@ struct PCBEditorView: View {
             return
         }
 
-        // Footprint graphics, layer/object-filtered (the Layers eyes
-        // and Objects toggles drive BoardVisibility — the same
-        // predicates BoardFixture asserts).
-        for graphic in footprint.graphics
-        where visibility.footprintGraphicShown(graphic) {
-            drawGraphic(&ctx, graphic: graphic, origin: component.origin)
+        // Footprint graphics, layer/object-filtered — flipped
+        // parts draw their EFFECTIVE (mirrored) graphics, so the
+        // visibility predicates and colours follow the side the
+        // part actually sits on.
+        for graphic in footprint.graphics {
+            let effective = BoardGeometry.boardGraphic(component, graphic)
+            if visibility.footprintGraphicShown(effective) {
+                drawGraphic(&ctx, graphic: effective, origin: component.origin)
+            }
         }
         // Highlight halo under the highlighted net's pads.
         if let highlightedNet {
@@ -2156,17 +3578,36 @@ struct PCBEditorView: View {
             }
         }
         // Pads with numbers + net names, visibility-filtered.
-        for pad in footprint.pads where visibility.padShown(pad) {
+        for pad in footprint.pads
+        where visibility.padShown(BoardGeometry.boardPad(component, pad)) {
             drawPad(&ctx, pad: pad, component: component)
         }
         if visibility.showText,
-           visibility.layerShown("F.SilkS") || visibility.layerShown("F.Fab") {
+           visibility.layerShown(component.side == .front ? "F.SilkS" : "B.SilkS")
+            || visibility.layerShown(component.side == .front ? "F.Fab" : "B.Fab") {
             drawReferenceLabel(&ctx, component: component, rect: rect)
         }
     }
 
     private func drawReferenceLabel(_ ctx: inout GraphicsContext,
                                     component: BoardComponent, rect: CGRect) {
+        // A back-side part's reference/value read mirrored (they
+        // live on the back silkscreen in reality): same points and
+        // anchors as the front calls, mirrored around the bounds'
+        // vertical centreline.
+        if component.side == .back {
+            drawMirroredText(&ctx, component.reference, size: 12, color: .white,
+                             at: CGPoint(x: rect.minX, y: rect.minY - 3),
+                             anchor: UnitPoint(x: 0, y: 1), axisX: rect.midX,
+                             bold: true)
+            if !component.value.isEmpty {
+                drawMirroredText(&ctx, component.value, size: 10,
+                                 color: .white.opacity(0.6),
+                                 at: CGPoint(x: rect.minX, y: rect.maxY + 3),
+                                 anchor: UnitPoint(x: 0, y: 0), axisX: rect.midX)
+            }
+            return
+        }
         ctx.draw(Text(component.reference)
             .font(.system(size: 12, weight: .bold))
             .foregroundColor(.white),
@@ -2241,16 +3682,25 @@ struct PCBEditorView: View {
         case .text(let text):
             guard !text.hidden, !text.text.isEmpty else { return }
             let fontSize = max(7, CGFloat(text.size * scale))
-            ctx.draw(Text(text.text)
-                .font(.system(size: fontSize))
-                .foregroundColor(color),
-                     at: map(FPPoint(x: text.x, y: text.y)), anchor: .center)
+            let anchorPoint = map(FPPoint(x: text.x, y: text.y))
+            // Back-layer footprint text renders mirrored.
+            if text.layer.hasPrefix("B.") {
+                drawMirroredText(&ctx, text.text, size: fontSize, color: color,
+                                 at: anchorPoint, anchor: .center,
+                                 axisX: anchorPoint.x)
+            } else {
+                ctx.draw(Text(text.text)
+                    .font(.system(size: fontSize))
+                    .foregroundColor(color),
+                         at: anchorPoint, anchor: .center)
+            }
         }
     }
 
     /// Pad fill colour by layer/type — the same convention as the
     /// footprint browser's padColor (a copy lives here so this view
-    /// stays self-contained).
+    /// stays self-contained). Called with the EFFECTIVE pad, so a
+    /// flipped part's pads take their new side's colours.
     private func padColor(_ pad: KiCadFootprintPad) -> Color {
         if pad.type == .npThruHole { return .gray.opacity(0.8) }
         let hasFront = pad.layers.contains { $0.hasPrefix("F.") || $0 == "*.Cu" }
@@ -2263,34 +3713,38 @@ struct PCBEditorView: View {
 
     private func drawPad(_ ctx: inout GraphicsContext,
                          pad: KiCadFootprintPad, component: BoardComponent) {
+        // The EFFECTIVE pad: for a flipped part this is the
+        // mirrored pad (centre, rotation, layers, drill offset all
+        // follow the side) — pin 1 still draws as pad 1.
+        let effective = BoardGeometry.boardPad(component, pad)
         let centreBoard = BoardGeometry.padCenter(component, pad)
         let centre = boardToScreen(centreBoard)
-        let w = CGFloat(pad.width * scale)
-        let h = CGFloat(pad.height * scale)
+        let w = CGFloat(effective.width * scale)
+        let h = CGFloat(effective.height * scale)
 
         // Dimming: a net highlight dims every pad not on the net;
         // "Highlight layer" dims pads that don't touch the active
-        // copper layer.
+        // layer.
         var alpha = 1.0
         let net = BoardGeometry.netName(component, pad)
         if let highlightedNet, net != highlightedNet { alpha *= 0.3 }
         if highlightActiveLayer,
-           !pad.layers.contains(activeCopperLayer),
-           !pad.layers.contains("*.Cu") {
+           !effective.layers.contains(activeLayer),
+           !effective.layers.contains("*.Cu") {
             alpha *= 0.4
         }
 
         var pctx = ctx
         pctx.opacity = alpha
         pctx.translateBy(x: centre.x, y: centre.y)
-        pctx.rotate(by: .degrees(pad.rotation))
+        pctx.rotate(by: .degrees(effective.rotation))
         let rect = CGRect(x: -w / 2, y: -h / 2, width: w, height: h)
-        let color = padColor(pad)
-        switch pad.shape {
+        let color = padColor(effective)
+        switch effective.shape {
         case .circle, .oval:
             pctx.fill(Path(ellipseIn: rect), with: .color(color))
         case .roundrect:
-            let ratio = CGFloat(pad.roundrectRatio ?? 0.25)
+            let ratio = CGFloat(effective.roundrectRatio ?? 0.25)
             let radius = min(w, h) / 2 * min(max(ratio, 0), 0.5) * 2
             pctx.fill(Path(roundedRect: rect, cornerRadius: radius), with: .color(color))
         case .trapezoid, .custom:
@@ -2301,7 +3755,7 @@ struct PCBEditorView: View {
         case .rect:
             pctx.fill(Path(rect), with: .color(color))
         }
-        if let drill = pad.drill {
+        if let drill = effective.drill {
             let dw = CGFloat(drill.width * scale)
             let dh = CGFloat(drill.height * scale)
             let drillRect = CGRect(x: CGFloat(drill.offsetX * scale) - dw / 2,
@@ -2312,9 +3766,13 @@ struct PCBEditorView: View {
             pctx.stroke(Path(ellipseIn: drillRect), with: .color(.white.opacity(0.5)),
                         lineWidth: 1)
         }
-        if !pad.number.isEmpty {
+        if !effective.number.isEmpty {
             let fontSize = max(7, min(w, h) * 0.55)
-            pctx.draw(Text(pad.number)
+            if component.side == .back {
+                // Pad numbers mirror with the part.
+                pctx.scaleBy(x: -1, y: 1)
+            }
+            pctx.draw(Text(effective.number)
                 .font(.system(size: fontSize, weight: .bold))
                 .foregroundColor(.black.opacity(0.75)),
                       at: .zero, anchor: .center)
@@ -2322,7 +3780,7 @@ struct PCBEditorView: View {
 
         // Net name beside/under the pad (unrotated, in board space):
         // the correspondence this whole app exists to display.
-        if !pad.number.isEmpty, let net {
+        if !effective.number.isEmpty, let net {
             ctx.draw(Text(net)
                 .font(.system(size: max(7, min(11, scale * 1.1)), weight: .semibold))
                 .foregroundColor(Color(red: 0.55, green: 0.95, blue: 0.85)

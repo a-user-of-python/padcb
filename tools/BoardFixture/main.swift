@@ -753,6 +753,420 @@ filter.setAll(true)
 check(filter.allItems && filter.allows(.component),
       "filter: All items switches every class back on")
 
+// MARK: - Part 5: grid/units, lengths, connectivity, pin status
+
+// -- Units + snap math (Sean: grid adjustable IN MILS) --
+check(approx(BoardUnits.mm(fromMil: 100), 2.54),
+      "units: 100 mil is 2.54 mm")
+check(approx(BoardUnits.mil(fromMM: 0.635), 25),
+      "units: 0.635 mm is 25 mil")
+let snapped25 = BoardGrid.snap(FPPoint(x: 0.4, y: 0.3), gridMil: 25)
+check(approx(snapped25.x, 0.635) && approx(snapped25.y, 0),
+      "grid: (0.4, 0.3) snaps to (0.635, 0) on a 25 mil grid (got \(snapped25))")
+let snapped5 = BoardGrid.snap(FPPoint(x: 0.4, y: 0.3), gridMil: 5)
+check(approx(snapped5.x, 0.381) && approx(snapped5.y, 0.254),
+      "grid: (0.4, 0.3) snaps to (0.381, 0.254) on a 5 mil grid (got \(snapped5))")
+check(BoardGrid.presetMils.contains(25) && BoardGrid.presetMils.contains(50),
+      "grid: the presets include 25 and 50 mil")
+
+// -- Layer stack (configurable copper count) --
+checkEqual(BoardLayers.copperLayers(count: 2), ["F.Cu", "B.Cu"],
+           "layers: a 2-layer board is F.Cu + B.Cu")
+checkEqual(BoardLayers.copperLayers(count: 6),
+           ["F.Cu", "In1.Cu", "In2.Cu", "In3.Cu", "In4.Cu", "B.Cu"],
+           "layers: a 6-layer board gains In1..In4")
+check(!BoardLayers.layerExists("In2.Cu", copperCount: 2)
+      && BoardLayers.layerExists("In2.Cu", copperCount: 4),
+      "layers: In2.Cu exists on a 4-layer board but not a 2-layer one")
+check(BoardLayers.layerExists("F.SilkS", copperCount: 2),
+      "layers: non-copper layers always exist")
+checkEqual(BoardLayers.flipDestinations, ["F.Cu", "B.Cu"],
+           "flip: the Change Layer destinations are exactly F.Cu and B.Cu")
+
+// -- v4 board files load unchanged (additive format growth) --
+let v4JSON = """
+{"formatVersion":1,"placements":{},"excludedReferences":[],\
+"traces":[{"id":"BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB","netName":"NET_A",\
+"layer":"F.Cu","width":0.25,"points":[{"x":0,"y":0},{"x":10,"y":0}]}],\
+"graphics":[],"knownReferences":["U1"]}
+"""
+do {
+    let v4State = try JSONDecoder().decode(BoardState.self, from: Data(v4JSON.utf8))
+    checkEqual(v4State.traces.count, 1, "v4 board file: its trace decodes")
+    check(v4State.vias.isEmpty && v4State.zones.isEmpty && v4State.sides.isEmpty,
+          "v4 board file: part-5 collections default to empty")
+    checkEqual(v4State.copperLayerCount, 4,
+               "v4 board file: copper count defaults to the part-4 stack (4)")
+    check(approx(v4State.gridMil, 25) && approx(v4State.clearanceMil, 8),
+          "v4 board file: grid/clearance default to 25 mil / 8 mil")
+} catch {
+    check(false, "v4 board file literal decodes (threw \(error))")
+}
+
+// -- Part-5 state round-trip (vias, zones, sides, settings) --
+var state5 = BoardState()
+state5.vias = [BoardVia(id: fixedUUID("12121212-1212-4212-8212-121212121212"),
+                        netName: "NET_A", center: FPPoint(x: 10, y: 10),
+                        diameter: 0.8, drill: 0.4)]
+state5.zones = [BoardZone(id: fixedUUID("34343434-3434-4434-8434-343434343434"),
+                          netName: "VCC", layer: "B.Cu",
+                          points: [FPPoint(x: 0, y: 50), FPPoint(x: 20, y: 50),
+                                   FPPoint(x: 20, y: 70), FPPoint(x: 0, y: 70)])]
+state5.sides = ["U1": .back]
+state5.copperLayerCount = 6
+state5.gridMil = 50
+state5.clearanceMil = 6
+state5.knownReferences = ["R1", "U1", "X1"]
+do {
+    try BoardStateStore.save(state5, tableStem: "fixture5", in: stateDir)
+    let loaded5 = BoardStateStore.load(tableStem: "fixture5", in: stateDir)
+    check(loaded5 == state5,
+          "part 5 state: vias/zones/sides/settings round-trip losslessly")
+} catch {
+    check(false, "part 5 state: the store round-trip threw \(error)")
+}
+
+// -- Via + zone hit geometry --
+let fixtureVia = state5.vias[0]
+check(BoardGeometry.viaHit(fixtureVia, point: FPPoint(x: 10.3, y: 10),
+                           tolerance: 0.05),
+      "via: a tap on the annular ring hits")
+check(!BoardGeometry.viaHit(fixtureVia, point: FPPoint(x: 11, y: 10),
+                            tolerance: 0.05),
+      "via: a tap 1 mm away misses")
+check(BoardGeometry.pointInPolygon(FPPoint(x: 10, y: 60),
+                                   polygon: state5.zones[0].points),
+      "zone: a point inside the polygon is inside")
+check(!BoardGeometry.pointInPolygon(FPPoint(x: 30, y: 60),
+                                    polygon: state5.zones[0].points),
+      "zone: a point outside the polygon is outside")
+check(BoardGeometry.zoneHit(state5.zones[0], point: FPPoint(x: 10, y: 60),
+                            tolerance: 0.05),
+      "zone: hit-testing finds the fill")
+
+// -- Connectivity + trace lengths on the real fixture board --
+let u1Shelf = board.components.first { $0.reference == "U1" }!
+let r1Shelf = board.components.first { $0.reference == "R1" }!
+let u1Pad1Centre = BoardGeometry.padCenter(u1Shelf, binding(u1, "1").pad!)
+let r1Pad1Centre = BoardGeometry.padCenter(r1Shelf, binding(r1Component, "1").pad!)
+
+var stateConn = BoardState()
+stateConn.knownReferences = ["R1", "U1", "X1"]
+let conn0 = BoardConnectivity.analyze(
+    model: PCBBoardMerger.apply(state: stateConn, to: board, isSync: false).model,
+    copperCount: 4)
+checkEqual(conn0["NET_A"]?.unroutedPads.count ?? -1, 2,
+           "connectivity: with no copper, NET_A's two pads reach nothing")
+checkEqual(conn0["VCC"]?.padCount ?? -1, 2,
+           "connectivity: VCC has exactly its two pads (U1 pin 8, X1 pin 2)")
+let statusUnrouted = BoardPinStatus.status(
+    of: binding(r1Component, "1"), in: r1Component, connectivity: conn0)
+check(statusUnrouted == .unrouted(net: "NET_A"),
+      "pin status: R1 pin 1 is UNROUTED (net exists, no copper) — got \(statusUnrouted)")
+let statusDisconnected = BoardPinStatus.status(
+    of: binding(u1, "2"), in: u1, connectivity: conn0)
+check(statusDisconnected == .disconnected,
+      "pin status: U1 pin 2 is DISCONNECTED (no net at all) — got \(statusDisconnected)")
+
+stateConn.traces = [
+    BoardTrace(id: fixedUUID("56565656-5656-4656-8656-565656565656"),
+               netName: "NET_A", layer: "F.Cu", width: 0.25,
+               points: [u1Pad1Centre, r1Pad1Centre]),
+    BoardTrace(id: fixedUUID("78787878-7878-4787-8787-787878787878"),
+               netName: "NET_A", layer: "B.Cu", width: 0.25,
+               points: [FPPoint(x: 0, y: 200), FPPoint(x: 30, y: 200)]),
+]
+let mergedConn = PCBBoardMerger.apply(state: stateConn, to: board, isSync: false).model
+let conn1 = BoardConnectivity.analyze(model: mergedConn, copperCount: 4)
+checkEqual(conn1["NET_A"]?.routedPadCount ?? -1, 2,
+           "connectivity: one trace pad-to-pad routes both NET_A pads")
+check(conn1["NET_A"]?.unroutedPads.isEmpty == true,
+      "connectivity: NET_A is fully routed once the trace lands")
+let expectedLength = u1Pad1Centre.distance(to: r1Pad1Centre) + 30
+check(approx(conn1["NET_A"]?.traceLength ?? -1, expectedLength),
+      "lengths: NET_A total = the joining trace + the spare 30 mm trace (got \(conn1["NET_A"]?.traceLength ?? -1), want \(expectedLength))")
+let statusRouted = BoardPinStatus.status(
+    of: binding(r1Component, "1"), in: r1Component, connectivity: conn1)
+check(statusRouted == .connected(net: "NET_A"),
+      "pin status: R1 pin 1 reads CONNECTED after routing — got \(statusRouted)")
+
+// A zone alone can route: a fill covering both NET_A pads (and no
+// trace) still unions them.
+var stateZone = BoardState()
+stateZone.knownReferences = ["R1", "U1", "X1"]
+let zoneMinX = min(u1Pad1Centre.x, r1Pad1Centre.x) - 1
+let zoneMaxX = max(u1Pad1Centre.x, r1Pad1Centre.x) + 1
+let zoneMinY = min(u1Pad1Centre.y, r1Pad1Centre.y) - 1
+let zoneMaxY = max(u1Pad1Centre.y, r1Pad1Centre.y) + 1
+stateZone.zones = [BoardZone(
+    id: fixedUUID("90909090-9090-4090-8090-909090909090"),
+    netName: "NET_A", layer: "F.Cu",
+    points: [FPPoint(x: zoneMinX, y: zoneMinY), FPPoint(x: zoneMaxX, y: zoneMinY),
+             FPPoint(x: zoneMaxX, y: zoneMaxY), FPPoint(x: zoneMinX, y: zoneMaxY)])]
+let connZone = BoardConnectivity.analyze(
+    model: PCBBoardMerger.apply(state: stateZone, to: board, isSync: false).model,
+    copperCount: 4)
+checkEqual(connZone["NET_A"]?.routedPadCount ?? -1, 2,
+           "connectivity: a copper fill covering both pads routes the net")
+
+// MARK: - Part 5: clearance (net-touch) check
+
+// Two parallel traces 0.30 mm apart centre-to-centre, both 0.25
+// wide: edge gap 0.05 mm < 8 mil (0.2032) -> violation.
+var stateClear = BoardState()
+stateClear.knownReferences = ["R1", "U1", "X1"]
+stateClear.traces = [
+    BoardTrace(id: fixedUUID("A1A1A1A1-A1A1-41A1-81A1-A1A1A1A1A1A1"),
+               netName: "NET_A", layer: "F.Cu", width: 0.25,
+               points: [FPPoint(x: 0, y: 100), FPPoint(x: 20, y: 100)]),
+    BoardTrace(id: fixedUUID("B2B2B2B2-B2B2-42B2-82B2-B2B2B2B2B2B2"),
+               netName: "VCC", layer: "F.Cu", width: 0.25,
+               points: [FPPoint(x: 0, y: 100.3), FPPoint(x: 20, y: 100.3)]),
+    // Same-net neighbour just as close: must NOT be flagged.
+    BoardTrace(id: fixedUUID("C3C3C3C3-C3C3-43C3-83C3-C3C3C3C3C3C3"),
+               netName: "NET_A", layer: "F.Cu", width: 0.25,
+               points: [FPPoint(x: 0, y: 99.7), FPPoint(x: 20, y: 99.7)]),
+]
+let mergedClear = PCBBoardMerger.apply(state: stateClear, to: board,
+                                       isSync: false).model
+let violations = BoardClearance.violations(
+    model: mergedClear, copperCount: 4,
+    clearanceMM: BoardUnits.mm(fromMil: 8))
+let tracePairViolation = violations.first {
+    $0.itemA.contains("trace") && $0.itemB.contains("trace")
+}
+check(tracePairViolation != nil,
+      "clearance: traces 0.05 mm apart (edge) across nets ARE flagged (got \(violations.map(\.message)))")
+if let pair = tracePairViolation {
+    check(Set([pair.netA, pair.netB]) == Set(["NET_A", "VCC"]),
+          "clearance: the violation names both nets (NET_A, VCC)")
+    check(approx(pair.distanceMM, 0.05),
+          "clearance: the measured gap is 0.05 mm (got \(pair.distanceMM))")
+}
+check(!violations.contains { $0.netA == $0.netB },
+      "clearance: same-net copper is never flagged")
+
+// Boundary: edge gap 0.2132 mm > 8 mil clearance -> clean.
+var stateClearOK = stateClear
+stateClearOK.traces[1].points = [FPPoint(x: 0, y: 100.4632),
+                                 FPPoint(x: 20, y: 100.4632)]
+let violationsOK = BoardClearance.violations(
+    model: PCBBoardMerger.apply(state: stateClearOK, to: board,
+                                isSync: false).model,
+    copperCount: 4, clearanceMM: BoardUnits.mm(fromMil: 8))
+check(!violationsOK.contains {
+    $0.itemA.contains("trace") && $0.itemB.contains("trace")
+}, "clearance: a 0.2132 mm edge gap respects the 8 mil boundary")
+
+// Touching = distance 0 and reported as touching.
+var stateTouch = stateClear
+stateTouch.traces[1].points = [FPPoint(x: 0, y: 100.25),
+                               FPPoint(x: 20, y: 100.25)]
+let touchViolations = BoardClearance.violations(
+    model: PCBBoardMerger.apply(state: stateTouch, to: board,
+                                isSync: false).model,
+    copperCount: 4, clearanceMM: BoardUnits.mm(fromMil: 8))
+check(touchViolations.contains {
+    $0.itemA.contains("trace") && $0.distanceMM <= 0.001
+}, "clearance: overlapping traces of different nets read as touching")
+
+// MARK: - Part 5: manufacturing checker (violating + clean)
+
+let mfgSettings = ManufacturingSettings(clearanceMil: 8)
+let mfgBad = BoardManufacturing.check(
+    model: mergedClear, copperCount: 4, settings: mfgSettings,
+    connectivity: conn1)
+check(mfgBad.rules[0].passed == false,
+      "manufacturing: the clearance rule FAILS on the close-traces board")
+check(mfgBad.rules[4].passed == false,
+      "manufacturing: the fully-routed rule FAILS while VCC is unrouted")
+check(mfgBad.rules[5].passed == false,
+      "manufacturing: the disconnected-pins rule FAILS on the fixture board (loose pins exist)")
+
+var stateThin = BoardState()
+stateThin.knownReferences = ["R1", "U1", "X1"]
+stateThin.traces = [BoardTrace(
+    id: fixedUUID("D4D4D4D4-D4D4-44D4-84D4-D4D4D4D4D4D4"),
+    netName: "NET_A", layer: "F.Cu", width: 0.1,
+    points: [FPPoint(x: 0, y: 100), FPPoint(x: 20, y: 100)])]
+stateThin.vias = [
+    BoardVia(id: fixedUUID("E5E5E5E5-E5E5-45E5-85E5-E5E5E5E5E5E5"),
+             netName: "NET_A", center: FPPoint(x: 5, y: 120),
+             diameter: 0.5, drill: 0.2),   // both under the minimums
+    BoardVia(id: fixedUUID("F6F6F6F6-F6F6-46F6-86F6-F6F6F6F6F6F6"),
+             netName: "NET_A", center: FPPoint(x: 15, y: 120),
+             diameter: 0.8, drill: 0.4),   // compliant
+]
+let mfgThin = BoardManufacturing.check(
+    model: PCBBoardMerger.apply(state: stateThin, to: board, isSync: false).model,
+    copperCount: 4, settings: mfgSettings, connectivity: conn1)
+check(mfgThin.rules[1].passed == false
+      && mfgThin.rules[1].violations.count == 1,
+      "manufacturing: a 0.1 mm (3.9 mil) trace fails the 6 mil width rule, exactly once")
+check(mfgThin.rules[2].passed == false
+      && mfgThin.rules[2].violations.count == 1,
+      "manufacturing: the 0.2 mm drill fails the 12 mil drill rule; the 0.4 mm drill passes")
+check(mfgThin.rules[3].passed == false
+      && mfgThin.rules[3].violations.count == 1,
+      "manufacturing: the 0.5 mm via fails the 24 mil diameter rule; the 0.8 mm via passes")
+check(mfgThin.rules[6].passed,
+      "manufacturing: the layer-existence rule passes when everything is on F.Cu")
+
+// Layer-count reduction: a trace stranded on In2.Cu is kept,
+// hidden, and reported — never silently dropped.
+var stateOrphan = BoardState()
+stateOrphan.knownReferences = ["R1", "U1", "X1"]
+stateOrphan.copperLayerCount = 2
+stateOrphan.traces = [BoardTrace(
+    id: fixedUUID("17171717-1717-4717-8717-171717171717"),
+    netName: "NET_A", layer: "In2.Cu", width: 0.25,
+    points: [FPPoint(x: 0, y: 100), FPPoint(x: 20, y: 100)])]
+let mergedOrphan = PCBBoardMerger.apply(state: stateOrphan, to: board,
+                                        isSync: false)
+checkEqual(mergedOrphan.model.traces.count, 1,
+           "layers: reducing the count does NOT drop the In2.Cu trace")
+check(mergedOrphan.model.boardProblems.contains { $0.contains("In2.Cu") },
+      "layers: the stranded trace is named in Problems")
+var visOrphan = BoardVisibility()
+visOrphan.copperLayerCount = 2
+check(!visOrphan.layerShown("In2.Cu") && visOrphan.layerShown("F.Cu"),
+      "layers: In2.Cu is hidden on a 2-layer board; F.Cu still shows")
+let mfgOrphan = BoardManufacturing.check(
+    model: mergedOrphan.model, copperCount: 2, settings: mfgSettings,
+    connectivity: conn1)
+check(mfgOrphan.rules[6].passed == false,
+      "manufacturing: the layer-existence rule FAILS for the stranded trace")
+
+// A fully CLEAN board: hand-built, everything routed and legal.
+guard let fixrParsed = fixrEntry.parsed else { fatal("FIXR_FP parsed") }
+func cleanComponent(_ reference: String, origin: FPPoint) -> BoardComponent {
+    BoardComponent(
+        reference: reference, value: "10k", symbolKey: "FixtureSym:FIXR",
+        footprintKey: "FixtureFP:FIXR_FP", matchKind: "property",
+        footprint: fixrParsed,
+        pins: [
+            BoardPinBinding(pinNumber: "1", pinName: "", pinType: "passive",
+                            netName: "NET_A", pad: fixrParsed.pads[0]),
+            BoardPinBinding(pinNumber: "2", pinName: "", pinType: "passive",
+                            netName: "NET_B", pad: fixrParsed.pads[1]),
+        ],
+        anomalies: [], notes: [], origin: origin, boundsSize: (w: 5.41, h: 1.6))
+}
+var cleanModel = BoardModel(
+    tableTitle: "Clean", sourceFileName: "clean.json",
+    components: [cleanComponent("RA", origin: FPPoint(x: 0, y: 0)),
+                 cleanComponent("RB", origin: FPPoint(x: 30, y: 0))],
+    globalAnomalies: [], excludedPowerReferences: [],
+    netCount: 2, netNames: ["NET_A", "NET_B"])
+cleanModel.traces = [
+    // NET_A jogs up and over so it never nears NET_B's pads.
+    BoardTrace(id: fixedUUID("28282828-2828-4828-8828-282828282828"),
+               netName: "NET_A", layer: "F.Cu", width: 0.25,
+               points: [FPPoint(x: -1.905, y: 0), FPPoint(x: -1.905, y: 6),
+                        FPPoint(x: 28.095, y: 6), FPPoint(x: 28.095, y: 0)]),
+    BoardTrace(id: fixedUUID("39393939-3939-4939-8939-393939393939"),
+               netName: "NET_B", layer: "F.Cu", width: 0.25,
+               points: [FPPoint(x: 1.905, y: 0), FPPoint(x: 1.905, y: -6),
+                        FPPoint(x: 31.905, y: -6), FPPoint(x: 31.905, y: 0)]),
+]
+let connClean = BoardConnectivity.analyze(model: cleanModel, copperCount: 4)
+check(connClean["NET_A"]?.isFullyRouted == true
+      && connClean["NET_B"]?.isFullyRouted == true,
+      "clean board: both nets analyse as fully routed")
+let mfgClean = BoardManufacturing.check(
+    model: cleanModel, copperCount: 4, settings: mfgSettings,
+    connectivity: connClean)
+check(mfgClean.allPassed,
+      "manufacturing: the clean board passes EVERY rule (failures: \(mfgClean.rules.filter { !$0.passed }.map(\.name)))")
+
+// MARK: - Part 5: theory heuristics
+
+let theoryFixture = BoardTheory.findings(model: mergedConn, connectivity: conn1)
+check(theoryFixture.contains { $0.message.contains("pin 7") },
+      "theory: U1's loose GND pin is flagged as an unconnected power pin (got \(theoryFixture.map(\.message)))")
+check(!theoryFixture.contains { $0.message.contains("mixup") },
+      "theory: the fixture board has no ground/supply mixup")
+// Synthetic mixup: a VCC-named pin on a net called GND.
+var mixupModel = cleanModel
+mixupModel.components[0].pins[1] = BoardPinBinding(
+    pinNumber: "2", pinName: "VCC", pinType: "power_in",
+    netName: "GND", pad: fixrParsed.pads[1])
+let theoryMixup = BoardTheory.findings(model: mixupModel, connectivity: connClean)
+check(theoryMixup.contains { $0.message.contains("mixup") },
+      "theory: a VCC pin on the GND net IS flagged as a possible mixup")
+check(BoardSummaryText.make(model: cleanModel, connectivity: connClean,
+                            manufacturing: mfgClean, theory: [])
+        .contains("all 8 rules pass"),
+      "summary: the AI summary text reports the clean manufacturing result")
+
+// MARK: - Part 5: flip side (Change Layer)
+
+checkEqual(BoardGeometry.flippedLayerName("F.Cu"), "B.Cu",
+           "flip: F.Cu becomes B.Cu")
+checkEqual(BoardGeometry.flippedLayerName("B.SilkS"), "F.SilkS",
+           "flip: B.SilkS becomes F.SilkS")
+checkEqual(BoardGeometry.flippedLayerName(
+            BoardGeometry.flippedLayerName("F.Mask")), "F.Mask",
+           "flip: flipping twice is the identity")
+
+// Flip U1 (asymmetric: pads at x = -3.81, -1.27, 1.27, 3.81).
+var stateFlip = BoardState()
+stateFlip.knownReferences = ["R1", "U1", "X1"]
+stateFlip.sides = ["U1": .back]
+let mergedFlip = PCBBoardMerger.apply(state: stateFlip, to: board, isSync: false)
+let u1Back = mergedFlip.model.components.first { $0.reference == "U1" }!
+check(u1Back.side == .back, "flip: the merger puts U1 on the back side")
+let u1Front = board.components.first { $0.reference == "U1" }!
+for number in ["1", "4", "8"] {
+    let rawPad = binding(u1, number).pad!
+    let frontCentre = BoardGeometry.padCenter(u1Front, rawPad)
+    let backCentre = BoardGeometry.padCenter(u1Back, rawPad)
+    check(approx(backCentre.x, 2 * u1Front.origin.x - frontCentre.x)
+          && approx(backCentre.y, frontCentre.y),
+          "flip: U1 pad \(number) mirrors across the origin's vertical axis (front \(frontCentre) -> back \(backCentre))")
+    checkEqual(binding(u1Back, number).pad?.number ?? "", number,
+               "flip: pin \(number) still binds pad \(number) after the flip")
+}
+// ...and it survives a SYNC merge too (side is board state).
+let mergedFlipSync = PCBBoardMerger.apply(state: mergedFlip.stateToSave,
+                                          to: boardV2, isSync: true)
+check(mergedFlipSync.model.components.first { $0.reference == "U1" }?.side == .back,
+      "flip: the side survives a sync merge")
+
+// Rotated asymmetric footprint: mirror composes with pad rotation.
+// A 30°-rotated rect pad at (1.905, 0): after the flip its outline
+// must be the exact mirror image of the front outline.
+var rotatedFP = fixrParsed
+rotatedFP.pads[1].rotation = 30
+let rotatedFront = BoardComponent(
+    reference: "RR", value: "", symbolKey: "FixtureSym:FIXR",
+    footprintKey: "FixtureFP:FIXR_FP", matchKind: nil,
+    footprint: rotatedFP, pins: [], anomalies: [], notes: [],
+    origin: FPPoint(x: 100, y: 100), boundsSize: (w: 5.41, h: 1.6))
+var rotatedBack = rotatedFront
+rotatedBack.side = .back
+let frontOutline = BoardGeometry.padOutline(rotatedFront, rotatedFP.pads[1])
+let backOutline = BoardGeometry.padOutline(rotatedBack, rotatedFP.pads[1])
+let mirroredFront = frontOutline.map {
+    FPPoint(x: 2 * 100 - $0.x, y: $0.y)
+}
+check(backOutline.count == mirroredFront.count
+      && backOutline.allSatisfy { point in
+          mirroredFront.contains {
+              approx($0.x, point.x) && approx($0.y, point.y)
+          }
+      },
+      "flip: a rotated pad's outline after the flip is the mirror of its front outline")
+check(approx(BoardGeometry.boardPad(rotatedBack, rotatedFP.pads[1]).rotation, -30),
+      "flip: the rotated pad's angle negates (30 -> -30)")
+
+// A trace's layer change keeps its coordinates exactly.
+var flippedTrace = fixtureTrace
+flippedTrace.layer = "B.Cu"
+check(flippedTrace.points == fixtureTrace.points
+      && approx(flippedTrace.length, fixtureTrace.length),
+      "flip: a trace moved F.Cu -> B.Cu keeps identical coordinates")
+
 // MARK: - Result
 
 print("BoardFixture: \(passCount) passed, \(failCount) failed")

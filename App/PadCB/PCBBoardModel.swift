@@ -60,6 +60,11 @@ struct BoardComponent {
     /// i.e. boardPoint(local) = origin + local. The footprint's bounds
     /// top-left therefore sits at origin + footprint.bounds.min.
     var origin: FPPoint
+    /// Which side of the board the part sits on (part 5). Set by
+    /// the merger from the saved board state (default front); a
+    /// back-side part's geometry is the MIRRORED footprint — see
+    /// BoardGeometry.boardPad / boardGraphic.
+    var side: BoardSide = .front
     /// Footprint bounds size in mm (12×8 placeholder when unresolved).
     var boundsSize: (w: Double, h: Double)
 }
@@ -86,6 +91,9 @@ struct BoardModel {
     /// these empty; only a merge from a saved BoardState fills them.
     var traces: [BoardTrace] = []
     var graphics: [BoardGraphicItem] = []
+    /// Placed vias + copper fill zones (part 5), merged the same way.
+    var vias: [BoardVia] = []
+    var zones: [BoardZone] = []
     /// Problems that belong to the merged board as a whole (part 4):
     /// traces whose net vanished from the schematic, kept visible
     /// here instead of being silently dropped.
