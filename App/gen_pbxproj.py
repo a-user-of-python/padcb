@@ -16,6 +16,9 @@ SWIFT_FILES = [
     # Part 3: search engine, symbol<->footprint matcher, PCB board model + editor.
     "SearchEngine.swift", "FootprintMatcher.swift",
     "PCBBoardModel.swift", "PCBEditorView.swift",
+    # Part 4: persisted board state (placements/traces/graphics),
+    # sync merge, visibility/filter predicates, board geometry.
+    "PCBBoardState.swift",
 ]
 
 

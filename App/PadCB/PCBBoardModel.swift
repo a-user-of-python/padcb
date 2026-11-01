@@ -78,6 +78,18 @@ struct BoardModel {
     /// with no footprint (KiCad keeps power symbols off the board).
     var excludedPowerReferences: [String]
     var netCount: Int
+    /// The table's net names (part 4) — the validity set the board
+    /// merger checks trace net bindings against.
+    var netNames: [String] = []
+    /// The user's board work, merged in by PCBBoardMerger (part 4):
+    /// routed traces and drawn board graphics. The builder leaves
+    /// these empty; only a merge from a saved BoardState fills them.
+    var traces: [BoardTrace] = []
+    var graphics: [BoardGraphicItem] = []
+    /// Problems that belong to the merged board as a whole (part 4):
+    /// traces whose net vanished from the schematic, kept visible
+    /// here instead of being silently dropped.
+    var boardProblems: [String] = []
 }
 
 // MARK: - Builder
@@ -434,7 +446,8 @@ enum PCBBoardModelBuilder {
             components: components,
             globalAnomalies: globalAnomalies,
             excludedPowerReferences: excludedPowerReferences.sorted(by: naturalLess),
-            netCount: table.nets.count)
+            netCount: table.nets.count,
+            netNames: table.nets.map(\.name))
     }
 
     // MARK: - Ordering helpers

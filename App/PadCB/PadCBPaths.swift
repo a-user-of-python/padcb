@@ -20,6 +20,8 @@ import Foundation
 ///                                subfolders are scanned recursively)
 /// - Documents/ConnectionTables/  encrypted connection tables (*.pct),
 ///                                one per saved schematic (part 2)
+/// - Documents/Boards/            PCB editor board state (*.board.json),
+///                                one per connection table (part 4)
 ///
 /// PART 3 RENAME (Sean): the user symbol-library folder was
 /// Documents/Libraries in part 2 and is Documents/Symbols from part 3
@@ -62,6 +64,15 @@ enum PadCBPaths {
         documentsDirectory.appendingPathComponent("ConnectionTables", isDirectory: true)
     }
 
+    /// PCB editor board state (part 4): one plain-JSON sidecar per
+    /// connection table, holding everything the user did to the board
+    /// (placements, exclusions, traces, board graphics). Plain JSON on
+    /// purpose — unlike the connection tables this is the user's own
+    /// editable work product, not derived data.
+    static var boardsDirectory: URL {
+        documentsDirectory.appendingPathComponent("Boards", isDirectory: true)
+    }
+
     /// Creates the four standard folders (best effort). Called on launch
     /// and before scans/writes so the folders are visible in Files even
     /// before the user has dropped anything into them. The legacy
@@ -69,7 +80,8 @@ enum PadCBPaths {
     static func ensureStandardDirectories() {
         let fm = FileManager.default
         for dir in [schematicsDirectory, userSymbolsDirectory,
-                    footprintsDirectory, connectionTablesDirectory] {
+                    footprintsDirectory, connectionTablesDirectory,
+                    boardsDirectory] {
             try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
         }
     }

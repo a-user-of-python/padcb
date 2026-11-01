@@ -521,6 +521,238 @@ checkEqual(syncDiff.newNetCount, 3, "sync diff: new net count is 3")
 check(PCBBoardModelBuilder.diff(from: board, to: board).isEmpty,
       "sync diff: a board diffed with itself is empty (sync with no re-save reports no changes)")
 
+// MARK: - Part 4: board state, traces, merge, visibility, filter
+
+// -- Routing geometry: KiCad's 45° corner rule --
+let cornerA = BoardGeometry.routeCorner(from: FPPoint(x: 0, y: 0),
+                                        to: FPPoint(x: 10, y: 4))
+check(cornerA != nil && approx(cornerA!.x, 4) && approx(cornerA!.y, 4),
+      "route: (0,0)->(10,4) bends at (4,4) — a 45° segment, then straight")
+check(BoardGeometry.routeCorner(from: FPPoint(x: 0, y: 0),
+                                to: FPPoint(x: 10, y: 0)) == nil,
+      "route: an axis-aligned run needs no corner")
+check(BoardGeometry.routeCorner(from: FPPoint(x: 0, y: 0),
+                                to: FPPoint(x: 6, y: -6)) == nil,
+      "route: a perfect diagonal needs no corner")
+let cornerB = BoardGeometry.routeCorner(from: FPPoint(x: 10, y: 10),
+                                        to: FPPoint(x: 2, y: 4))
+check(cornerB != nil && approx(cornerB!.x, 4) && approx(cornerB!.y, 4),
+      "route: (10,10)->(2,4) bends at (4,4) — signs handled")
+
+// -- Zoom metrics (Sean: "add more zoom, I can't get that close") --
+checkEqual(BoardCanvasMetrics.maxScale, 150.0,
+           "zoom: the ceiling is 150 pt/mm")
+checkEqual(BoardCanvasMetrics.percent(forScale: 150), 6000,
+           "zoom: 150 pt/mm reads as 6000%")
+checkEqual(BoardCanvasMetrics.clamped(10_000), 150.0,
+           "zoom: the clamp holds the ceiling")
+checkEqual(BoardCanvasMetrics.percent(forScale: 2.5), 100,
+           "zoom: 2.5 pt/mm still reads as 100%")
+
+// -- Trace model: hit-testing follows the (resizeable) width --
+var fixtureTrace = BoardTrace(
+    id: fixedUUID("BBBBBBBB-BBBB-4BBB-8BBB-BBBBBBBBBBBB"),
+    netName: "NET_A", layer: "F.Cu", width: 0.25,
+    points: [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 0), FPPoint(x: 10, y: 10)])
+check(BoardGeometry.traceHit(fixtureTrace, point: FPPoint(x: 5, y: 0.1),
+                             tolerance: 0.05),
+      "trace: a point on the copper is a hit")
+check(!BoardGeometry.traceHit(fixtureTrace, point: FPPoint(x: 5, y: 1.0),
+                              tolerance: 0.05),
+      "trace: a point 1 mm off a 0.25 mm trace is a miss")
+check(approx(fixtureTrace.length, 20),
+      "trace: length sums its segments (10 + 10)")
+fixtureTrace.width = 2.0
+check(BoardGeometry.traceHit(fixtureTrace, point: FPPoint(x: 5, y: 0.9),
+                             tolerance: 0.05),
+      "trace: RESIZED to 2 mm, that same point is on the copper now")
+fixtureTrace.width = 0.25
+
+// -- Hit-testing against the real fixture board --
+if let pad1 = binding(u1, "1").pad {
+    let centre = BoardGeometry.padCenter(u1, pad1)
+    if let hit = BoardGeometry.padAt(board, point: centre, tolerance: 0.1) {
+        checkEqual(hit.component.reference, "U1",
+                   "geometry: padAt names the owning component")
+        checkEqual(hit.netName ?? "", "NET_A",
+                   "geometry: padAt reports the pad's net (NET_A)")
+    } else {
+        check(false, "geometry: padAt finds U1 pad 1 at its centre")
+    }
+    checkEqual(BoardGeometry.componentAt(board, point: centre)?.reference ?? "",
+               "U1", "geometry: componentAt finds U1 at its pad 1 centre")
+} else {
+    check(false, "geometry: U1 pad 1 exists for the hit tests")
+}
+
+// -- Board-state persistence through the real store --
+let stateDir = FileManager.default.temporaryDirectory
+    .appendingPathComponent("padcb-boardfixture-\(ProcessInfo.processInfo.processIdentifier)")
+var state1 = BoardState()
+state1.placements = ["U1": FPPoint(x: 500, y: 500)]
+state1.traces = [fixtureTrace,
+                 BoardTrace(id: fixedUUID("CCCCCCCC-CCCC-4CCC-8CCC-CCCCCCCCCCCC"),
+                            netName: "VCC", layer: "B.Cu", width: 0.5,
+                            points: [FPPoint(x: 0, y: 20), FPPoint(x: 30, y: 20)])]
+state1.graphics = [BoardGraphicItem(
+    id: fixedUUID("DDDDDDDD-DDDD-4DDD-8DDD-DDDDDDDDDDDD"),
+    kind: .line, layer: "Dwgs.User",
+    points: [FPPoint(x: 0, y: 0), FPPoint(x: 5, y: 5)])]
+state1.knownReferences = ["R1", "U1", "X1"]
+do {
+    try BoardStateStore.save(state1, tableStem: "fixture", in: stateDir)
+    let loaded = BoardStateStore.load(tableStem: "fixture", in: stateDir)
+    check(loaded == state1,
+          "board state: save/load through the real store is lossless")
+} catch {
+    check(false, "board state: the store round-trip threw \(error)")
+}
+check(BoardStateStore.load(tableStem: "no-such-board", in: stateDir) == BoardState.empty,
+      "board state: a missing sidecar loads as the empty state")
+
+// -- Merge on open: placements + traces + graphics carry --
+let mergedLoad = PCBBoardMerger.apply(state: state1, to: board, isSync: false)
+let u1Merged = mergedLoad.model.components.first { $0.reference == "U1" }!
+check(approx(u1Merged.origin.x, 500) && approx(u1Merged.origin.y, 500),
+      "merge: U1 keeps its saved placement (500, 500), not the shelf origin")
+let r1Merged = mergedLoad.model.components.first { $0.reference == "R1" }!
+check(!(approx(r1Merged.origin.x, 500) && approx(r1Merged.origin.y, 500)),
+      "merge: R1 (never moved) keeps its shelf origin")
+checkEqual(mergedLoad.model.traces.count, 2,
+           "merge: both traces carry into the model")
+checkEqual(mergedLoad.model.graphics.count, 1,
+           "merge: the board graphic carries into the model")
+check(mergedLoad.model.boardProblems.isEmpty,
+      "merge: no problems while every trace's net exists")
+checkEqual(Set(mergedLoad.stateToSave.knownReferences), Set(["R1", "U1", "X1"]),
+           "merge: the canonical state records the board's references")
+
+// -- Merge on sync to the v2 table (VCC renamed VCC2) --
+let mergedSync = PCBBoardMerger.apply(state: state1, to: boardV2, isSync: true)
+checkEqual(mergedSync.model.traces.count, 2,
+           "sync merge: the orphaned trace is NOT dropped")
+let orphaned = mergedSync.model.traces.first { $0.id == state1.traces[1].id }!
+check(orphaned.netName == nil && orphaned.disconnectedNetName == "VCC",
+      "sync merge: the VCC trace is unconnected and remembers its net")
+check(mergedSync.model.boardProblems.contains { $0.contains("VCC") },
+      "sync merge: the lost net appears in Problems, never silence")
+checkEqual(mergedSync.report.disconnectedTraceIDs, [orphaned.id],
+           "sync merge: the report names the disconnected trace")
+let stillBound = mergedSync.model.traces.first { $0.id == state1.traces[0].id }!
+checkEqual(stillBound.netName ?? "", "NET_A",
+           "sync merge: the NET_A trace keeps its binding by name")
+let u1Synced = mergedSync.model.components.first { $0.reference == "U1" }!
+check(approx(u1Synced.origin.x, 500) && approx(u1Synced.origin.y, 500),
+      "sync merge: U1's placement survives the sync")
+
+// -- And when the net comes back, the trace rebinds --
+let mergedBack = PCBBoardMerger.apply(state: mergedSync.stateToSave,
+                                      to: board, isSync: true)
+let rebound = mergedBack.model.traces.first { $0.id == state1.traces[1].id }!
+checkEqual(rebound.netName ?? "", "VCC",
+           "sync merge: when VCC returns, the trace rebinds by name")
+check(rebound.disconnectedNetName == nil
+      && mergedBack.model.boardProblems.isEmpty,
+      "sync merge: the problem clears when the net returns")
+
+// -- Deletion: excluded on open, restored + reported on sync --
+var stateExcluded = state1
+stateExcluded.excludedReferences = ["R1"]
+let mergedExcluded = PCBBoardMerger.apply(state: stateExcluded,
+                                          to: board, isSync: false)
+checkEqual(mergedExcluded.model.components.map(\.reference), ["U1", "X1"],
+           "merge (open): a deleted footprint stays off the board")
+let mergedReAdded = PCBBoardMerger.apply(state: stateExcluded,
+                                         to: board, isSync: true)
+check(mergedReAdded.model.components.contains { $0.reference == "R1" },
+      "merge (sync): the schematic restores the deleted footprint")
+checkEqual(mergedReAdded.report.reAddedReferences, ["R1"],
+           "merge (sync): the restore is REPORTED, never silent")
+check(mergedReAdded.stateToSave.excludedReferences.isEmpty,
+      "merge (sync): the exclusion is cleared once restored")
+
+// -- Arrivals and removals across a sync --
+var tableV3 = roundTripped
+var r2Instance = tableV3.components.first { $0.reference == "R1" }!
+r2Instance.reference = "R2"
+r2Instance.instanceID = fixedUUID("EEEEEEEE-EEEE-4EEE-8EEE-EEEEEEEEEEEE")
+tableV3.components.append(r2Instance)
+let boardV3 = PCBBoardModelBuilder.build(
+    table: tableV3,
+    resolveSymbol: { library, name in defsByKey["\(library)|\(name)"] },
+    resolveFootprint: { key in
+        guard let entry = FootprintMatcher.entry(forResolutionKey: key, in: entries),
+              let parsed = entry.parsed else { return nil }
+        return (entry: entry, parsed: parsed)
+    })
+check(boardV3.components.contains { $0.reference == "R2" },
+      "arrival fixture: the v3 board carries the new R2")
+let mergedArrival = PCBBoardMerger.apply(state: state1, to: boardV3, isSync: true)
+checkEqual(mergedArrival.report.arrivedReferences, ["R2"],
+           "merge: a new schematic part is reported as arrived")
+let r2Shelf = boardV3.components.first { $0.reference == "R2" }!
+let r2Merged = mergedArrival.model.components.first { $0.reference == "R2" }!
+check(r2Merged.origin == r2Shelf.origin,
+      "merge: the arrived part keeps its (unplaced) shelf position")
+var stateKnown = mergedArrival.stateToSave
+stateKnown.placements["R2"] = FPPoint(x: 42, y: 42)
+let mergedRemoval = PCBBoardMerger.apply(state: stateKnown, to: board, isSync: true)
+checkEqual(mergedRemoval.report.removedReferences, ["R2"],
+           "merge: a part removed from the schematic is reported")
+check(mergedRemoval.stateToSave.placements["R2"] == nil,
+      "merge: the vanished part's placement is pruned from the state")
+
+// -- Visibility: the predicates the canvas draws through --
+var vis = BoardVisibility()
+let silkLine = KiCadFootprintGraphic.line(
+    start: FPPoint(x: 0, y: 0), end: FPPoint(x: 1, y: 1),
+    layer: "F.SilkS", strokeWidth: 0.12, strokeType: "solid", fill: "none")
+check(vis.footprintGraphicShown(silkLine),
+      "visibility: a silk graphic shows by default")
+vis.hiddenLayers = ["F.SilkS"]
+check(!vis.footprintGraphicShown(silkLine),
+      "visibility: hiding F.SilkS hides its graphics — the eye is real")
+vis.hiddenLayers = []
+vis.showDrawings = false
+check(!vis.footprintGraphicShown(silkLine),
+      "visibility: Drawings off hides footprint graphics")
+vis.showDrawings = true
+let wildPad = KiCadFootprintPad(
+    number: "1", type: .thruHole, shape: .circle, x: 0, y: 0, rotation: 0,
+    width: 1.6, height: 1.6, drill: nil, layers: ["*.Cu", "*.Mask"],
+    roundrectRatio: nil, chamferRatio: nil, rectDelta: nil,
+    primitives: [], customAnchor: nil)
+check(vis.padShown(wildPad),
+      "visibility: a *.Cu pad shows while any copper layer is shown")
+vis.hiddenLayers = ["F.Cu", "In1.Cu", "In2.Cu", "B.Cu"]
+check(!vis.padShown(wildPad),
+      "visibility: with every copper layer hidden, the *.Cu pad hides")
+vis.hiddenLayers = ["F.Cu"]
+check(vis.padShown(wildPad),
+      "visibility: hiding F.Cu alone does NOT hide a through-hole pad")
+vis.hiddenLayers = []
+vis.showPads = false
+check(!vis.padShown(wildPad), "visibility: Pads off hides pads")
+vis.showPads = true
+check(vis.traceShown(fixtureTrace), "visibility: a trace shows by default")
+vis.showTracks = false
+check(!vis.traceShown(fixtureTrace), "visibility: Tracks off hides traces")
+vis.showTracks = true
+vis.hiddenLayers = ["B.Cu"]
+check(!vis.traceShown(state1.traces[1]),
+      "visibility: hiding B.Cu hides the B.Cu trace")
+
+// -- Selection filter --
+var filter = BoardSelectionFilter()
+check(filter.allows(.component) && filter.allows(.trace) && filter.allItems,
+      "filter: everything is selectable by default")
+filter.components = false
+check(!filter.allows(.component) && filter.allows(.trace) && !filter.allItems,
+      "filter: Footprints off blocks component selection only")
+filter.setAll(true)
+check(filter.allItems && filter.allows(.component),
+      "filter: All items switches every class back on")
+
 // MARK: - Result
 
 print("BoardFixture: \(passCount) passed, \(failCount) failed")

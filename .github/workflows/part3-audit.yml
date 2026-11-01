@@ -9,6 +9,8 @@ name: Part 3 Audit
 #    (exit 1 on fixture failure).
 #  - BoardFixture: schematic -> table -> board model correspondence
 #    proof on a hand-built fixture (exit 1 on any failed assertion).
+#    Part 4 extends it: board state persistence, sync merge
+#    semantics, trace model, visibility/filter predicates, zoom.
 
 on:
   workflow_dispatch:
@@ -25,6 +27,7 @@ on:
       - "App/PadCB/SymbolDrawList.swift"
       - "App/PadCB/ConnectionTable.swift"
       - "App/PadCB/PCBBoardModel.swift"
+      - "App/PadCB/PCBBoardState.swift"
       - "tools/SearchBench/**"
       - "tools/search_fixtures.py"
       - "tools/MatchCensus/**"
@@ -120,5 +123,6 @@ jobs:
             App/PadCB/FootprintMatcher.swift \
             App/PadCB/PadCBPaths.swift \
             App/PadCB/PCBBoardModel.swift \
+            App/PadCB/PCBBoardState.swift \
             tools/BoardFixture/main.swift
           /tmp/BoardFixture tools/board-fixtures | tee /tmp/board-fixture.txt

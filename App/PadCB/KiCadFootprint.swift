@@ -16,7 +16,7 @@ import Foundation
 /// Skipped but counted in `skippedNodeCounts`: (model ...) 3D references,
 /// zones, dimensions, groups, and anything else not listed above.
 
-struct FPPoint: Equatable {
+struct FPPoint: Equatable, Codable {
     var x: Double
     var y: Double
 
