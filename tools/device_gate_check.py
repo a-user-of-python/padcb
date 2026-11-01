@@ -44,15 +44,47 @@ def main():
 
     types = json.loads(simctl("list", "devicetypes", "-j"))["devicetypes"]
 
-    def pick(substr):
-        cands = [t for t in types if substr in t["name"]]
-        if not cands:
-            raise SystemExit(f"no simulator device type matching {substr!r}")
-        return cands[-1]
+    def try_create(label, candidates):
+        """First candidate (in preference order) the runtime accepts.
+        The device-type list includes legacy types (e.g. iPhone 6s)
+        that current runtimes refuse as 'Incompatible device', so
+        creation itself is the compatibility test."""
+        for dtype in candidates:
+            r = subprocess.run(
+                ["xcrun", "simctl", "create", f"Gate-{label}",
+                 dtype["identifier"], runtime],
+                capture_output=True, text=True)
+            if r.returncode == 0 and r.stdout.strip():
+                print(f"{label}: device type {dtype['name']}")
+                return r.stdout.strip()
+            print(f"{label}: {dtype['name']} refused: "
+                  f"{(r.stderr or r.stdout).strip().splitlines()[-1] if (r.stderr or r.stdout).strip() else 'unknown error'}")
+        raise SystemExit(f"no usable {label} device type for this runtime")
 
-    for label, dtype in (("iphone", pick("iPhone")), ("ipad", pick("iPad"))):
-        print(f"{label}: device type {dtype['name']}")
-        udid = simctl("create", f"Gate-{label}", dtype["identifier"], runtime)
+    def iphone_candidates():
+        import re
+        cands = [t for t in types if t["name"].startswith("iPhone")]
+        def model(t):
+            m = re.search(r"iPhone\s+(\d+)", t["name"])
+            return int(m.group(1)) if m else -1
+        # Newest model first — those are the types a current runtime
+        # is guaranteed to accept.
+        return sorted(cands, key=model, reverse=True)
+
+    def ipad_candidates():
+        cands = [t for t in types if t["name"].startswith("iPad")]
+        def family_rank(t):
+            for rank, marker in enumerate(("Pro", "Air", "mini")):
+                if marker in t["name"]:
+                    return rank
+            return 3
+        return sorted(cands, key=family_rank)
+
+    for label, candidates in (("iphone", iphone_candidates()),
+                              ("ipad", ipad_candidates())):
+        if not candidates:
+            raise SystemExit(f"no simulator device types for {label}")
+        udid = try_create(label, candidates)
         print(f"{label}: created {udid}")
         simctl("boot", udid)
         simctl("bootstatus", udid, "-b")
