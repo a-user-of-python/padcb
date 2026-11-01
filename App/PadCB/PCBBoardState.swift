@@ -304,12 +304,16 @@ struct BoardVisibility: Equatable {
     }
 
     /// A pad shows when the Pads class is on and at least one of its
-    /// layers is shown (a through-hole pad lives on every copper
-    /// layer, so hiding F.Cu alone must not hide it).
+    /// COPPER layers is shown. Pads are copper objects: their mask /
+    /// paste openings follow the pad, they don't keep it alive —
+    /// with every copper layer hidden the pad is gone (BoardFixture
+    /// caught exactly that). A through-hole pad lives on "*.Cu"
+    /// (every copper layer), so hiding F.Cu alone must not hide it.
     func padShown(_ pad: KiCadFootprintPad) -> Bool {
         guard showPads else { return false }
-        if pad.layers.isEmpty { return true }
-        return pad.layers.contains { layerShown($0) }
+        let copper = pad.layers.filter { $0 == "*.Cu" || $0.hasSuffix(".Cu") }
+        if copper.isEmpty { return true }
+        return copper.contains { layerShown($0) }
     }
 
     func traceShown(_ trace: BoardTrace) -> Bool {
