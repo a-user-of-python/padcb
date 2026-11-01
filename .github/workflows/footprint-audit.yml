@@ -1,0 +1,29 @@
+name: Footprint Audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "App/PadCB/SExpr.swift"
+      - "App/PadCB/KiCadFootprint.swift"
+      - "tools/FootprintDump/**"
+      - "tools/footprint-fixtures/**"
+      - ".github/workflows/footprint-audit.yml"
+
+jobs:
+  footprint-audit:
+    name: Footprint audit (real Swift footprint parser vs fixtures)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compile FootprintDump harness (app's real footprint sources)
+        run: |
+          xcrun swiftc -O -o /tmp/FootprintDump \
+            App/PadCB/SExpr.swift \
+            App/PadCB/KiCadFootprint.swift \
+            tools/FootprintDump/main.swift
+
+      - name: Run FootprintDump over the fixtures
+        run: |
+          /tmp/FootprintDump tools/footprint-fixtures

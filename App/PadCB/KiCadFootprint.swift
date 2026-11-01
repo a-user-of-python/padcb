@@ -241,6 +241,9 @@ struct KiCadFootprint {
         let handled: Set<String> = [
             "version", "generator", "generator_version", "layer", "tstamp",
             "uuid", "descr", "tags", "attr", "property",
+            // Per-file settings every KiCad 10 footprint carries; not
+            // geometry, so not "skipped" either.
+            "duplicate_pad_numbers_are_jumpers", "embedded_fonts",
             "fp_line", "fp_rect", "fp_circle", "fp_arc", "fp_poly",
             "fp_curve", "fp_text", "pad",
         ]
@@ -290,6 +293,45 @@ struct KiCadFootprint {
             }
         }
         return footprint
+    }
+
+    // MARK: - Arc sampling
+
+    /// Samples the arc through three file points via the circumcenter,
+    /// along the sweep passing through the mid point. Returns [start]
+    /// + one point per step, ending at the end point; a (near-)
+    /// collinear triple returns exactly [start, mid, end].
+    private static func arcSamplePoints(a: FPPoint, m: FPPoint, e: FPPoint) -> [FPPoint] {
+        var points: [FPPoint] = [a]
+        let d = 2 * (a.x * (m.y - e.y) + m.x * (e.y - a.y) + e.x * (a.y - m.y))
+        if abs(d) < 1e-9 {
+            points.append(m)
+            points.append(e)
+            return points
+        }
+        let aSq = a.x * a.x + a.y * a.y
+        let mSq = m.x * m.x + m.y * m.y
+        let eSq = e.x * e.x + e.y * e.y
+        let cx = (aSq * (m.y - e.y) + mSq * (e.y - a.y) + eSq * (a.y - m.y)) / d
+        let cy = (aSq * (e.x - m.x) + mSq * (a.x - e.x) + eSq * (m.x - a.x)) / d
+        let r = hypot(a.x - cx, a.y - cy)
+        let a0 = atan2(a.y - cy, a.x - cx)
+        let am = atan2(m.y - cy, m.x - cx)
+        let a1 = atan2(e.y - cy, e.x - cx)
+        func norm(_ v: Double) -> Double {
+            var v = v.truncatingRemainder(dividingBy: 2 * Double.pi)
+            if v < 0 { v += 2 * Double.pi }
+            return v
+        }
+        let sweepPos = norm(a1 - a0)
+        let midPos = norm(am - a0)
+        let sweep = midPos <= sweepPos + 1e-9 ? sweepPos : -(2 * Double.pi - sweepPos)
+        let steps = max(4, Int(abs(sweep) / (Double.pi / 36)) + 1)
+        for i in 1...steps {
+            let t = a0 + sweep * Double(i) / Double(steps)
+            points.append(FPPoint(x: cx + r * cos(t), y: cy + r * sin(t)))
+        }
+        return points
     }
 
     // MARK: - Node helpers
@@ -369,9 +411,27 @@ struct KiCadFootprint {
                         strokeWidth: stroke.width, strokeType: stroke.type, fill: fill)
         case "fp_poly", "gr_poly":
             guard let pts = node.child("pts") else { return nil }
-            let points = pts.children("xy").compactMap { xy -> FPPoint? in
-                guard let x = xy.double(1), let y = xy.double(2) else { return nil }
-                return FPPoint(x: x, y: y)
+            // KiCad 10 polygon outlines mix (xy x y) vertices with
+            // (arc (start)(mid)(end)) segments (e.g.
+            // Sensor_Pressure:Honeywell_ABPDAN) — sample the arcs into
+            // the point sequence, in file order.
+            var points: [FPPoint] = []
+            for child in pts.items {
+                guard case .list(let children) = child,
+                      let childHead = children.first?.atomValue else { continue }
+                if childHead == "xy",
+                   let x = child.double(1), let y = child.double(2) {
+                    points.append(FPPoint(x: x, y: y))
+                } else if childHead == "arc",
+                          let start = pointOf(child, "start"),
+                          let mid = pointOf(child, "mid"),
+                          let end = pointOf(child, "end") {
+                    for (i, sampled) in arcSamplePoints(a: start, m: mid, e: end).enumerated() {
+                        if i == 0, let last = points.last,
+                           last.distance(to: sampled) < 1e-9 { continue }
+                        points.append(sampled)
+                    }
+                }
             }
             guard points.count >= 2 else { return nil }
             return .poly(points: points, layer: layer,
