@@ -62,10 +62,17 @@ func jpt(_ p: CGPoint) -> String {
     jxy(Double(p.x), Double(p.y))
 }
 
+/// Markup runs in the differ's array form:
+/// [[text, sub, sup, overbar], ...].
 func jruns(_ runs: [KiCadText.Run]) -> String {
     "[" + runs.map {
-        "{\"text\":\(jstr($0.text)),\"sub\":\(jbool($0.sub)),\"sup\":\(jbool($0.sup)),\"overbar\":\(jbool($0.overbar))}"
+        "[\(jstr($0.text)),\(jbool($0.sub)),\(jbool($0.sup)),\(jbool($0.overbar))]"
     }.joined(separator: ",") + "]"
+}
+
+func jptOpt(_ p: CGPoint?) -> String {
+    guard let p else { return "null" }
+    return jpt(p)
 }
 
 func glyphJSON(_ g: SymbolDrawList.Glyph) -> String {
@@ -81,12 +88,19 @@ func glyphJSON(_ g: SymbolDrawList.Glyph) -> String {
 
 func pinJSON(_ pg: SymbolDrawList.PinGeom) -> String {
     let pin = pg.pin
+    // Schema = tools/truth_diff.py's documented dump schema:
+    // "glyphs" is the pin NAME's markup runs (array form); the pin
+    // DECORATION glyphs (bubble/wedge/x) ride along as "deco" — the
+    // differ does not compare them yet, they are dumped for the
+    // record. Anchors are null when the text is not drawn.
     return "{\"num\":\(jstr(pin.number)),\"name\":\(jstr(pin.name)),\"plainName\":\(jstr(pg.plainName)),"
         + "\"hidden\":\(jbool(pin.hidden)),\"type\":\(jstr(pin.type.rawValue)),\"shape\":\(jstr(pin.shape.rawValue)),"
         + "\"conn\":\(jpt(pg.conn)),\"root\":\(jpt(pg.root)),\"angle\":\(jnum(pin.rotation)),\"len\":\(jnum(pin.length)),"
         + "\"nameSize\":\(jnum(pin.nameSize)),\"numSize\":\(jnum(pin.numberSize)),"
-        + "\"nameAnchor\":\(jpt(pg.nameAnchor)),\"numAnchor\":\(jpt(pg.numberAnchor)),"
-        + "\"glyphs\":[\(pg.glyphs.map(glyphJSON).joined(separator: ","))]}"
+        + "\"nameAnchor\":\(jptOpt(pg.nameAnchor)),\"numAnchor\":\(jptOpt(pg.numberAnchor)),"
+        + "\"nameOutside\":\(jbool(pg.nameOutside)),"
+        + "\"glyphs\":\(jruns(pg.nameRuns)),"
+        + "\"deco\":[\(pg.glyphs.map(glyphJSON).joined(separator: ","))]}"
 }
 
 func strokeJSON(_ w: Double, _ t: String, _ f: String) -> String {
@@ -94,36 +108,34 @@ func strokeJSON(_ w: Double, _ t: String, _ f: String) -> String {
 }
 
 func gfxJSON(_ g: SymbolDrawList.GraphicGeom) -> String {
+    // Field names = tools/truth_diff.py's documented dump schema.
     switch g {
     case .rectangle(let x1, let y1, let x2, let y2, let w, let t, let f):
-        // Corners in the renderer's trace order:
-        // (x1, y1) -> (x2, y1) -> (x2, y2) -> (x1, y2).
-        let corners = [jxy(x1, y1), jxy(x2, y1), jxy(x2, y2), jxy(x1, y2)].joined(separator: ",")
-        return "{\"kind\":\"rect\",\"corners\":[\(corners)],\(strokeJSON(w, t, f))}"
+        return "{\"kind\":\"rect\",\"x1\":\(jnum(x1)),\"y1\":\(jnum(y1)),\"x2\":\(jnum(x2)),\"y2\":\(jnum(y2)),\(strokeJSON(w, t, f))}"
     case .circle(let cx, let cy, let r, let w, let t, let f):
-        return "{\"kind\":\"circle\",\"c\":\(jxy(cx, cy)),\"r\":\(jnum(r)),\(strokeJSON(w, t, f))}"
+        return "{\"kind\":\"circle\",\"cx\":\(jnum(cx)),\"cy\":\(jnum(cy)),\"r\":\(jnum(r)),\(strokeJSON(w, t, f))}"
     case .arc(let sx, let sy, let mx, let my, let ex, let ey, let sampled, let w, let t, let f):
-        return "{\"kind\":\"arc\",\"start\":\(jxy(sx, sy)),\"mid\":\(jxy(mx, my)),\"end\":\(jxy(ex, ey)),"
+        return "{\"kind\":\"arc\",\"sx\":\(jnum(sx)),\"sy\":\(jnum(sy)),\"mx\":\(jnum(mx)),\"my\":\(jnum(my)),\"ex\":\(jnum(ex)),\"ey\":\(jnum(ey)),"
             + "\"pts\":[\(sampled.map(jpt).joined(separator: ","))],\(strokeJSON(w, t, f))}"
     case .polyline(let points, let w, let t, let f):
         let pts = points.map { jxy($0.0, $0.1) }.joined(separator: ",")
-        return "{\"kind\":\"poly\",\"pts\":[\(pts)],\(strokeJSON(w, t, f))}"
+        return "{\"kind\":\"poly\",\"points\":[\(pts)],\(strokeJSON(w, t, f))}"
     case .bezier(let p1, let p2, let p3, let p4, let w, let t, let f):
-        // pts = the 4 control points in order (start, c1, c2, end).
+        // points = the 4 control points in order (start, c1, c2, end).
         let pts = [jxy(p1.0, p1.1), jxy(p2.0, p2.1), jxy(p3.0, p3.1), jxy(p4.0, p4.1)].joined(separator: ",")
-        return "{\"kind\":\"bezier\",\"pts\":[\(pts)],\(strokeJSON(w, t, f))}"
+        return "{\"kind\":\"bezier\",\"points\":[\(pts)],\(strokeJSON(w, t, f))}"
     case .text(let string, let x, let y, let rotation, let size, let bold, let italic,
                let hJustify, let vJustify, let plain, let runs):
         // Text graphics carry no stroke/fill in the file format: null.
-        return "{\"kind\":\"text\",\"text\":\(jstr(string)),\"plain\":\(jstr(plain)),\"runs\":\(jruns(runs)),"
-            + "\"at\":\(jxy(x, y)),\"rot\":\(jnum(rotation)),\"size\":\(jnum(size)),"
+        return "{\"kind\":\"text\",\"string\":\(jstr(string)),\"plain\":\(jstr(plain)),\"glyphs\":\(jruns(runs)),"
+            + "\"x\":\(jnum(x)),\"y\":\(jnum(y)),\"rotation\":\(jnum(rotation)),\"size\":\(jnum(size)),"
             + "\"bold\":\(jbool(bold)),\"italic\":\(jbool(italic)),"
             + "\"hJustify\":\(jstr(hJustify)),\"vJustify\":\(jstr(vJustify)),"
             + "\"strokeW\":null,\"strokeType\":null,\"fill\":null}"
     case .textBox(let string, let x, let y, let w, let h, let rotation, let size, let bold, let italic,
                   let hJustify, let vJustify, let sw, let st, let f, let plain, let runs):
-        return "{\"kind\":\"textbox\",\"text\":\(jstr(string)),\"plain\":\(jstr(plain)),\"runs\":\(jruns(runs)),"
-            + "\"at\":\(jxy(x, y)),\"w\":\(jnum(w)),\"h\":\(jnum(h)),\"rot\":\(jnum(rotation)),\"size\":\(jnum(size)),"
+        return "{\"kind\":\"textbox\",\"string\":\(jstr(string)),\"plain\":\(jstr(plain)),\"glyphs\":\(jruns(runs)),"
+            + "\"x\":\(jnum(x)),\"y\":\(jnum(y)),\"w\":\(jnum(w)),\"h\":\(jnum(h)),\"rotation\":\(jnum(rotation)),\"size\":\(jnum(size)),"
             + "\"bold\":\(jbool(bold)),\"italic\":\(jbool(italic)),"
             + "\"hJustify\":\(jstr(hJustify)),\"vJustify\":\(jstr(vJustify)),"
             + "\(strokeJSON(sw, st, f))}"

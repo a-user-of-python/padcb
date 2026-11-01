@@ -67,47 +67,64 @@ unit-0-then-unit order:
 | `angle` | pin angle in degrees (as stored) |
 | `len` | pin length in mm |
 | `nameSize` / `numSize` | pin name / number font sizes in mm |
-| `nameAnchor` | `[x, y]` = `root + dir * pinNameOffset` (the def's offset) |
-| `numAnchor` | `[x, y]` = stub midpoint + perp * (`numSize` * 0.8 + 0.1), perp = (−dirY, dirX) |
-| `glyphs` | glyph objects in draw order (see below) |
+| `nameAnchor` | `[x, y]` anchor of the pin-name text (see `SymbolDrawList.pinGeom` for the inside/outside layouts), or `null` when the name is not drawn (names hidden / empty plain name) |
+| `numAnchor` | `[x, y]` centre of the pin-number text (KiCad absolute-side rule), or `null` when the number is not drawn |
+| `nameOutside` | true when pinNameOffset == 0 (name centred over the stub) |
+| `glyphs` | the pin name's markup runs, array form (see below) |
+| `deco` | pin decoration glyph objects in draw order (see below); not compared by the differ yet — dumped for the record |
 
-### Glyphs
+### Markup runs
 
-- `{"kind":"bubble","c":[x,y],"r":0.3}` — inversion bubble (centre,
-  radius in mm).
+`glyphs` (pins) and `glyphs` (text graphics) are arrays of
+`[text, sub, sup, overbar]` — the KiCad markup parse of the raw
+string (`KiCadText.runs`).
+
+### Decoration glyphs (`deco`)
+
+Sizes are KiCad's text-size-derived decoration sizes: bubble radius
+= pin number size / 2, clock wedge length = pin name size / 2
+(half-width name size / 4), no-connect x half-extent = 0.381 mm
+(TARGET_PIN_RADIUS, 15 mil).
+
+- `{"kind":"bubble","c":[x,y],"r":…}` — inversion bubble: centre ON
+  the stub, one radius from the root toward the connection point
+  (tangent at the root).
 - `{"kind":"wedge","pts":[[x,y],[x,y],[x,y]]}` — clock wedge, points
-  in draw order: base + perp·0.3, apex (base + dir·0.6), base − perp·0.3.
-  Drawn as an open polyline, not closed.
-- `{"kind":"x","at":[x,y],"d":0.3}` — a small x centred at `at` with
+  in draw order: base + perp·h, apex (base + dir·length),
+  base − perp·h. Drawn as an open polyline, not closed.
+- `{"kind":"x","at":[x,y],"d":…}` — a small x centred at `at` with
   half-extent `d` in the pin's dir/perp frame: the drawn segments run
   between `at + dir·a + perp·b` for (a, b) in (−d, −d) → (d, d) and
   (−d, d) → (d, −d). Used for the non_logic glyph (centred at the pin
-  root) and the no_connect cross (centred at the connection point);
-  a pin can carry both, shape glyph first.
+  root, d = name size / 4) and the no_connect cross (centred at the
+  connection point, d = 0.381); a pin can carry both, shape glyph
+  first.
 
 ### Graphics (`gfx`)
 
-Common suffix on every entry: `"strokeW"` (mm), `"strokeType"`
-(verbatim token), `"fill"` (verbatim token). Text graphics have no
-stroke/fill in the format, so those three keys are `null` there.
+Field names are exactly the ones `tools/truth_diff.py` documents and
+compares. Common suffix on every entry: `"strokeW"` (mm),
+`"strokeType"` (verbatim token), `"fill"` (verbatim token). Text
+graphics have no stroke/fill in the format, so those three keys are
+`null` there.
 
-- `rect`: `"corners"` — 4 `[x, y]` points in the renderer's trace
-  order (x1,y1) → (x2,y1) → (x2,y2) → (x1,y2).
-- `circle`: `"c"` centre, `"r"` radius.
-- `arc`: `"start"`, `"mid"`, `"end"` plus `"pts"` — the sampled
-  polyline from the circumcenter sweep (first point = start, last =
-  end; a collinear arc samples as exactly [start, mid, end]).
-- `poly`: `"pts"` — the polyline points in order.
-- `bezier`: `"pts"` — the 4 control points in order (start, c1, c2, end).
-- `text`: `"text"` (raw), `"plain"`, `"runs"` (see below), `"at"`,
-  `"rot"` (degrees), `"size"`, `"bold"`, `"italic"`, `"hJustify"`,
-  `"vJustify"`.
-- `textbox`: `"text"` (raw), `"plain"`, `"runs"`, `"at"`, `"w"`, `"h"`
-  (signed, as stored), `"rot"`, `"size"`, `"bold"`, `"italic"`,
-  `"hJustify"`, `"vJustify"`, plus the stroke/fill suffix.
-
-`runs` entries are `{"text": "...", "sub": bool, "sup": bool,
-"overbar": bool}` — the KiCad markup parse of the raw string.
+- `rect`: `"x1"`, `"y1"`, `"x2"`, `"y2"` (raw start/end).
+- `circle`: `"cx"`, `"cy"`, `"r"`.
+- `arc`: `"sx"`, `"sy"`, `"mx"`, `"my"`, `"ex"`, `"ey"` plus `"pts"` —
+  the sampled polyline from the circumcenter sweep (first point =
+  start, last = end; a collinear arc samples as exactly
+  [start, mid, end]).
+- `poly`: `"points"` — the polyline points in order.
+- `bezier`: `"points"` — the 4 control points in order (start, c1,
+  c2, end).
+- `text`: `"string"` (raw), `"plain"`, `"glyphs"` (markup runs, array
+  form), `"x"`, `"y"`, `"rotation"` (DEGREES — the file stores graphic
+  text rotation in decidegrees; the parser divides by 10), `"size"`,
+  `"bold"`, `"italic"`, `"hJustify"`, `"vJustify"`.
+- `textbox`: `"string"` (raw), `"plain"`, `"glyphs"`, `"x"`, `"y"`,
+  `"w"`, `"h"` (signed, as stored), `"rotation"` (degrees — text_box
+  angles are plain degrees in the file), `"size"`, `"bold"`,
+  `"italic"`, `"hJustify"`, `"vJustify"`, plus the stroke/fill suffix.
 
 ## Probes schema (`probes.jsonl`)
 

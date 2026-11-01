@@ -306,7 +306,13 @@ def _fill(node):
             g = fval(col, 2, 0.0)
             b = fval(col, 3, 0.0)
             a = fval(col, 4, 1.0)
-            return f'color={r:g},{g:g},{b:g},{a:g}'
+            # Canonical form matches the app's own encoding of the
+            # same value (Swift Double interpolation: 111 -> "111.0").
+            # The fill VALUE is what is being compared; %g vs float
+            # repr was a formatting-only false diff (2 corpus hits:
+            # Connector DP_Sink / DP_Source).
+            return (f'color={float(r)!r},{float(g)!r},'
+                    f'{float(b)!r},{float(a)!r}')
     return t
 
 
@@ -527,6 +533,12 @@ def _parse_graphic(node):
                 'strokeW': w, 'strokeType': t, 'fill': _fill(node),
                 'private': private}
     if h == 'text':
+        # KiCad converts a graphic text whose (effects ...) hides it
+        # into a hidden field; it is never drawn (memo §d). The app's
+        # parser drops it the same way (part 1.3 fix).
+        eff = find('effects')
+        if eff is not None and _hide_value(eff):
+            return None
         string = sval(node, 2 if private else 1, '')
         at = find('at')
         x = fval(at, 1, 0.0)

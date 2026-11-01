@@ -17,30 +17,36 @@ import CoreGraphics
 /// Screen / canvas mapping lives in SymbolRenderer.draw's `map` closure.
 enum SymbolDrawList {
 
-    /// KiCad inversion bubble radius (mm).
-    static let bubbleRadius = 0.3
-    /// Half-extent (mm) of the small x glyphs (non_logic at the pin
-    /// root, no_connect at the connection point): the drawn segments
-    /// run between centre + dir*a + perp*b for (a, b) in
-    /// (-d, -d) -> (d, d) and (-d, d) -> (d, -d).
-    static let xGlyphHalf = 0.3
-    /// Clock wedge dimensions (mm): base half-width and apex distance
-    /// along the pin direction from the wedge base point.
-    static let wedgeHalfWidth = 0.3
-    static let wedgeLength = 0.6
+    /// Pin text clearance (mm): KiCad's getPinTextOffset() +
+    /// PIN_TEXT_MARGIN = (round(24 * 0.15) + 4) mil = 8 mil = 0.2032 mm
+    /// (eeschema/pin_layout_cache.cpp). Pin numbers sit this far plus
+    /// half their text size from the pin axis.
+    static let pinTextClearance = 0.2032
+    /// Half-extent (mm) of the no-connect x at the connection point:
+    /// KiCad TARGET_PIN_RADIUS = 15 mil = 0.381 mm (SCH_PAINTER).
+    /// (Pin-shape glyph SIZES are not constants: KiCad derives the
+    /// inversion bubble radius from the pin NUMBER text size / 2 and
+    /// the clock wedge size from the pin NAME text size / 2 — see
+    /// pinGeom. Before part 1.3 they were fixed at 0.3 / 0.6 mm,
+    /// roughly half KiCad's size at the default 1.27 mm text size,
+    /// and the bubble was centred inside the body instead of on the
+    /// stub — see the part 1.3 semantics memo.)
 
     // MARK: - Draw-list model
 
     /// One pin-shape / no-connect glyph, in local coordinates.
     enum Glyph {
-        /// Inversion bubble: centre one radius beyond the pin root.
+        /// Inversion bubble: centre ON the stub, one radius from the
+        /// root toward the connection point (tangent at the root) —
+        /// KiCad's painter direction for external decorations points
+        /// from the root toward the connection point.
         case bubble(center: CGPoint, radius: Double)
         /// Clock wedge: exactly 3 points in draw order —
         /// base + perp*h, apex (base + dir*length), base - perp*h —
         /// stroked as an open polyline (not closed).
         case wedge(points: [CGPoint])
         /// A small x centred at `at` with half-extent `half` in the
-        /// pin's dir/perp frame (see xGlyphHalf).
+        /// pin's dir/perp frame.
         case x(at: CGPoint, half: Double)
     }
 
@@ -59,11 +65,26 @@ enum SymbolDrawList {
         /// Shape glyphs in draw order (shape glyph first, then the
         /// no-connect x when the pin type is no_connect).
         var glyphs: [Glyph]
-        /// Pin-name text anchor: root + dir * pinNameOffset.
-        var nameAnchor: CGPoint
-        /// Pin-number text anchor: stub midpoint + perp *
-        /// (numberSize * 0.8 + 0.1), perp = (-dirY, dirX).
-        var numberAnchor: CGPoint
+        /// Pin-name text anchor, or nil when the name is not part of
+        /// the drawing (pin names hidden for the symbol, or the plain
+        /// name is empty). For pinNameOffset > 0 this is
+        /// root + dir * offset (text runs into the body from there);
+        /// for offset == 0 ("outside" names) it is the CENTRE of the
+        /// name text above the stub (see nameOutside).
+        var nameAnchor: CGPoint?
+        /// True when pinNameOffset == 0: the name is drawn centred on
+        /// nameAnchor, outside the body over the stub (KiCad's
+        /// PIN_LAYOUT_CACHE outside-name layout), not extending into
+        /// the body from the root.
+        var nameOutside: Bool
+        /// Pin-number text anchor, or nil when the number is not part
+        /// of the drawing (pin numbers hidden, or empty number). The
+        /// number text is centred here. Position follows KiCad's
+        /// absolute-side rule (see pinGeom): pinTextClearance +
+        /// numberSize/2 from the pin axis, +Y side for horizontal
+        /// pins, -X side for vertical pins (flipped when the name is
+        /// also outside).
+        var numberAnchor: CGPoint?
         /// Pin name with KiCad markup removed (KiCadText.plain).
         var plainName: String
         /// Pin name parsed into markup runs (KiCadText.runs).
@@ -117,10 +138,18 @@ enum SymbolDrawList {
     /// def.pinNameOffset) so the geometry under test is a pure
     /// function of its inputs.
     static func build(def: KiCadSymbolDef, unit: Int, pinNameOffset: Double) -> DrawList {
+        // KiCad's outside pin-name layout (pinNameOffset == 0) stacks
+        // every name at a shared height: the tallest name half-height
+        // across the drawn pins (PIN_LAYOUT_CACHE::GetPinNameInfo).
+        let merged = mergedUnits(def: def, unit: unit)
+        let maxNameHalf = merged.flatMap { $0.pins }.map { $0.nameSize / 2 }.max() ?? 0
         var pins: [PinGeom] = []
-        for u in mergedUnits(def: def, unit: unit) {
+        for u in merged {
             for pin in u.pins {
-                pins.append(pinGeom(pin, pinNameOffset: pinNameOffset))
+                pins.append(pinGeom(pin, pinNameOffset: pinNameOffset,
+                                    showNames: !def.pinNamesHidden,
+                                    showNumbers: !def.pinNumbersHidden,
+                                    maxNameHalf: maxNameHalf))
             }
         }
         var graphics: [GraphicGeom] = []
@@ -132,7 +161,9 @@ enum SymbolDrawList {
         return DrawList(pins: pins, graphics: graphics)
     }
 
-    private static func pinGeom(_ pin: KiCadPin, pinNameOffset: Double) -> PinGeom {
+    private static func pinGeom(_ pin: KiCadPin, pinNameOffset: Double,
+                                showNames: Bool, showNumbers: Bool,
+                                maxNameHalf: Double) -> PinGeom {
         let rad = pin.rotation * Double.pi / 180.0
         // dir points from the connection point toward the body: KiCad's
         // parser maps the file angle to an orientation whose root (the
@@ -149,58 +180,122 @@ enum SymbolDrawList {
                     y: base.y + CGFloat(diry * alongDir + dirx * alongPerp))
         }
 
+        // Glyph sizes are TEXT-SIZE-DERIVED in KiCad (SCH_PAINTER
+        // externalPinDecoSize = pin number text size, internalPinDecoSize
+        // = pin name text size): bubble radius = numberSize/2, clock
+        // wedge length = nameSize/2 with half-width nameSize/4.
+        let bubbleRadius = pin.numberSize / 2
+        let wedgeLength = pin.nameSize / 2
+        let wedgeHalfWidth = pin.nameSize / 4
+
         var glyphs: [Glyph] = []
         switch pin.shape {
         case .inverted, .invertedClock:
-            // Bubble just inside the body, tangent to the stub end:
-            // its centre lies one radius beyond the root, along +dir.
-            glyphs.append(.bubble(center: pt(root, bubbleRadius, 0), radius: bubbleRadius))
+            // Bubble ON the stub: KiCad's painter direction for
+            // external decorations points from the root TOWARD the
+            // connection point, so the bubble is centred one radius
+            // from the root along -dir, tangent at the root; the drawn
+            // stub effectively ends at the bubble's far edge.
+            glyphs.append(.bubble(center: pt(root, -bubbleRadius, 0), radius: bubbleRadius))
             if pin.shape == .invertedClock {
-                // Clock wedge beyond the bubble, further along +dir.
-                glyphs.append(.wedge(points: wedgePoints(tipBase: pt(root, 2 * bubbleRadius, 0),
-                                                         dirx: dirx, diry: diry)))
+                // Clock wedge inside the body, starting at the root.
+                glyphs.append(.wedge(points: wedgePoints(tipBase: root, dirx: dirx, diry: diry,
+                                                         halfWidth: wedgeHalfWidth, length: wedgeLength)))
             }
         case .clock, .clockLow, .edgeClockHigh:
-            glyphs.append(.wedge(points: wedgePoints(tipBase: root, dirx: dirx, diry: diry)))
+            glyphs.append(.wedge(points: wedgePoints(tipBase: root, dirx: dirx, diry: diry,
+                                                     halfWidth: wedgeHalfWidth, length: wedgeLength)))
         case .nonLogic:
-            // Small x centred at the root (inner stub end).
-            glyphs.append(.x(at: root, half: xGlyphHalf))
+            // Small x centred at the root (inner stub end), sized
+            // like the internal decorations.
+            glyphs.append(.x(at: root, half: wedgeHalfWidth))
         default:
             break // line / input_low / output_low etc: plain stub
         }
 
-        // No-connect pins carry a small x at the CONNECTION point
-        // (KiCad's PT_NC branch draws the cross at the pin position,
-        // independently of the pin's shape glyph above).
+        // No-connect pins carry an x at the CONNECTION point with
+        // half-extent TARGET_PIN_RADIUS = 15 mil (KiCad's PT_NC
+        // branch, independent of the pin's shape glyph above).
         if pin.type == .noConnect {
-            glyphs.append(.x(at: conn, half: xGlyphHalf))
+            glyphs.append(.x(at: conn, half: 0.381))
         }
 
-        // Pin name: inside the body, starting pinNameOffset beyond the
-        // inner stub end, extending along +dir (into the body).
-        let nameAnchor = pt(root, pinNameOffset, 0)
-        // Pin number: near the stub, offset perpendicular from its middle.
+        let plainName = KiCadText.plain(pin.name)
         let mid = CGPoint(x: conn.x + CGFloat(dirx * pin.length / 2),
                           y: conn.y + CGFloat(diry * pin.length / 2))
-        let numberOff = pin.numberSize * 0.8 + 0.1
-        let numberAnchor = pt(mid, 0, numberOff)
+        // Cardinal direction only: KiCad rejects any pin angle that
+        // is not a multiple of 90 degrees at parse time, so every
+        // corpus pin is horizontal or vertical. (A non-cardinal angle
+        // can only come from a hand-made file KiCad itself refuses;
+        // the absolute-side rules below then fall back to treating
+        // the pin as horizontal.)
+        let angleDeg = ((Int(pin.rotation.rounded()) % 360) + 360) % 360
+        let horizontal = angleDeg == 0 || angleDeg == 180
+
+        // Pin name anchor (KiCad PIN_LAYOUT_CACHE::GetPinNameInfo):
+        // offset > 0 — the name starts pinNameOffset beyond the root
+        // and runs along +dir into the body. offset == 0 — "outside":
+        // the name is CENTRED over the stub, clear of the pin axis by
+        // pinTextClearance + (for horizontal pins) the tallest name
+        // half-height on the symbol / (vertical pins) this pin's own
+        // name half-height, on the +Y side (horizontal) or -X side
+        // (vertical).
+        var nameAnchor: CGPoint? = nil
+        var nameOutside = false
+        if showNames && !plainName.isEmpty {
+            if pinNameOffset > 0 {
+                nameAnchor = pt(root, pinNameOffset, 0)
+            } else {
+                nameOutside = true
+                if horizontal {
+                    nameAnchor = CGPoint(x: mid.x,
+                                         y: conn.y + CGFloat(pinTextClearance + maxNameHalf))
+                } else {
+                    nameAnchor = CGPoint(x: conn.x - CGFloat(pinTextClearance + pin.nameSize / 2),
+                                         y: mid.y)
+                }
+            }
+        }
+
+        // Pin number anchor (KiCad PIN_LAYOUT_CACHE::GetPinNumberInfo):
+        // centred on the stub midpoint, pinTextClearance +
+        // numberSize/2 from the pin axis, on an ABSOLUTE side — +Y
+        // for horizontal pins, -X for vertical pins (NOT relative to
+        // the pin direction: left-pointing and down-pointing pins keep
+        // their numbers on the same world side). When the name is
+        // also outside (offset == 0 and shown), the number flips to
+        // the opposite side so the two texts never collide.
+        var numberAnchor: CGPoint? = nil
+        if showNumbers && !pin.number.isEmpty {
+            let off = pinTextClearance + pin.numberSize / 2
+            let bothOutside = pinNameOffset == 0 && showNames && !plainName.isEmpty
+            if horizontal {
+                numberAnchor = CGPoint(x: mid.x,
+                                       y: conn.y + CGFloat(bothOutside ? -off : off))
+            } else {
+                numberAnchor = CGPoint(x: conn.x + CGFloat(bothOutside ? off : -off),
+                                       y: mid.y)
+            }
+        }
 
         return PinGeom(pin: pin, conn: conn, root: root,
                        dirX: dirx, dirY: diry, glyphs: glyphs,
-                       nameAnchor: nameAnchor, numberAnchor: numberAnchor,
-                       plainName: KiCadText.plain(pin.name),
+                       nameAnchor: nameAnchor, nameOutside: nameOutside,
+                       numberAnchor: numberAnchor,
+                       plainName: plainName,
                        nameRuns: KiCadText.runs(pin.name))
     }
 
     /// Clock wedge points in draw order: base corners at
-    /// tipBase ± perp * wedgeHalfWidth, apex at
-    /// tipBase + dir * wedgeLength (pointing into the body).
-    private static func wedgePoints(tipBase: CGPoint, dirx: Double, diry: Double) -> [CGPoint] {
+    /// tipBase ± perp * halfWidth, apex at tipBase + dir * length
+    /// (pointing into the body).
+    private static func wedgePoints(tipBase: CGPoint, dirx: Double, diry: Double,
+                                    halfWidth: Double, length: Double) -> [CGPoint] {
         func pt(_ alongDir: Double, _ alongPerp: Double) -> CGPoint {
             CGPoint(x: tipBase.x + CGFloat(dirx * alongDir + (-diry) * alongPerp),
                     y: tipBase.y + CGFloat(diry * alongDir + dirx * alongPerp))
         }
-        return [pt(0, wedgeHalfWidth), pt(wedgeLength, 0), pt(0, -wedgeHalfWidth)]
+        return [pt(0, halfWidth), pt(length, 0), pt(0, -halfWidth)]
     }
 
     private static func graphicGeom(_ g: KiCadGraphic) -> GraphicGeom {
@@ -330,8 +425,10 @@ enum SymbolDrawList {
     // MARK: - Bounds
 
     /// Union of graphic bounds for units 0 and `unit`, in local coords.
-    /// Text extents are approximated (length * size * 0.6). If the symbol has
-    /// no graphics at all, falls back to the bounds of its pin points.
+    /// Text extents are approximated from the markup-aware width
+    /// estimate; arc extents come from the sampled sweep. If the
+    /// symbol has no graphics at all, falls back to the bounds of its
+    /// pin points.
     static func graphicsBounds(def: KiCadSymbolDef, unit: Int) -> CGRect {
         var rect: CGRect?
         func include(_ r: CGRect) { rect = rect.map { $0.union(r) } ?? r }
@@ -359,13 +456,23 @@ enum SymbolDrawList {
                     include(CGRect(x: CGFloat(cx - r), y: CGFloat(cy - r),
                                    width: CGFloat(2 * r), height: CGFloat(2 * r)))
                 case .arc(let sx, let sy, let mx, let my, let ex, let ey, _, _, _):
-                    includePts([(sx, sy), (mx, my), (ex, ey)])
+                    // Bounds from the sampled sweep polyline, not just
+                    // start/mid/end: an arc's true extremes (top/bottom
+                    // of the circle) can lie well outside the triangle
+                    // of its three defining points.
+                    let sampled = arcSamplePoints(a: CGPoint(x: CGFloat(sx), y: CGFloat(sy)),
+                                                  m: CGPoint(x: CGFloat(mx), y: CGFloat(my)),
+                                                  e: CGPoint(x: CGFloat(ex), y: CGFloat(ey)))
+                    includePts(sampled.map { (Double($0.x), Double($0.y)) })
                 case .polyline(let points, _, _, _):
                     includePts(points)
                 case .bezier(let p1, let p2, let p3, let p4, _, _, _):
                     includePts([p1, p2, p3, p4]) // control-hull approximation
                 case .text(let string, let x, let y, _, let size, _, _, _, _):
-                    let w = Double(string.count) * size * 0.6
+                    // Markup-aware width estimate (parsed runs), not
+                    // the raw string length: markup braces/escapes in
+                    // the raw string are not drawn glyphs.
+                    let w = Double(KiCadText.estimatedWidth(string, size: CGFloat(size)))
                     include(CGRect(x: CGFloat(x - w / 2), y: CGFloat(y - size / 2),
                                    width: CGFloat(w), height: CGFloat(size)))
                 case .textBox(_, let x, let y, let w, let h, _, _, _, _, _, _, _, _, _):

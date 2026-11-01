@@ -168,11 +168,22 @@ struct KiCadLibrary {
                 properties += parent.properties.filter { !ownNames.contains($0.name) }
             }
 
-            // Units: the most-derived def that defines a unit wins wholesale.
-            var units = parent?.units ?? [:]
-            for (unit, unitDef) in raw.units {
-                units[unit] = unitDef
-            }
+            // Units and pin-text settings: KiCad's LIB_SYMBOL::Flatten()
+            // copies the ROOT symbol and merges only fields (properties),
+            // keywords, fp filters and exclusion flags from the derived
+            // symbol. A derived symbol's own sub-symbols and its own
+            // (pin_names) / (pin_numbers) nodes are parsed by KiCad but
+            // DISCARDED by flattening — pins, graphics, unit count and
+            // pin-text settings are the root ancestor's, identically.
+            // (Part 1.3 semantics audit, KiCad 10.0.1 source. Corpus
+            // check: 0 of 12,209 derived symbols in the 10.0.1 corpus
+            // define any sub-symbol, so this matches the old per-unit
+            // merge on this corpus — but it is the rule KiCad applies.)
+            // The parent def is itself already root-resolved, so taking
+            // the parent's values wholesale reaches the root. When the
+            // parent cannot be resolved (missing/cycle), fall back to
+            // the symbol's own units/settings rather than dropping it.
+            let units = parent?.units ?? raw.units
 
             let def = KiCadSymbolDef(
                 name: symbolName,
@@ -181,9 +192,9 @@ struct KiCadLibrary {
                 units: units,
                 unitCount: units.keys.filter { $0 > 0 }.max() ?? 1,
                 extendsName: raw.extendsName,
-                pinNameOffset: raw.pinNameOffset ?? parent?.pinNameOffset ?? 0.508,
-                pinNamesHidden: raw.pinNamesHidden ?? parent?.pinNamesHidden ?? false,
-                pinNumbersHidden: raw.pinNumbersHidden ?? parent?.pinNumbersHidden ?? false,
+                pinNameOffset: parent?.pinNameOffset ?? raw.pinNameOffset ?? 0.508,
+                pinNamesHidden: parent?.pinNamesHidden ?? raw.pinNamesHidden ?? false,
+                pinNumbersHidden: parent?.pinNumbersHidden ?? raw.pinNumbersHidden ?? false,
                 isPowerSymbol: raw.hasPowerMarker ?? parent?.isPowerSymbol ?? false
             )
             resolved[symbolName] = def
@@ -547,6 +558,13 @@ private func parseTextBoxGraphic(_ node: SExpr) -> KiCadGraphic? {
 }
 
 private func parseTextGraphic(_ node: SExpr) -> KiCadGraphic? {
+    // A graphic text whose (effects ...) carries (hide yes) is turned
+    // by KiCad's parser into a hidden FIELD, not a drawn graphic — it
+    // never renders in the schematic view. Drop it here. ((hide no)
+    // and a missing hide node keep the text.)
+    if let effects = node.child("effects"), nodeHides(effects) {
+        return nil
+    }
     let at = node.child("at")
     var size = 1.27
     var bold = false
@@ -590,7 +608,16 @@ private func parseTextGraphic(_ node: SExpr) -> KiCadGraphic? {
     return .text(string: node.value(1) ?? "",
                  x: at?.double(1) ?? 0,
                  y: at?.double(2) ?? 0,
-                 rotation: at?.double(3) ?? 0,
+                 // Graphic (text ...) rotation is in DECIDEGREES in the
+                 // file format (KiCad 10 parseSymbolText constructs
+                 // EDA_ANGLE(..., TENTHS_OF_A_DEGREE_T) — "Yes, LIB_TEXT
+                 // is really decidegrees even though all the others
+                 // are degrees."). Corpus values are 0 / 900 / 2700 /
+                 // 675 / 225 ... — read as degrees, 900 became 180°
+                 // (upside-down text) before part 1.3. text_box and
+                 // property/pin angles ARE plain degrees and are not
+                 // divided.
+                 rotation: (at?.double(3) ?? 0) / 10.0,
                  size: size, bold: bold, italic: italic,
                  hJustify: hJustify, vJustify: vJustify)
 }

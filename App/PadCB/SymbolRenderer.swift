@@ -219,34 +219,49 @@ enum SymbolRenderer {
                 }
             }
 
-            // Pin number: near the stub, offset perpendicular from its
-            // middle (anchor precomputed in the draw list).
-            if showPinNumbers && !pin.number.isEmpty {
+            // Pin number: centred on its anchor near the stub (anchor
+            // precomputed in the draw list, KiCad absolute-side rule;
+            // nil when pin numbers are hidden for the symbol).
+            if showPinNumbers, let numberAnchor = pg.numberAnchor, !pin.number.isEmpty {
                 let dirS = screenDir(pg.dirX, pg.dirY)
                 var angle = atan2(Double(dirS.y), Double(dirS.x))
                 if angle > Double.pi / 2 { angle -= Double.pi }
                 if angle < -Double.pi / 2 { angle += Double.pi }
-                drawText(&ctx, pin.number, at: map(pg.numberAnchor),
+                drawText(&ctx, pin.number, at: map(numberAnchor),
                          size: max(CGFloat(pin.numberSize) * scale, 5.5),
                          color: pinNumberColor, angle: angle, anchor: .center,
                          bold: false, italic: false)
             }
 
-            // Pin name: inside the body, starting pinNameOffset beyond
-            // the inner stub end (anchor precomputed in the draw list),
-            // extending along +dir (into the body).
-            if showPinNames && !pin.name.isEmpty && pin.name != "~" {
-                let inward = screenDir(pg.dirX, pg.dirY)
-                var angle = atan2(Double(inward.y), Double(inward.x))
-                var anchor: UnitPoint = .leading
-                if cos(angle) < 0 { // text would run right-to-left; flip so it reads into the body
-                    angle += Double.pi
-                    anchor = .trailing
+            // Pin name (anchor precomputed in the draw list; nil when
+            // pin names are hidden for the symbol). Two layouts:
+            // offset > 0 — inside the body, starting pinNameOffset
+            // beyond the inner stub end, extending along +dir;
+            // offset == 0 — "outside": centred on the anchor over the
+            // stub, reading along the pin axis like the number.
+            if showPinNames, let nameAnchor = pg.nameAnchor, !pin.name.isEmpty && pin.name != "~" {
+                if pg.nameOutside {
+                    let dirS = screenDir(pg.dirX, pg.dirY)
+                    var angle = atan2(Double(dirS.y), Double(dirS.x))
+                    if angle > Double.pi / 2 { angle -= Double.pi }
+                    if angle < -Double.pi / 2 { angle += Double.pi }
+                    KiCadText.draw(in: &ctx, pin.name, at: map(nameAnchor),
+                                   size: max(CGFloat(pin.nameSize) * scale, 6),
+                                   color: pinNameColor, angle: angle, anchor: .center,
+                                   bold: false, italic: false)
+                } else {
+                    let inward = screenDir(pg.dirX, pg.dirY)
+                    var angle = atan2(Double(inward.y), Double(inward.x))
+                    var anchor: UnitPoint = .leading
+                    if cos(angle) < 0 { // text would run right-to-left; flip so it reads into the body
+                        angle += Double.pi
+                        anchor = .trailing
+                    }
+                    KiCadText.draw(in: &ctx, pin.name, at: map(nameAnchor),
+                                   size: max(CGFloat(pin.nameSize) * scale, 6),
+                                   color: pinNameColor, angle: angle, anchor: anchor,
+                                   bold: false, italic: false)
                 }
-                KiCadText.draw(in: &ctx, pin.name, at: map(pg.nameAnchor),
-                               size: max(CGFloat(pin.nameSize) * scale, 6),
-                               color: pinNameColor, angle: angle, anchor: anchor,
-                               bold: false, italic: false)
             }
         }
     }
