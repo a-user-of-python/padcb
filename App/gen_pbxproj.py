@@ -197,7 +197,7 @@ def main():
 \t\t\t\tPRODUCT_NAME = "$(TARGET_NAME)";
 \t\t\t\tSWIFT_STRICT_CONCURRENCY = minimal;
 \t\t\t\tSWIFT_VERSION = 5.0;
-\t\t\t\tTARGETED_DEVICE_FAMILY = 2;
+\t\t\t\tTARGETED_DEVICE_FAMILY = "1,2";
 \t\t\t};"""
     w("/* Begin XCBuildConfiguration section */")
     for cid, cfg, name in ((proj_dbg, proj_cfg, "Debug"), (proj_rel, proj_cfg, "Release"),

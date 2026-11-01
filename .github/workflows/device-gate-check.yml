@@ -1,0 +1,75 @@
+name: Device Gate Check
+
+# Manual-only proof for the v3.1 device gate: builds PadCB for the iOS
+# Simulator, launches it on an iPhone-idiom and an iPad-idiom simulator,
+# and uploads a screenshot of each first screen. The iPhone shot must
+# show ONLY the "You need an iPad for this to work" notice; the iPad
+# shot must show the normal home screen.
+
+on:
+  workflow_dispatch:
+
+env:
+  KICAD_SYMBOLS_URL: "https://gitlab.com/kicad/libraries/kicad-symbols/-/archive/10.0.1/kicad-symbols-10.0.1.tar.gz"
+  KICAD_FOOTPRINTS_URL: "https://gitlab.com/kicad/libraries/kicad-footprints/-/archive/10.0.1/kicad-footprints-10.0.1.tar.gz"
+  KICAD_FOOTPRINTS_SHA256: "858754aa9946f62c9df2ee2368e6ece0a6983167a10d406767bbaddb0c89bb4f"
+
+jobs:
+  gate-check:
+    name: iPhone notice / iPad home screenshots
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download KiCad symbol libraries (pinned) and merge symdirs
+        run: |
+          curl -fL "$KICAD_SYMBOLS_URL" -o /tmp/kicad-symbols.tar.gz
+          mkdir -p /tmp/kicad-symbols
+          tar -xzf /tmp/kicad-symbols.tar.gz -C /tmp/kicad-symbols --strip-components=1
+          python3 tools/merge_symdirs.py /tmp/kicad-symbols App/PadCB/Symbols | tail -4
+
+      - name: Download KiCad footprint libraries (pinned) — .pretty only
+        run: |
+          curl -fL "$KICAD_FOOTPRINTS_URL" -o /tmp/kicad-footprints.tar.gz
+          echo "$KICAD_FOOTPRINTS_SHA256  /tmp/kicad-footprints.tar.gz" | shasum -a 256 -c -
+          mkdir -p /tmp/kicad-footprints
+          tar -xzf /tmp/kicad-footprints.tar.gz -C /tmp/kicad-footprints --strip-components=1
+          for d in /tmp/kicad-footprints/*.pretty; do
+            cp -R "$d" App/PadCB/Footprints/
+          done
+          cp /tmp/kicad-footprints/LICENSE.md App/PadCB/Footprints/KICAD-FOOTPRINTS-LICENSE.md
+          echo "footprint files staged: $(find App/PadCB/Footprints -name '*.kicad_mod' | wc -l | tr -d ' ')"
+
+      - name: Footprint census + bundle index
+        run: |
+          set -o pipefail
+          xcrun swiftc -O -o /tmp/FootprintCensus \
+            App/PadCB/SExpr.swift \
+            App/PadCB/KiCadFootprint.swift \
+            tools/FootprintCensus/main.swift
+          /tmp/FootprintCensus App/PadCB/Footprints App/PadCB/Footprints/FootprintIndex.json | tee /tmp/footprint-census.txt
+          test -s App/PadCB/Footprints/FootprintIndex.json
+
+      - name: Build app for iOS Simulator (unsigned)
+        run: |
+          xcodebuild -project App/PadCB.xcodeproj \
+            -scheme PadCB \
+            -sdk iphonesimulator \
+            -configuration Debug \
+            -derivedDataPath build/simdd \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Launch on iPhone + iPad simulators, screenshot both
+        run: |
+          python3 tools/device_gate_check.py \
+            build/simdd/Build/Products/Debug-iphonesimulator/PadCB.app \
+            gate-shots
+          ls -lh gate-shots
+
+      - name: Upload screenshots
+        uses: actions/upload-artifact@v4
+        with:
+          name: device-gate-screenshots
+          path: gate-shots
