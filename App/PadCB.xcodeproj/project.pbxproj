@@ -16,6 +16,7 @@
 		0E1DC29D8A20CA76845232C8 = {isa = PBXBuildFile; fileRef = 2048B7B37A5E3D0F3367215F; };
 		60EBA512C754C0F1441D5225 = {isa = PBXBuildFile; fileRef = 6326FE8B58AFEEFD07A67DAD; };
 		D934D71FCB274EC03012379B = {isa = PBXBuildFile; fileRef = B272DEC995C59052980336CE; };
+		037621FFAF81DBB8B0D68F52 = {isa = PBXBuildFile; fileRef = 3E2D96E84D5570F709DB8541; };
 		1E0D22BE5286DEBEE788994B = {isa = PBXBuildFile; fileRef = F2EBF17E3C4375E922D433FA; };
 		792B0A72688D653D5E721FF2 = {isa = PBXBuildFile; fileRef = EB0281D9F8947762249CA542; };
 		A5C3D5129AA6474C8CB8F9CA = {isa = PBXBuildFile; fileRef = E6A7B4484BDF6A3FDFF3DD16; };
@@ -33,6 +34,7 @@
 		2048B7B37A5E3D0F3367215F = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SchematicDocument.swift; sourceTree = "<group>"; };
 		6326FE8B58AFEEFD07A67DAD = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SchematicCanvasView.swift; sourceTree = "<group>"; };
 		B272DEC995C59052980336CE = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SymbolRenderer.swift; sourceTree = "<group>"; };
+		3E2D96E84D5570F709DB8541 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SymbolDrawList.swift; sourceTree = "<group>"; };
 		F2EBF17E3C4375E922D433FA = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SExpr.swift; sourceTree = "<group>"; };
 		EB0281D9F8947762249CA542 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KiCadSymbol.swift; sourceTree = "<group>"; };
 		E6A7B4484BDF6A3FDFF3DD16 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LibraryStore.swift; sourceTree = "<group>"; };
@@ -82,6 +84,7 @@
 				2048B7B37A5E3D0F3367215F,
 				6326FE8B58AFEEFD07A67DAD,
 				B272DEC995C59052980336CE,
+				3E2D96E84D5570F709DB8541,
 				F2EBF17E3C4375E922D433FA,
 				EB0281D9F8947762249CA542,
 				E6A7B4484BDF6A3FDFF3DD16,
@@ -169,6 +172,7 @@
 				0E1DC29D8A20CA76845232C8,
 				60EBA512C754C0F1441D5225,
 				D934D71FCB274EC03012379B,
+				037621FFAF81DBB8B0D68F52,
 				1E0D22BE5286DEBEE788994B,
 				792B0A72688D653D5E721FF2,
 				A5C3D5129AA6474C8CB8F9CA,

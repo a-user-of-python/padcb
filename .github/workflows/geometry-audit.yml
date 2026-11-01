@@ -1,0 +1,72 @@
+name: Geometry Audit
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "App/PadCB/**"
+      - "tools/**"
+      - ".github/workflows/geometry-audit.yml"
+
+env:
+  # Pinned KiCad symbol libraries (canonical source: KiCad GitLab.
+  # The GitHub mirror KiCad/kicad-symbols is frozen at 5.1.x-era tags.)
+  KICAD_SYMBOLS_TAG: "10.0.1"
+  KICAD_SYMBOLS_COMMIT: "7058584a0fbe9aa2f1c9ff2acf7847726ff6922c"
+  KICAD_SYMBOLS_URL: "https://gitlab.com/kicad/libraries/kicad-symbols/-/archive/10.0.1/kicad-symbols-10.0.1.tar.gz"
+
+jobs:
+  geometry-audit:
+    name: Geometry audit (real Swift draw lists vs file truth)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download KiCad symbol libraries (pinned) and merge symdirs
+        run: |
+          curl -fL "$KICAD_SYMBOLS_URL" -o /tmp/kicad-symbols.tar.gz
+          mkdir -p /tmp/kicad-symbols
+          tar -xzf /tmp/kicad-symbols.tar.gz -C /tmp/kicad-symbols --strip-components=1
+          # KiCad 10 ships one .kicad_sym file per symbol inside
+          # <Library>.kicad_symdir/ directories; merge each directory into a
+          # single per-library file (extracted symbol nodes are unmodified).
+          # The upstream LICENSE.md lands next to them as
+          # KICAD-LIBRARIES-LICENSE.md so attribution ships in the bundle.
+          python3 tools/merge_symdirs.py /tmp/kicad-symbols App/PadCB/Symbols | tail -4
+          ls App/PadCB/Symbols | head -5
+
+      - name: Compile GeomDump harness (app's real geometry sources)
+        run: |
+          xcrun swiftc -O -o /tmp/GeomDump \
+            App/PadCB/SExpr.swift \
+            App/PadCB/KiCadSymbol.swift \
+            App/PadCB/SchematicDocument.swift \
+            App/PadCB/SymbolDrawList.swift \
+            tools/GeomDump/main.swift
+
+      - name: Run GeomDump over the full corpus
+        run: |
+          /tmp/GeomDump App/PadCB/Symbols dump.jsonl probes.jsonl
+          wc -l dump.jsonl probes.jsonl
+
+      - name: Diff dumps against independent file-truth model
+        continue-on-error: true
+        run: |
+          if [ -f tools/truth_diff.py ]; then
+            python3 tools/truth_diff.py --corpus App/PadCB/Symbols \
+              --dump dump.jsonl --probes probes.jsonl \
+              --out report.json --summary report.txt
+          else
+            echo "tools/truth_diff.py not present yet — dumps are uploaded for the differ lane."
+          fi
+
+      - name: Upload geometry audit artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: geometry-audit
+          path: |
+            dump.jsonl
+            probes.jsonl
+            report.json
+            report.txt
+          if-no-files-found: warn

@@ -7,6 +7,7 @@ SWIFT_FILES = [
     "PadCBApp.swift", "HomeView.swift", "PCBPlaceholderView.swift",
     "SchematicEditorView.swift", "SymbolChooserView.swift", "FileListView.swift",
     "SchematicDocument.swift", "SchematicCanvasView.swift", "SymbolRenderer.swift",
+    "SymbolDrawList.swift",
     "SExpr.swift", "KiCadSymbol.swift", "LibraryStore.swift",
 ]
 
