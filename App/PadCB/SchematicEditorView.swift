@@ -25,6 +25,7 @@ struct SchematicEditorView: View {
     @StateObject private var document = SchematicDocument()
     @StateObject private var canvasState = CanvasViewState()
     @EnvironmentObject private var store: LibraryStore
+    @EnvironmentObject private var footprintStore: FootprintStore
 
     @Environment(\.openURL) private var openURL
 
@@ -124,11 +125,7 @@ struct SchematicEditorView: View {
         }
         .sheet(isPresented: $showSave) {
             FileListView(mode: .save, initialName: document.state.title) { url in
-                do {
-                    try document.save(to: url)
-                } catch {
-                    errorMessage = "Could not save that file: \(error.localizedDescription)"
-                }
+                saveSchematic(to: url)
             }
         }
         .alert("Rename Schematic", isPresented: $showTitleEdit) {
@@ -147,6 +144,37 @@ struct SchematicEditorView: View {
             Button("OK") { errorMessage = nil }
         } message: {
             Text(errorMessage ?? "")
+        }
+    }
+
+    // MARK: - Saving (schematic + encrypted connection table)
+
+    /// Every save writes BOTH files: the schematic JSON and — derived
+    /// from the same state, through the real symbol/footprint stores —
+    /// its encrypted connection table (ConnectionTableStore). The table
+    /// is built BEFORE the schematic is written, so a table problem
+    /// never leaves a save half-done; a table write failure after the
+    /// schematic lands is reported distinctly.
+    private func saveSchematic(to url: URL) {
+        let table = ConnectionTableBuilder.build(
+            state: document.state,
+            sourceFileName: url.lastPathComponent,
+            resolveSymbol: { placed in
+                store.symbol(library: placed.library, name: placed.symbolName)
+            },
+            resolveFootprint: { reference in
+                footprintStore.resolvedKey(forFootprintReference: reference)
+            })
+        do {
+            try document.save(to: url)
+        } catch {
+            errorMessage = "Could not save that file: \(error.localizedDescription)"
+            return
+        }
+        do {
+            try ConnectionTableStore.save(table, forSchematicFile: url)
+        } catch {
+            errorMessage = "The schematic saved, but its encrypted connection table could not be written: \(error.localizedDescription)"
         }
     }
 
@@ -383,7 +411,7 @@ struct SchematicEditorView: View {
 
     private var selectionSummary: String {
         if let placed = selectedPlaced {
-            return "\(placed.reference) — \(placed.library):\(placed.symbolName)"
+            return "\(placed.reference) — \(LibraryStore.displayName(forLibraryKey: placed.library)):\(placed.symbolName)"
         }
         return "\(document.state.symbols.count) symbols, \(document.state.wires.count) wires"
     }
@@ -429,6 +457,7 @@ private struct SymbolPropertiesCard: View {
     @ObservedObject var document: SchematicDocument
     let placedID: UUID
     let store: LibraryStore
+    @EnvironmentObject private var footprintStore: FootprintStore
     var onClose: () -> Void
     var onSelect: (UUID) -> Void
 
@@ -486,11 +515,22 @@ private struct SymbolPropertiesCard: View {
                         }
                     }
                     Divider()
-                    readOnlyRow("Library", placed?.library ?? "—")
+                    readOnlyRow("Library", placed.map { LibraryStore.displayName(forLibraryKey: $0.library) } ?? "—")
                     readOnlyRow("Symbol", placed?.symbolName ?? "—")
                     if let footprint = def?.property("Footprint"),
                        !footprint.isEmpty, footprint != "~" {
                         readOnlyRow("Footprint", footprint)
+                        if let match = footprintStore.resolve(reference: footprint) {
+                            Text("Imported footprint: \(match.key) (\(match.padCount) pads)")
+                                .font(.caption)
+                                .foregroundStyle(.green)
+                                .lineLimit(2)
+                        } else {
+                            Text("No imported footprint matches this reference yet.")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .lineLimit(2)
+                        }
                     }
                     if let description = def?.property("Description"),
                        !description.isEmpty, description != "~" {

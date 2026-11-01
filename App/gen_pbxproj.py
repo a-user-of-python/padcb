@@ -9,6 +9,10 @@ SWIFT_FILES = [
     "SchematicDocument.swift", "SchematicCanvasView.swift", "SymbolRenderer.swift",
     "SymbolDrawList.swift",
     "SExpr.swift", "KiCadSymbol.swift", "LibraryStore.swift",
+    # Part 2: paths, connection tables (+ debug view), footprints.
+    "PadCBPaths.swift", "ConnectionTable.swift", "ConnectionTableStore.swift",
+    "ConnectionDebugView.swift",
+    "KiCadFootprint.swift", "FootprintStore.swift", "FootprintBrowserView.swift",
 ]
 
 
@@ -23,6 +27,7 @@ def main():
     buildfile = {f: oid("build:" + f) for f in SWIFT_FILES}
     assets_ref, assets_build = oid("ref:assets"), oid("build:assets")
     symbols_ref, symbols_build = oid("ref:symbols"), oid("build:symbols")
+    footprints_ref, footprints_build = oid("ref:footprints"), oid("build:footprints")
     plist_ref = oid("ref:plist")
     app_ref = oid("ref:app")
     main_group, prod_group, app_group = oid("g:main"), oid("g:prod"), oid("g:app")
@@ -45,6 +50,7 @@ def main():
         w(f"\t\t{buildfile[f]} = {{isa = PBXBuildFile; fileRef = {fileref[f]}; }};")
     w(f"\t\t{assets_build} = {{isa = PBXBuildFile; fileRef = {assets_ref}; }};")
     w(f"\t\t{symbols_build} = {{isa = PBXBuildFile; fileRef = {symbols_ref}; }};")
+    w(f"\t\t{footprints_build} = {{isa = PBXBuildFile; fileRef = {footprints_ref}; }};")
     w("/* End PBXBuildFile section */")
     w("")
     w("/* Begin PBXFileReference section */")
@@ -52,6 +58,7 @@ def main():
         w(f"\t\t{fileref[f]} = {{isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = {f}; sourceTree = \"<group>\"; }};")
     w(f"\t\t{assets_ref} = {{isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = \"<group>\"; }};")
     w(f"\t\t{symbols_ref} = {{isa = PBXFileReference; lastKnownFileType = folder; path = Symbols; sourceTree = \"<group>\"; }};")
+    w(f"\t\t{footprints_ref} = {{isa = PBXFileReference; lastKnownFileType = folder; path = Footprints; sourceTree = \"<group>\"; }};")
     w(f"\t\t{plist_ref} = {{isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = \"<group>\"; }};")
     w(f"\t\t{app_ref} = {{isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PadCB.app; sourceTree = BUILT_PRODUCTS_DIR; }};")
     w("/* End PBXFileReference section */")
@@ -89,6 +96,7 @@ def main():
     for f in SWIFT_FILES:
         w(f"\t\t\t\t{fileref[f]},")
     w(f"\t\t\t\t{symbols_ref},")
+    w(f"\t\t\t\t{footprints_ref},")
     w(f"\t\t\t\t{plist_ref},")
     w("\t\t\t);")
     w("\t\t\tpath = PadCB;")
@@ -148,6 +156,7 @@ def main():
     w("\t\t\tfiles = (")
     w(f"\t\t\t\t{assets_build},")
     w(f"\t\t\t\t{symbols_build},")
+    w(f"\t\t\t\t{footprints_build},")
     w("\t\t\t);")
     w("\t\t\trunOnlyForDeploymentPostprocessing = 0;")
     w("\t\t};")

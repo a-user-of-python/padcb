@@ -39,9 +39,7 @@ struct FileListView: View {
     // MARK: - Storage
 
     private static var padcbDirectory: URL {
-        let base = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return base.appendingPathComponent("PadCB", isDirectory: true)
+        PadCBPaths.schematicsDirectory
     }
 
     private static func sanitizedName(_ raw: String) -> String {

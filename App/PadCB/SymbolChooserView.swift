@@ -9,6 +9,7 @@ import SwiftUI
 /// definition back through `onPick` and dismisses.
 struct SymbolChooserView: View {
     @ObservedObject var store: LibraryStore
+    @EnvironmentObject private var footprintStore: FootprintStore
     let powerOnly: Bool
     var onPick: (KiCadSymbolDef) -> Void
 
@@ -38,8 +39,12 @@ struct SymbolChooserView: View {
         }
     }
 
+    /// Library KEYS (bundled base names, "user:<Name>" for custom
+    /// libraries), sorted by their display names.
     private var availableLibraries: [String] {
-        Array(Set(scopeEntries.map(\.library))).sorted()
+        Array(Set(scopeEntries.map(\.libraryKey)))
+            .sorted { LibraryStore.displayName(forLibraryKey: $0)
+                < LibraryStore.displayName(forLibraryKey: $1) }
     }
 
     private var isSearching: Bool {
@@ -56,17 +61,20 @@ struct SymbolChooserView: View {
     private var filteredEntries: [SymbolIndexEntry] {
         let query = searchText.trimmingCharacters(in: .whitespaces)
         return scopeEntries.filter { entry in
-            if let libraryFilter, entry.library != libraryFilter { return false }
+            if let libraryFilter, entry.libraryKey != libraryFilter { return false }
             if !query.isEmpty && !matchesSearch(entry, query: query) { return false }
             return true
         }
     }
 
     private var groupedEntries: [(library: String, entries: [SymbolIndexEntry])] {
-        let grouped = Dictionary(grouping: filteredEntries, by: \.library)
-        return grouped.keys.sorted().map { key in
-            (library: key, entries: grouped[key] ?? [])
-        }
+        let grouped = Dictionary(grouping: filteredEntries, by: \.libraryKey)
+        return grouped.keys
+            .sorted { LibraryStore.displayName(forLibraryKey: $0)
+                < LibraryStore.displayName(forLibraryKey: $1) }
+            .map { key in
+                (library: key, entries: grouped[key] ?? [])
+            }
     }
 
     // MARK: - Body
@@ -79,6 +87,7 @@ struct SymbolChooserView: View {
                 } else {
                     VStack(spacing: 0) {
                         filterBar
+                        importStatusStrip
                         Divider()
                         HStack(spacing: 0) {
                             symbolList
@@ -100,6 +109,20 @@ struct SymbolChooserView: View {
                     Button("Cancel") { dismiss() }
                         .lineLimit(1)
                 }
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        store.rescanUserLibraries()
+                        footprintStore.rescan()
+                    } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: "arrow.clockwise")
+                                .lineLimit(1)
+                            Text("Rescan")
+                                .lineLimit(1)
+                        }
+                    }
+                    .disabled(store.isScanningCustomLibraries || footprintStore.isScanning)
+                }
             }
         }
         .preferredColorScheme(.dark)
@@ -110,7 +133,7 @@ struct SymbolChooserView: View {
                 def = nil
                 return
             }
-            def = store.symbol(library: entry.library, name: entry.name)
+            def = store.symbol(library: entry.libraryKey, name: entry.name)
         }
     }
 
@@ -156,13 +179,15 @@ struct SymbolChooserView: View {
                 Button("All libraries") { libraryFilter = nil }
                 Divider()
                 ForEach(availableLibraries, id: \.self) { library in
-                    Button(library) { libraryFilter = library }
+                    Button(LibraryStore.displayName(forLibraryKey: library)) {
+                        libraryFilter = library
+                    }
                 }
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "books.vertical")
                         .lineLimit(1)
-                    Text(libraryFilter ?? "All libraries")
+                    Text(libraryFilter.map { LibraryStore.displayName(forLibraryKey: $0) } ?? "All libraries")
                         .lineLimit(1)
                         .fixedSize(horizontal: true, vertical: false)
                     Image(systemName: "chevron.down")
@@ -178,6 +203,37 @@ struct SymbolChooserView: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 10)
+    }
+
+    /// One slim line under the filter bar while a custom-library
+    /// rescan runs or when the last scan skipped files.
+    @ViewBuilder
+    private var importStatusStrip: some View {
+        if store.isScanningCustomLibraries {
+            HStack(spacing: 8) {
+                ProgressView().tint(.white)
+                Text("Scanning your Libraries folder…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+        } else if !store.customLibraryIssues.isEmpty {
+            HStack(spacing: 8) {
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                Text("\(store.customLibraryIssues.count) library file\(store.customLibraryIssues.count == 1 ? "" : "s") skipped: \(store.customLibraryIssues.first ?? "")")
+                    .font(.caption)
+                    .foregroundStyle(.orange)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 4)
+        }
     }
 
     // MARK: - List
@@ -217,7 +273,7 @@ struct SymbolChooserView: View {
         } else {
             List {
                 ForEach(groupedEntries, id: \.library) { group in
-                    Section(group.library) {
+                    Section(LibraryStore.displayName(forLibraryKey: group.library)) {
                         ForEach(group.entries) { entry in
                             entryRow(entry)
                         }
@@ -234,10 +290,21 @@ struct SymbolChooserView: View {
             selectedEntry = entry
         } label: {
             VStack(alignment: .leading, spacing: 2) {
-                Text(entry.name)
-                    .font(.body.weight(.semibold))
-                    .foregroundStyle(.primary)
-                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(entry.name)
+                        .font(.body.weight(.semibold))
+                        .foregroundStyle(.primary)
+                        .lineLimit(1)
+                    if entry.source == .custom {
+                        Text("CUSTOM")
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.black)
+                            .lineLimit(1)
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 1)
+                            .background(Color.green, in: Capsule())
+                    }
+                }
                 if !entry.description.isEmpty {
                     Text(entry.description)
                         .font(.caption)
@@ -271,7 +338,7 @@ struct SymbolChooserView: View {
                         Text(entry.name)
                             .font(.headline)
                             .lineLimit(1)
-                        metadataRow("Library", entry.library)
+                        metadataRow("Library", LibraryStore.displayName(forLibraryKey: entry.libraryKey))
                         if !entry.description.isEmpty {
                             metadataBlock("Description", entry.description)
                         }
@@ -281,6 +348,17 @@ struct SymbolChooserView: View {
                         if let footprint = def.property("Footprint"),
                            !footprint.isEmpty, footprint != "~" {
                             metadataRow("Footprint", footprint)
+                            if let match = footprintStore.resolve(reference: footprint) {
+                                Text("Imported footprint available: \(match.key) — \(match.padCount) pads")
+                                    .font(.caption)
+                                    .foregroundStyle(.green)
+                                    .lineLimit(2)
+                            } else {
+                                Text("No imported footprint matches this reference yet — drop its .kicad_mod into the Footprints folder.")
+                                    .font(.caption)
+                                    .foregroundStyle(.orange)
+                                    .lineLimit(2)
+                            }
                         }
                         if let url = entry.datasheetURL ?? datasheetURL(from: def) {
                             Link(destination: url) {
@@ -396,7 +474,7 @@ struct SymbolChooserView: View {
                 .fixedSize(horizontal: true, vertical: false)
             Spacer()
             if let entry = selectedEntry {
-                Text("\(entry.library):\(entry.name)")
+                Text("\(LibraryStore.displayName(forLibraryKey: entry.libraryKey)):\(entry.name)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)

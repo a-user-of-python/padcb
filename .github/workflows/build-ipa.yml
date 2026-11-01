@@ -10,6 +10,13 @@ env:
   KICAD_SYMBOLS_TAG: "10.0.1"
   KICAD_SYMBOLS_COMMIT: "7058584a0fbe9aa2f1c9ff2acf7847726ff6922c"
   KICAD_SYMBOLS_URL: "https://gitlab.com/kicad/libraries/kicad-symbols/-/archive/10.0.1/kicad-symbols-10.0.1.tar.gz"
+  # Pinned KiCad footprint libraries (same 10.0.1 release line, GitLab —
+  # the GitHub mirror is equally frozen). Commit = the 10.0.1 tag's
+  # commit; sha256 = the release tarball's hash (measured 2026-11-01).
+  KICAD_FOOTPRINTS_TAG: "10.0.1"
+  KICAD_FOOTPRINTS_COMMIT: "3d2b27e687a44c97f02109afb2acfeebbc8dd75f"
+  KICAD_FOOTPRINTS_URL: "https://gitlab.com/kicad/libraries/kicad-footprints/-/archive/10.0.1/kicad-footprints-10.0.1.tar.gz"
+  KICAD_FOOTPRINTS_SHA256: "858754aa9946f62c9df2ee2368e6ece0a6983167a10d406767bbaddb0c89bb4f"
 
 jobs:
   build:
@@ -66,6 +73,31 @@ jobs:
           print("symbol library validation OK")
           EOF
 
+      - name: Download KiCad footprint libraries (pinned) — .pretty only, no 3D models
+        run: |
+          curl -fL "$KICAD_FOOTPRINTS_URL" -o /tmp/kicad-footprints.tar.gz
+          echo "$KICAD_FOOTPRINTS_SHA256  /tmp/kicad-footprints.tar.gz" | shasum -a 256 -c -
+          mkdir -p /tmp/kicad-footprints
+          tar -xzf /tmp/kicad-footprints.tar.gz -C /tmp/kicad-footprints --strip-components=1
+          # Take ONLY the *.pretty library folders (the .kicad_mod files).
+          # 3D models (.wrl/.step) and .3dshapes content are excluded.
+          for d in /tmp/kicad-footprints/*.pretty; do
+            cp -R "$d" App/PadCB/Footprints/
+          done
+          cp /tmp/kicad-footprints/LICENSE.md App/PadCB/Footprints/KICAD-FOOTPRINTS-LICENSE.md
+          echo "footprint files staged: $(find App/PadCB/Footprints -name '*.kicad_mod' | wc -l | tr -d ' ')"
+          du -sh App/PadCB/Footprints
+
+      - name: Footprint census (real Swift parser over the whole corpus) + bundle index
+        run: |
+          xcrun swiftc -O -o /tmp/FootprintCensus \
+            App/PadCB/SExpr.swift \
+            App/PadCB/KiCadFootprint.swift \
+            tools/FootprintCensus/main.swift
+          # Exit 1 on ANY parse failure — the corpus is the test suite.
+          /tmp/FootprintCensus App/PadCB/Footprints App/PadCB/Footprints/FootprintIndex.json | tee /tmp/footprint-census.txt
+          test -s App/PadCB/Footprints/FootprintIndex.json
+
       - name: Build app (unsigned)
         run: |
           xcodebuild -project App/PadCB.xcodeproj \
@@ -100,6 +132,17 @@ jobs:
           test "$SRC" = "$DST"
           test -f "$APP_PATH/Symbols/KICAD-LIBRARIES-LICENSE.md"
           du -sh "$APP_PATH"
+
+      - name: Verify bundled footprint libraries in built app
+        run: |
+          APP_PATH="build/dd/Build/Products/Release-iphoneos/PadCB.app"
+          SRC=$(find App/PadCB/Footprints -name '*.kicad_mod' | wc -l | tr -d ' ')
+          DST=$(find "$APP_PATH/Footprints" -name '*.kicad_mod' | wc -l | tr -d ' ')
+          echo "footprints in project: $SRC ; in app bundle: $DST"
+          test "$SRC" = "$DST"
+          test -f "$APP_PATH/Footprints/FootprintIndex.json"
+          test -f "$APP_PATH/Footprints/KICAD-FOOTPRINTS-LICENSE.md"
+          cat /tmp/footprint-census.txt
 
       - name: Package IPA
         run: |

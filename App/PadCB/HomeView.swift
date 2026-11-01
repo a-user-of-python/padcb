@@ -1,15 +1,18 @@
 import SwiftUI
 
 /// Launcher screen: two big, high-contrast destinations (Schematic Editor,
-/// PCB Editor) plus a live status line for the KiCad symbol library index.
+/// PCB Editor), the footprint browser, and — TEMPORARY, part 2 — a debug
+/// button that decrypts the saved connection tables. Plus live status
+/// lines for the symbol library index and the footprint scans.
 ///
 /// All labels are single-line by design — see the LumenScene top-bar lesson
 /// recorded in the project contracts (no wrapping button titles, ever).
 struct HomeView: View {
     @EnvironmentObject private var store: LibraryStore
+    @EnvironmentObject private var footprintStore: FootprintStore
 
     private var libraryCount: Int {
-        Set(store.index.map(\.library)).count
+        Set(store.index.map(\.libraryKey)).count
     }
 
     var body: some View {
@@ -18,21 +21,24 @@ struct HomeView: View {
                 Color(white: 0.08)
                     .ignoresSafeArea()
 
-                VStack(spacing: 32) {
-                    header
-                    navigationButtons
-                    libraryStatus
-                    Spacer(minLength: 0)
+                ScrollView {
+                    VStack(spacing: 28) {
+                        header
+                        navigationButtons
+                        importStatus
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: 640)
+                    .padding(.horizontal, 32)
+                    .padding(.top, 40)
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(maxWidth: 640)
-                .padding(.horizontal, 32)
-                .padding(.top, 48)
-                .frame(maxWidth: .infinity)
             }
             .navigationTitle("PadCB")
             .navigationBarTitleDisplayMode(.inline)
             .task {
                 store.bootstrap()
+                footprintStore.bootstrap()
             }
         }
         .preferredColorScheme(.dark)
@@ -70,10 +76,30 @@ struct HomeView: View {
                             title: "PCB Editor")
             }
             .buttonStyle(.plain)
+
+            NavigationLink {
+                FootprintBrowserView()
+            } label: {
+                launcherRow(icon: "square.grid.3x3.square",
+                            title: "Footprint Browser")
+            }
+            .buttonStyle(.plain)
+
+            // TEMPORARY (part 2): decrypts the connection table written
+            // on every schematic save and shows what connects to what.
+            // Remove when the PCB editor consumes the tables directly.
+            NavigationLink {
+                ConnectionDebugView()
+            } label: {
+                launcherRow(icon: "tablecells.badge.ellipsis",
+                            title: "Debug: View Connections",
+                            badge: "TEMPORARY")
+            }
+            .buttonStyle(.plain)
         }
     }
 
-    private func launcherRow(icon: String, title: String) -> some View {
+    private func launcherRow(icon: String, title: String, badge: String? = nil) -> some View {
         HStack(spacing: 18) {
             Image(systemName: icon)
                 .font(.system(size: 30, weight: .medium))
@@ -83,6 +109,15 @@ struct HomeView: View {
                 .font(.title2.weight(.semibold))
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
+            if let badge {
+                Text(badge)
+                    .font(.caption.weight(.bold))
+                    .foregroundStyle(.black)
+                    .lineLimit(1)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(Color.orange, in: Capsule())
+            }
             Spacer(minLength: 0)
             Image(systemName: "chevron.right")
                 .font(.body.weight(.semibold))
@@ -101,19 +136,49 @@ struct HomeView: View {
         .contentShape(RoundedRectangle(cornerRadius: 16))
     }
 
+    // MARK: - Import status
+
     @ViewBuilder
-    private var libraryStatus: some View {
-        if store.indexReady {
-            Text("KiCad symbol libraries — \(store.index.count.formatted()) symbols in \(libraryCount) libraries")
-                .font(.callout)
-                .foregroundStyle(.white.opacity(0.65))
-                .lineLimit(1)
-                .minimumScaleFactor(0.8)
-        } else if let loadError = store.loadError {
-            Text(loadError)
-                .font(.callout)
-                .foregroundStyle(.red.opacity(0.9))
+    private var importStatus: some View {
+        VStack(spacing: 8) {
+            symbolStatus
+            if store.customLibraryCount > 0 {
+                statusLine("Your libraries: \(store.customLibraryCount) file\(store.customLibraryCount == 1 ? "" : "s") in Libraries folder",
+                           color: .green.opacity(0.9))
+            }
+            if store.isScanningCustomLibraries {
+                statusLine("Scanning your Libraries folder…", color: .white.opacity(0.65))
+            }
+            ForEach(Array(store.customLibraryIssues.prefix(3).enumerated()), id: \.offset) { _, issue in
+                statusLine(issue, color: .orange.opacity(0.9))
+            }
+            footprintStatus
+            ForEach(Array(footprintStore.issues.prefix(3).enumerated()), id: \.offset) { _, issue in
+                statusLine(issue, color: .orange.opacity(0.9))
+            }
+            Text("Add your own parts in the Files app: PadCB ▸ Libraries (.kicad_sym) · PadCB ▸ Footprints (.kicad_mod)")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.45))
                 .lineLimit(2)
+                .multilineTextAlignment(.center)
+        }
+    }
+
+    private func statusLine(_ text: String, color: Color) -> some View {
+        Text(text)
+            .font(.callout)
+            .foregroundStyle(color)
+            .lineLimit(2)
+            .multilineTextAlignment(.center)
+    }
+
+    @ViewBuilder
+    private var symbolStatus: some View {
+        if store.indexReady {
+            statusLine("KiCad symbol libraries — \(store.index.count.formatted()) symbols in \(libraryCount) libraries",
+                       color: .white.opacity(0.65))
+        } else if let loadError = store.loadError {
+            statusLine(loadError, color: .red.opacity(0.9))
         } else {
             HStack(spacing: 10) {
                 ProgressView()
@@ -123,6 +188,25 @@ struct HomeView: View {
                     .foregroundStyle(.white.opacity(0.65))
                     .lineLimit(1)
             }
+        }
+    }
+
+    @ViewBuilder
+    private var footprintStatus: some View {
+        if footprintStore.isScanning && !footprintStore.didScan {
+            HStack(spacing: 10) {
+                ProgressView()
+                    .tint(.white)
+                Text("Scanning footprints…")
+                    .font(.callout)
+                    .foregroundStyle(.white.opacity(0.65))
+                    .lineLimit(1)
+            }
+        } else if footprintStore.didScan {
+            let userCount = footprintStore.userFootprints.count
+            let bundledCount = footprintStore.bundledFootprints.count
+            statusLine("Footprints — \(bundledCount.formatted()) KiCad library footprints · \(userCount) imported by you",
+                       color: .white.opacity(0.65))
         }
     }
 }
