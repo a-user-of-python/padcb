@@ -473,3 +473,82 @@ enum PCBBoardModelBuilder {
         return (ca.count - i) < (cb.count - j)
     }
 }
+
+// MARK: - Diff (Sync from Schematic feedback)
+
+/// What changed between two board models — in practice, between the
+/// board built from one save of a schematic and the board built from
+/// a later save of the same schematic. The PCB editor's "Sync from
+/// Schematic" reports this after rebuilding; the BoardFixture harness
+/// asserts it against a mutated second table.
+struct BoardModelDiff {
+    /// References on the new board that were not on the old one.
+    var addedReferences: [String]
+    /// References on the old board that are gone from the new one.
+    var removedReferences: [String]
+    /// References on both boards whose content changed (footprint
+    /// choice, any pin's net or bound pad, value, problems, notes).
+    var changedReferences: [String]
+    var oldNetCount: Int
+    var newNetCount: Int
+
+    var isEmpty: Bool {
+        addedReferences.isEmpty && removedReferences.isEmpty
+            && changedReferences.isEmpty && oldNetCount == newNetCount
+    }
+}
+
+extension PCBBoardModelBuilder {
+
+    /// Component-set diff between two models, in each model's own
+    /// component order. References are unique within a model (the
+    /// builder groups by reference), so keying by reference is safe.
+    static func diff(from old: BoardModel, to new: BoardModel) -> BoardModelDiff {
+        let oldByReference = Dictionary(
+            uniqueKeysWithValues: old.components.map { ($0.reference, $0) })
+        let newByReference = Dictionary(
+            uniqueKeysWithValues: new.components.map { ($0.reference, $0) })
+
+        var added: [String] = []
+        var removed: [String] = []
+        var changed: [String] = []
+        for component in new.components where oldByReference[component.reference] == nil {
+            added.append(component.reference)
+        }
+        for component in old.components {
+            guard let counterpart = newByReference[component.reference] else {
+                removed.append(component.reference)
+                continue
+            }
+            if signature(component) != signature(counterpart) {
+                changed.append(component.reference)
+            }
+        }
+        return BoardModelDiff(addedReferences: added,
+                              removedReferences: removed,
+                              changedReferences: changed,
+                              oldNetCount: old.netCount,
+                              newNetCount: new.netCount)
+    }
+
+    /// Everything about a component that a re-sync can change, folded
+    /// into one comparable string: value, symbol, footprint choice and
+    /// how it was chosen, every pin's net and bound pad (number and
+    /// position — a pad that moved under the same number still counts
+    /// as a change), plus its problems and notes.
+    private static func signature(_ component: BoardComponent) -> String {
+        var parts: [String] = [
+            component.value,
+            component.symbolKey,
+            component.footprintKey ?? "-",
+            component.matchKind ?? "-",
+        ]
+        for pin in component.pins {
+            let pad = pin.pad.map { "\($0.number)@\($0.x),\($0.y)" } ?? "-"
+            parts.append("\(pin.pinNumber)=\(pin.netName ?? "-"):\(pad)")
+        }
+        parts += component.anomalies
+        parts += component.notes
+        return parts.joined(separator: "|")
+    }
+}

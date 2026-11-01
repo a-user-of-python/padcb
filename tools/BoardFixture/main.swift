@@ -58,7 +58,12 @@ import Foundation
 /// store's Codable path), and a hand-written v1-format JSON literal
 /// (no footprintMatchKind key) is decoded to prove backward
 /// compatibility. The BoardModel is then built from the round-tripped
-/// table and asserted. Any failure prints FAIL lines and exits 1.
+/// table and asserted. Finally, the SYNC proof (v3.1): a mutated v2
+/// table (one renamed net, one changed footprint choice) is rebuilt
+/// through the same builder — the exact operation the PCB editor's
+/// "Sync from Schematic" performs — and the rebuilt board plus
+/// PCBBoardModelBuilder.diff are asserted. Any failure prints FAIL
+/// lines and exits 1.
 
 // MARK: - Assertion helpers
 
@@ -440,6 +445,81 @@ checkEqual(x1Pin2Binding.netName ?? "", "VCC", "X1 pin 2 is on VCC")
 checkEqual(x1Pin2Binding.pad?.number ?? "", "2", "X1 pin 2 binds to pad 2")
 check(x1Component.anomalies.isEmpty,
       "X1 has no anomalies (got \(x1Component.anomalies))")
+
+// MARK: - Sync proof (v3.1): rebuild from a changed table
+
+// The PCB editor's Sync is: re-decrypt the (possibly rewritten)
+// table and run PCBBoardModelBuilder.build again, then diff. Here a
+// v2 table is derived from the round-tripped v1 table with the two
+// changes a schematic re-save would carry:
+var tableV2 = roundTripped
+// (a) A changed net: VCC renamed to VCC2. Endpoints reference
+// instance + pin only, so renaming the net renames it for every
+// endpoint at once (U1 pin 8, X1 pin 2).
+if let vccIndex = tableV2.nets.firstIndex(where: { $0.name == "VCC" }) {
+    tableV2.nets[vccIndex].name = "VCC2"
+} else {
+    fatal("VCC net missing from the v1 table")
+}
+// (b) A changed footprint choice: R1's instance now records an
+// instance choice of the custom CUST_FP (2 pads, like FIXR_FP).
+var r1Mutated = false
+for index in tableV2.components.indices
+where tableV2.components[index].reference == "R1" {
+    tableV2.components[index].resolvedFootprintKey = "user:CustomFP:CUST_FP"
+    tableV2.components[index].footprintMatchKind = "instanceChoice"
+    r1Mutated = true
+}
+check(r1Mutated, "sync fixture: the v2 table carries R1's changed footprint choice")
+
+let boardV2 = PCBBoardModelBuilder.build(
+    table: tableV2,
+    resolveSymbol: { library, name in defsByKey["\(library)|\(name)"] },
+    resolveFootprint: { key in
+        guard let entry = FootprintMatcher.entry(forResolutionKey: key, in: entries),
+              let parsed = entry.parsed else { return nil }
+        return (entry: entry, parsed: parsed)
+    })
+
+func componentV2(_ reference: String) -> BoardComponent {
+    guard let found = boardV2.components.first(where: { $0.reference == reference })
+    else { fatal("v2 board is missing component \(reference)") }
+    return found
+}
+
+// The rebuilt board reflects v2, not v1:
+checkEqual(binding(componentV2("U1"), "8").netName ?? "", "VCC2",
+           "sync: U1 pin 8 follows the renamed net")
+checkEqual(binding(componentV2("X1"), "2").netName ?? "", "VCC2",
+           "sync: X1 pin 2 follows the renamed net")
+checkEqual(binding(componentV2("U1"), "1").netName ?? "", "NET_A",
+           "sync: an untouched net (NET_A) is unchanged")
+let r1V2 = componentV2("R1")
+checkEqual(r1V2.footprintKey ?? "", "user:CustomFP:CUST_FP",
+           "sync: R1 footprint is the new instance choice")
+checkEqual(r1V2.matchKind ?? "", "instanceChoice",
+           "sync: R1 matchKind records the instance choice")
+if let pad = binding(r1V2, "1").pad {
+    check(approx(pad.x, -2.54) && approx(pad.y, 0),
+          "sync: R1 pin 1 binds CUST_FP's pad 1 at (-2.54, 0) (got \(pad.x), \(pad.y))")
+} else {
+    check(false, "sync: R1 pin 1 has a pad after the footprint change")
+}
+check(r1V2.anomalies.isEmpty,
+      "sync: R1 has no anomalies on its new footprint (got \(r1V2.anomalies))")
+
+// And the diff the editor reports names exactly the touched parts:
+let syncDiff = PCBBoardModelBuilder.diff(from: board, to: boardV2)
+check(syncDiff.addedReferences.isEmpty,
+      "sync diff: nothing added (got \(syncDiff.addedReferences))")
+check(syncDiff.removedReferences.isEmpty,
+      "sync diff: nothing removed (got \(syncDiff.removedReferences))")
+checkEqual(Set(syncDiff.changedReferences), Set(["R1", "U1", "X1"]),
+           "sync diff: R1 (footprint) + U1 and X1 (renamed net) changed")
+checkEqual(syncDiff.oldNetCount, 3, "sync diff: old net count is 3")
+checkEqual(syncDiff.newNetCount, 3, "sync diff: new net count is 3")
+check(PCBBoardModelBuilder.diff(from: board, to: board).isEmpty,
+      "sync diff: a board diffed with itself is empty (sync with no re-save reports no changes)")
 
 // MARK: - Result
 

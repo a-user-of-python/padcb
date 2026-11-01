@@ -6,13 +6,15 @@ import SwiftUI
 /// panels on the right, KiCad-style status bar along the bottom.
 ///
 /// What works: opening an encrypted connection table (the same tables
-/// the schematic editor writes on every save), pan / zoom / fit, grid
-/// toggle, tab switching, component selection, and the pin↔pad
-/// correspondence display (every pin of the selected component with
-/// its net and its real footprint pad). What does NOT work yet, by
-/// design: editing — no routing, no moving, no model mutation. The
-/// menus, layer/object visibility toggles and selection filters are
-/// visual state only.
+/// the schematic editor writes on every save), "Sync from Schematic"
+/// (re-read the loaded schematic's saved table and rebuild the board
+/// in place — the saved state is the source, never a live editing
+/// session), pan / zoom / fit, grid toggle, tab switching, component
+/// selection, and the pin↔pad correspondence display (every pin of
+/// the selected component with its net and its real footprint pad).
+/// What does NOT work yet, by design: editing — no routing, no
+/// moving, no mutation beyond a sync rebuild. The menus, layer/object
+/// visibility toggles and selection filters are visual state only.
 ///
 /// Board coordinates are KiCad PCB coordinates: millimetres, x right,
 /// y DOWN — the canvas maps them straight to the screen (NO y-flip;
@@ -27,6 +29,12 @@ struct PCBEditorView: View {
     @State private var model: BoardModel? = nil
     @State private var loadError: String? = nil
     @State private var isLoading = false
+    // Sync state (v3.1): the last sync's one-line result, and the flag
+    // that stops .task(id: selectedURL) from rebuilding a table a sync
+    // just built when the sync itself moved the picker selection.
+    @State private var isSyncing = false
+    @State private var syncMessage: String? = nil
+    @State private var suppressTaskLoad = false
 
     // Canvas state (points per mm; 2.5 pt/mm reads as "100 %" below)
     @State private var scale: CGFloat = 2.5
@@ -214,6 +222,12 @@ struct PCBEditorView: View {
                         .lineLimit(1)
                 }
             }
+            if let syncMessage {
+                Text(syncMessage)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.green.opacity(0.9))
+                    .lineLimit(1)
+            }
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 8)
@@ -221,6 +235,14 @@ struct PCBEditorView: View {
     }
 
     private func loadSelected() async {
+        // A sync that just rebuilt the board AND moved the picker to
+        // the table it built sets this flag: the selection change must
+        // not trigger a second, identical load.
+        if suppressTaskLoad {
+            suppressTaskLoad = false
+            return
+        }
+        syncMessage = nil
         model = nil
         loadError = nil
         guard let url = selectedURL else { return }
@@ -261,6 +283,114 @@ struct PCBEditorView: View {
         }
     }
 
+    // MARK: - Sync from Schematic (v3.1)
+
+    /// KiCad's "Update PCB from Schematic", PadCB-style: re-read the
+    /// SAVED connection table for the schematic on the board and
+    /// rebuild the board in place. The saved table is the only source
+    /// — sync never reaches into a live, unsaved editing session; if
+    /// the schematic was edited and saved since the board was built,
+    /// picking up exactly those changes is the point.
+    ///
+    /// The board being edited stays on screen during the rebuild and
+    /// is swapped only on success; a failed sync changes nothing but
+    /// the status line.
+    private func syncFromSchematic() async {
+        guard !isSyncing else { return }
+        isSyncing = true
+        isLoading = true
+        defer {
+            isSyncing = false
+            isLoading = false
+        }
+
+        // A save since opening may have rewritten the loaded
+        // schematic's .pct in place (same file, new bytes) or added a
+        // new schematic's table — rescan before choosing.
+        tables = ConnectionTableStore.availableTables()
+
+        // Target: the table for the schematic currently on the board
+        // (tables are one file per schematic, so that file's current
+        // bytes ARE its newest state). With no board loaded, the
+        // newest table overall — the same choice opening makes.
+        let target: URL?
+        if let current = selectedURL,
+           tables.contains(where: { $0.path == current.path }) {
+            target = current
+        } else {
+            target = tables.first
+        }
+        guard let url = target else {
+            syncMessage = "Nothing to sync — save a schematic first."
+            return
+        }
+
+        let libStore = libraryStore
+        let fpStore = footprintStore
+        do {
+            // The exact decrypt + build path loadSelected uses.
+            let built = try await Task.detached(priority: .userInitiated) { () throws -> BoardModel in
+                let table = try ConnectionTableStore.load(from: url)
+                return PCBBoardModelBuilder.build(
+                    table: table,
+                    resolveSymbol: { library, name in
+                        libStore.symbol(library: library, name: name)
+                    },
+                    resolveFootprint: { key in
+                        guard let entry = fpStore.entry(forResolutionKey: key),
+                              let parsed = fpStore.footprint(for: entry)
+                        else { return nil }
+                        return (entry: entry, parsed: parsed)
+                    })
+            }.value
+            let previous = model
+            model = built
+            loadError = nil
+            if selectedURL != url {
+                // Keep the picker on the table now on the board,
+                // without .task(id:) rebuilding what sync just built.
+                suppressTaskLoad = true
+                selectedURL = url
+            }
+            if let selectedReference,
+               !built.components.contains(where: { $0.reference == selectedReference }) {
+                self.selectedReference = built.components.first?.reference
+            } else if selectedReference == nil {
+                selectedReference = built.components.first?.reference
+            }
+            syncMessage = Self.syncSummary(previous: previous, current: built)
+        } catch {
+            if model == nil {
+                loadError = "Sync failed: \(error.localizedDescription)"
+            }
+            syncMessage = "Sync failed: \(error.localizedDescription)"
+        }
+    }
+
+    /// "Synced — 12 components, 8 nets", plus the diff against the
+    /// previously loaded board when it was the same schematic.
+    private static func syncSummary(previous: BoardModel?, current: BoardModel) -> String {
+        var text = "Synced — \(current.components.count) components, \(current.netCount) nets"
+        guard let previous, previous.sourceFileName == current.sourceFileName
+        else { return text }
+        let diff = PCBBoardModelBuilder.diff(from: previous, to: current)
+        if diff.isEmpty { return text + " · no changes" }
+        var parts: [String] = []
+        if !diff.addedReferences.isEmpty {
+            parts.append("\(diff.addedReferences.count) added")
+        }
+        if !diff.removedReferences.isEmpty {
+            parts.append("\(diff.removedReferences.count) removed")
+        }
+        if !diff.changedReferences.isEmpty {
+            parts.append("\(diff.changedReferences.count) changed")
+        }
+        if diff.oldNetCount != diff.newNetCount {
+            parts.append("nets \(diff.oldNetCount) → \(diff.newNetCount)")
+        }
+        return parts.isEmpty ? text : text + " · " + parts.joined(separator: ", ")
+    }
+
     // MARK: - Menu strip (visual only this part)
 
     private var menuStrip: some View {
@@ -297,6 +427,10 @@ struct PCBEditorView: View {
                 tables = ConnectionTableStore.availableTables()
                 if selectedURL == nil { selectedURL = tables.first }
             }
+            iconButton("arrow.triangle.2.circlepath", "Sync from Schematic",
+                       disabled: isSyncing) {
+                Task { await syncFromSchematic() }
+            }
             Divider().frame(height: 26)
             iconButton("minus.magnifyingglass", "Zoom Out") { zoomOut() }
             iconButton("plus.magnifyingglass", "Zoom In") { zoomIn() }
@@ -315,6 +449,7 @@ struct PCBEditorView: View {
 
     private func iconButton(_ icon: String, _ label: String,
                             active: Bool = false,
+                            disabled: Bool = false,
                             action: @escaping () -> Void) -> some View {
         Button(action: action) {
             VStack(spacing: 1) {
@@ -327,6 +462,7 @@ struct PCBEditorView: View {
                     .fixedSize(horizontal: true, vertical: false)
             }
             .foregroundStyle(active ? Color.accentColor : .white.opacity(0.9))
+            .opacity(disabled ? 0.45 : 1)
             .padding(.horizontal, 8)
             .padding(.vertical, 3)
             .background(active ? Color.accentColor.opacity(0.22) : Color.clear,
@@ -334,6 +470,7 @@ struct PCBEditorView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
+        .disabled(disabled)
     }
 
     // MARK: - Left tool rail (visual tool selection only)
