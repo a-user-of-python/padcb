@@ -747,7 +747,7 @@ struct PCBEditorView: View {
         // Part 5.2: the spatial index and the ratsnest rebuild
         // with the checks — once per edit/commit, never per
         // pointer event.
-        spatialIndex = BoardSpatialIndex(model: model)
+        spatialIndex = BoardSpatialIndex.build(model)
         ratsnestSegments = BoardRatsnest.segments(
             model: model, copperCount: boardState.copperLayerCount)
     }
@@ -2057,8 +2057,8 @@ struct PCBEditorView: View {
                     .buttonStyle(.bordered)
                     .font(.callout)
                     HStack(spacing: 6) {
-                        Button("Centre ↔") { applyAlignment(.centerX) }
-                        Button("Centre ↕") { applyAlignment(.centerY) }
+                        Button("Centre ↔") { applyAlignment(.centreX) }
+                        Button("Centre ↕") { applyAlignment(.centreY) }
                     }
                     .buttonStyle(.bordered)
                     .font(.callout)
@@ -4007,7 +4007,7 @@ struct PCBEditorView: View {
         let refs = selectedComponentReferencesOrdered
         let moves = BoardPlacementTools.alignedOrigins(
             model, references: refs, mode: mode,
-            lockedReferences: boardState.lockedReferences)
+            lockedReferences: Set(boardState.lockedReferences))
         guard !moves.isEmpty else {
             setStatus("Nothing to align — the selected footprints are already there (locked ones never move).")
             return
@@ -4025,7 +4025,7 @@ struct PCBEditorView: View {
         let refs = selectedComponentReferencesOrdered
         let moves = BoardPlacementTools.distributedOrigins(
             model, references: refs, horizontal: horizontal,
-            lockedReferences: boardState.lockedReferences)
+            lockedReferences: Set(boardState.lockedReferences))
         guard !moves.isEmpty else {
             setStatus("Nothing to distribute — pick at least three unlocked footprints that aren't already evenly spaced.")
             return
