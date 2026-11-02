@@ -1051,7 +1051,8 @@ struct BoardPointerState: Equatable {
     }
 }
 
-/// Which DELIVERY channel a hover event arrived on (part 5.0.2).
+/// Which DELIVERY channel a hover event arrived on (parts
+/// 5.0.2–5.0.3).
 ///
 /// v5.0.1's model was proven but its ONE delivery path (a
 /// hit-test-transparent overlay + recognizers lent to its first
@@ -1060,37 +1061,37 @@ struct BoardPointerState: Equatable {
 /// so the overlay's own recognizer was dead by construction, and
 /// the lent recognizers' placement in the live hit chain was a
 /// gamble on SwiftUI's private hierarchy (see CONTRACTS.md,
-/// "Part 5.0.2 forensics"). v5.0.2 feeds the SAME
-/// `BoardPointerState` entry point from THREE independent
-/// channels, each tagged, so delivery no longer depends on any
-/// single mechanism — and the diagnostics below can name WHICH
-/// channel is alive on a given device:
-/// - overlay: the overlay itself, now hover-hit-testable
-///   (hitTest returns self for hover events, nil for touches);
-///   its own UIHoverGestureRecognizer feeds the stream.
-/// - ancestor: a UIHoverGestureRecognizer on the topmost view
-///   below the window (the hosting controller's root), attached
-///   by a probe view on the CANVAS side.
+/// "Part 5.0.2 forensics"). v5.0.2 fed the SAME
+/// `BoardPointerState` entry point from three tagged channels —
+/// and Sean's hardware STILL reported no hover (2026-11-01
+/// 21:37), so v5.0.3 stops working around the view hierarchy and
+/// OWNS it: ONE dedicated UIKit interaction view sits FRONTMOST
+/// over the canvas rect and is the hit view for hover AND touches
+/// alike, with the UIHoverGestureRecognizer attached DIRECTLY to
+/// it (Apple's canonical pattern — the recognizer on the canvas
+/// surface view itself). No lent recognizers, no ancestor walks,
+/// no selectively-transparent hit test:
+/// - interaction: the frontmost interaction view's own
+///   UIHoverGestureRecognizer (the primary channel).
 /// - swiftUI: SwiftUI's `.onContinuousHover` on the canvas
-///   container (the v5.0 feed, restored as a third channel).
+///   container (the v5.0 feed, kept as a counted fallback).
 enum BoardHoverChannel: Int, Equatable, CaseIterable {
-    case overlay = 1
-    case ancestor = 2
-    case swiftUI = 3
+    case interaction = 1
+    case swiftUI = 2
 }
 
 /// Per-channel hover delivery counters (part 5.0.2): the
 /// on-screen proof mechanism. Every hover event the editor
 /// accepts is recorded against its channel BEFORE it is applied
 /// to `BoardPointerState`, so the status-bar line
-/// ("Hover 1: n · 2: n · 3: n · (x, y)") shows live counts per
+/// ("Hover 1: n · 2: n · (x, y)") shows live counts per
 /// channel plus the last hover point in board mm. A channel whose
 /// counter stays at 0 while the pencil hovers is a dead channel
 /// on that hardware; all-zero means hover never reached the app.
 struct BoardHoverDiagnostics: Equatable {
     /// Event counts, indexed by `BoardHoverChannel.rawValue`
     /// (slot 0 unused).
-    private(set) var counts: [Int] = [0, 0, 0, 0]
+    private(set) var counts: [Int] = [0, 0, 0]
     /// The most recent hover position from a `hoverMoved` event
     /// (any channel), in board mm. `hoverEnded` does NOT clear
     /// it — it is the LAST point, a historical diagnostic.
@@ -1109,10 +1110,10 @@ struct BoardHoverDiagnostics: Equatable {
         counts[channel.rawValue]
     }
 
-    var totalCount: Int { counts[1] + counts[2] + counts[3] }
+    var totalCount: Int { counts[1] + counts[2] }
 
-    /// The status-bar line, e.g. "Hover 1: 0 · 2: 0 · 3: 0 · (–, –)"
-    /// before any event, "Hover 1: 12 · 2: 340 · 3: 5 · (12.3, 4.5)"
+    /// The status-bar line, e.g. "Hover 1: 0 · 2: 0 · (–, –)"
+    /// before any event, "Hover 1: 340 · 2: 5 · (12.3, 4.5)"
     /// once events flow. The en dash marks "no point yet".
     var summary: String {
         let pointText: String
@@ -1123,7 +1124,7 @@ struct BoardHoverDiagnostics: Equatable {
             pointText = "(–, –)"
         }
         return "Hover 1: \(counts[1]) · 2: \(counts[2])"
-            + " · 3: \(counts[3]) · \(pointText)"
+            + " · \(pointText)"
     }
 }
 

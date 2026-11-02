@@ -14,7 +14,9 @@ import Foundation
 ///   xcrun swiftc -O -o /tmp/hover_pilot tools/hover_pilot.swift
 /// Sweeps a grid over the simulator window's central band (where
 /// the PCB canvas sits in the editor), pausing at each point so
-/// hover recognizers see sustained positions, for ~24 seconds.
+/// hover recognizers see sustained positions, for ~24 seconds —
+/// then (part 5.0.3) performs a click, a pan drag, and a
+/// best-effort pinch on the canvas (see the gesture phase).
 
 func log(_ message: String) {
     print("PILOT: \(message)")
@@ -110,3 +112,82 @@ for round in 0..<3 {
     }
 }
 log("sweep complete")
+
+// MARK: - Gesture phase (part 5.0.3)
+//
+// Hover injection into the CI simulator is impossible (proven
+// across five v5.0.2 rounds), but CLICKS and DRAGS are ordinary
+// mouse events and DO reach the simulated device. v5.0.3's
+// interaction view is the hit view for touches too, so this
+// phase proves the editor's SwiftUI drag/tap machinery still
+// receives them: a click on the canvas (the app logs a
+// PADCB-GESTURE "drag ended" with moved < 5 — the tap path) and
+// a long drag (moved >> 5, mode pan — the pan path). A pinch is
+// attempted best-effort via the Simulator's Option+drag pinch
+// emulation; the driver reports its markers but does not gate
+// on them.
+func postMouse(_ type: CGEventType, _ point: CGPoint, pid: pid_t,
+               flags: CGEventFlags = []) {
+    CGWarpMouseCursorPosition(point)
+    if let event = CGEvent(mouseEventSource: nil, mouseType: type,
+                           mouseCursorPosition: point,
+                           mouseButton: .left) {
+        event.flags = flags
+        event.post(tap: .cghidEventTap)
+        event.postToPid(pid)
+    }
+}
+
+func windowPoint(_ fx: CGFloat, _ fy: CGFloat) -> CGPoint {
+    CGPoint(x: frame.minX + frame.width * fx,
+            y: frame.minY + frame.height * fy)
+}
+
+func click(_ point: CGPoint, pid: pid_t) {
+    postMouse(.leftMouseDown, point, pid: pid)
+    Thread.sleep(forTimeInterval: 0.3)
+    postMouse(.leftMouseUp, point, pid: pid)
+}
+
+func drag(from: CGPoint, to: CGPoint, pid: pid_t,
+          flags: CGEventFlags = []) {
+    postMouse(.leftMouseDown, from, pid: pid, flags: flags)
+    Thread.sleep(forTimeInterval: 0.3)
+    let steps = 12
+    for i in 1...steps {
+        let p = CGPoint(
+            x: from.x + (to.x - from.x) * CGFloat(i) / CGFloat(steps),
+            y: from.y + (to.y - from.y) * CGFloat(i) / CGFloat(steps))
+        postMouse(.leftMouseDragged, p, pid: pid, flags: flags)
+        Thread.sleep(forTimeInterval: 0.09)
+    }
+    postMouse(.leftMouseUp, to, pid: pid, flags: flags)
+}
+
+let pid = sim.processIdentifier
+Thread.sleep(forTimeInterval: 1.0)
+click(windowPoint(0.28, 0.50), pid: pid)
+log("gesture phase: click done")
+Thread.sleep(forTimeInterval: 1.2)
+drag(from: windowPoint(0.24, 0.42), to: windowPoint(0.40, 0.58),
+     pid: pid)
+log("gesture phase: drag done")
+Thread.sleep(forTimeInterval: 1.2)
+// Best-effort pinch: hold Option (the Simulator's pinch
+// emulation shows two mirrored touch points) and drag outward
+// from the canvas centre.
+if let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 58,
+                         keyDown: true) {
+    keyDown.flags = .maskAlternate
+    keyDown.post(tap: .cghidEventTap)
+    keyDown.postToPid(pid)
+}
+drag(from: windowPoint(0.30, 0.50), to: windowPoint(0.38, 0.50),
+     pid: pid, flags: .maskAlternate)
+if let keyUp = CGEvent(keyboardEventSource: nil, virtualKey: 58,
+                       keyDown: false) {
+    keyUp.flags = []
+    keyUp.post(tap: .cghidEventTap)
+    keyUp.postToPid(pid)
+}
+log("gesture phase: pinch attempt done")

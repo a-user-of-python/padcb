@@ -1,19 +1,33 @@
 #!/usr/bin/env python3
-"""Hover exercise (part 5.0.2): boot an iPad simulator, install the
-Debug build of PadCB (compiled with the DEBUG compilation
-condition so the -padcbHoverCheck seed is live), launch it into
-the PCB editor on the seeded fixture board, then sweep the HOST
-mouse over the simulator window with tools/hover_pilot.swift so
-the app receives real pointer hover events.
+"""Hover exercise (parts 5.0.2–5.0.3): boot an iPad simulator,
+install the Debug build of PadCB (compiled with the DEBUG
+compilation condition so the -padcbHoverCheck seed is live),
+launch it into the PCB editor on the seeded fixture board, then
+sweep the HOST mouse over the simulator window with
+tools/hover_pilot.swift.
 
-The app mirrors its PADCB-HOVER markers to
-Documents/hover-markers.txt inside its container (the console
-stream is stdio-buffered and cannot be trusted live); this
-script polls that file for the "armed" markers, and reads the
-final per-channel counts from it (channel 1 = overlay
-recognizer, 2 = ancestor recognizer, 3 = SwiftUI
-.onContinuousHover). It fails if the channels never arm or every
-counter stayed at 0, and screenshots the simulator either way.
+What this exercise can and cannot prove (measured, part 5.0.2):
+synthetic HOVER never enters the CI simulator as hover events —
+five rounds, three injection methods, and not even SwiftUI's
+own .onContinuousHover received a single event. Hover counts
+are therefore REPORTED here, never gated. What the simulator
+CAN prove, and this script gates on (part 5.0.3):
+
+  - the interaction view arms (its PADCB-HOVER marker);
+  - the hit-test probe: the interaction view IS the window's
+    hit-test result at the canvas centre, with the
+    UIHoverGestureRecognizer attached to it (PADCB-PROBE);
+  - the SwiftUI canvas gestures still receive touches whose hit
+    view is the frontmost interaction view: the pilot's click
+    produces a "drag ended" marker with moved < 5 (the tap
+    path) and its long drag one with moved >= 20 and mode pan
+    (the pan path). A pinch is attempted best-effort and its
+    markers are reported, not gated.
+
+The app mirrors its markers to Documents/hover-markers.txt
+inside its container (the console stream is stdio-buffered and
+cannot be trusted live); channel 1 = interaction-view
+recognizer, 2 = SwiftUI .onContinuousHover.
 
 Usage: hover_check.py <PadCB.app> <output-dir>
 """
@@ -25,7 +39,12 @@ import sys
 import time
 
 APP_ID = "com.user.padcb"
-SUMMARY_RE = re.compile(r"Hover 1: (\d+) · 2: (\d+) · 3: (\d+)")
+SUMMARY_RE = re.compile(r"Hover 1: (\d+) · 2: (\d+) ·")
+PROBE_RE = re.compile(
+    r"PADCB-PROBE hitTest\(centre\)=(\S+)"
+    r" isInteractionView=(true|false) recognizers=\[(.*?)\]")
+DRAG_END_RE = re.compile(
+    r"PADCB-GESTURE drag ended moved=([\d.]+) mode=(\w+)")
 
 
 def run(*args, check=True):
@@ -86,8 +105,11 @@ def main():
         raise SystemExit("could not create an iPad simulator")
 
     failure = None
-    counts = (0, 0, 0)
+    counts = (0, 0)
     armed_channels = []
+    probe = None
+    drag_ends = []
+    magnify_count = 0
     try:
         simctl("boot", udid)
         simctl("bootstatus", udid, "-b")
@@ -135,8 +157,9 @@ def main():
         armed_channels = sorted(set(re.findall(
             r"PADCB-HOVER armed ch=(\d)", markers())))
         print(f"armed markers: channels {armed_channels}", flush=True)
-        if not armed_channels and failure is None:
-            failure = "hover channels never armed (canvas never appeared?)"
+        if "1" not in armed_channels and failure is None:
+            failure = ("interaction view never armed "
+                       "(canvas never appeared?)")
 
         if failure is None:
             # Open the Simulator GUI: `simctl boot` runs the device
@@ -164,12 +187,54 @@ def main():
         if summaries:
             counts = tuple(int(v) for v in summaries[-1])
         print(f"final hover counts: ch1={counts[0]} ch2={counts[1]} "
-              f"ch3={counts[2]} (from {len(summaries)} summaries)",
+              f"(from {len(summaries)} summaries; reported only — "
+              f"the CI input layer cannot inject hover)", flush=True)
+
+        # Structural gates (part 5.0.3): the probe line and the
+        # gesture-delivery markers are what the simulator CAN
+        # settle.
+        probe_match = PROBE_RE.search(text)
+        if probe_match:
+            probe = (probe_match.group(1),
+                     probe_match.group(2) == "true",
+                     probe_match.group(3))
+        drag_ends = [(float(m), mode)
+                     for m, mode in DRAG_END_RE.findall(text)]
+        magnify_count = text.count("PADCB-GESTURE magnify began")
+        taps = [m for m, _ in drag_ends if m < 5]
+        pans = [(m, mode) for m, mode in drag_ends
+                if m >= 20 and mode == "pan"]
+        print(f"probe: {probe}", flush=True)
+        print(f"drag ends: {drag_ends} (taps={len(taps)}, "
+              f"pans={len(pans)}), magnify began x{magnify_count}",
               flush=True)
+
+        if failure is None:
+            if probe is None:
+                failure = "no PADCB-PROBE hit-test line recorded"
+            elif not probe[1]:
+                failure = (f"hit-test probe: the interaction view "
+                           f"is NOT the hit view at the canvas "
+                           f"centre (hit={probe[0]})")
+            elif "UIHoverGestureRecognizer" not in probe[2]:
+                failure = ("hit-test probe: no "
+                           "UIHoverGestureRecognizer attached to "
+                           f"the hit view (recognizers={probe[2]})")
+            elif not taps:
+                failure = ("gesture exercise: no tap reached the "
+                           "canvas drag gesture (no drag-ended "
+                           "marker with moved < 5)")
+            elif not pans:
+                failure = ("gesture exercise: no pan reached the "
+                           "canvas drag gesture (no drag-ended "
+                           "marker with moved >= 20, mode pan)")
+
         with open(os.path.join(out_dir, "verdict.txt"), "w") as f:
             f.write(f"armed={armed_channels}\n"
-                    f"counts ch1={counts[0]} ch2={counts[1]} "
-                    f"ch3={counts[2]}\n"
+                    f"counts ch1={counts[0]} ch2={counts[1]}\n"
+                    f"probe={probe}\n"
+                    f"drag_ends={drag_ends}\n"
+                    f"magnify_began={magnify_count}\n"
                     f"failure={failure}\n")
 
         simctl("terminate", udid, APP_ID, check=False)
@@ -183,12 +248,10 @@ def main():
             print("---- markers ----", flush=True)
             print(text[-2000:] or "(no marker file content)", flush=True)
             raise SystemExit(failure)
-        if counts == (0, 0, 0):
-            print("---- markers ----", flush=True)
-            print(text[-2000:], flush=True)
-            raise SystemExit("ZERO hover events on every channel")
-        print("HOVER EXERCISE: at least one channel delivered "
-              "events in the simulator", flush=True)
+        print("HOVER EXERCISE: interaction view is the hit view "
+              "with its recognizer attached; tap + pan delivered "
+              "to the SwiftUI canvas gestures; hover counts "
+              "reported above (device-judged)", flush=True)
     finally:
         subprocess.run(["xcrun", "simctl", "shutdown", udid],
                        capture_output=True)

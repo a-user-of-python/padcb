@@ -1,14 +1,20 @@
 name: Hover Check
 
-# Manual-only exercise for part 5.0.2: builds PadCB (Debug, with
-# the DEBUG compilation condition so the -padcbHoverCheck seed is
-# live) for the iOS Simulator, opens the PCB editor on a seeded
-# fixture board, and sweeps the host mouse over the simulator
-# window (tools/hover_pilot.swift) so the app receives real
-# pointer hover events. The app's PADCB-HOVER log markers report
-# which delivery channels fired (1 = overlay recognizer,
-# 2 = ancestor recognizer, 3 = SwiftUI .onContinuousHover). The
-# step fails if the channels never arm or every counter is 0.
+# Manual-only exercise for parts 5.0.2–5.0.3: builds PadCB
+# (Debug, with the DEBUG compilation condition so the
+# -padcbHoverCheck seed is live) for the iOS Simulator and opens
+# the PCB editor on a seeded fixture board. Synthetic HOVER
+# cannot be injected into the CI simulator (proven in 5.0.2 —
+# the input layer drops it before any app channel), so hover
+# counts (1 = interaction-view recognizer, 2 = SwiftUI
+# .onContinuousHover) are reported, not gated. The step DOES
+# gate on what the simulator can settle for v5.0.3: the
+# frontmost interaction view arms; the PADCB-PROBE hit-test line
+# shows it IS the window's hit-test result at the canvas centre
+# with its UIHoverGestureRecognizer attached; and the pilot's
+# click + pan drag reach the SwiftUI canvas gestures
+# (PADCB-GESTURE drag-ended markers: moved < 5 = tap,
+# moved >= 20 + mode pan = pan).
 
 on:
   workflow_dispatch:
