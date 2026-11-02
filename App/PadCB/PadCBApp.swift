@@ -26,11 +26,35 @@ struct PadCBApp: App {
             if UIDevice.current.userInterfaceIdiom == .phone {
                 IPadRequiredView()
             } else {
-                HomeView()
-                    .environmentObject(store)
-                    .environmentObject(footprintStore)
+                iPadRoot
             }
         }
+    }
+
+    /// The iPad root: normally HomeView. A DEBUG build launched
+    /// with `-padcbHoverCheck` (the simulator hover exercise,
+    /// part 5.0.2) goes straight to the PCB editor on a seeded
+    /// fixture board instead. Release builds compile that branch
+    /// out entirely (the hover-check workflow passes
+    /// SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG; the IPA build
+    /// does not).
+    @ViewBuilder
+    private var iPadRoot: some View {
+        #if DEBUG
+        if HoverCheckSeed.isEnabled {
+            HoverCheckRootView()
+                .environmentObject(store)
+                .environmentObject(footprintStore)
+        } else {
+            HomeView()
+                .environmentObject(store)
+                .environmentObject(footprintStore)
+        }
+        #else
+        HomeView()
+            .environmentObject(store)
+            .environmentObject(footprintStore)
+        #endif
     }
 }
 

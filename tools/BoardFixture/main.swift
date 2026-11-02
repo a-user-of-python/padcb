@@ -1351,6 +1351,103 @@ check(BoardGeometry.hoverTarget(board, point: FPPoint(x: 2000, y: 2000),
                                 tolerance: hoverTol) == nil,
       "hover: empty board space has no hover target")
 
+// MARK: - Part 5.0.2: hover delivery channels + diagnostics
+//
+// Sean's device verdict on v5.0.1: "Hover still dead" — the model
+// was right but DELIVERY failed (see CONTRACTS.md "Part 5.0.2
+// forensics": the hit-test-transparent overlay's own recognizer
+// was dead by construction; the lent ancestor recognizers were a
+// depth-3 gamble on SwiftUI's private hierarchy). v5.0.2 feeds
+// the SAME BoardPointerState from three tagged channels. The
+// funnel below mirrors the editor's feed helpers EXACTLY
+// (record the channel, then apply the event), so what is proven
+// here is the convergence contract the view relies on: the
+// channel tag can never change arbitration.
+
+// The editor's feed funnel, mirrored: diagnostics record first,
+// then the one shared apply.
+struct HoverFeed {
+    var pointer = BoardPointerState()
+    var diagnostics = BoardHoverDiagnostics()
+    mutating func moved(_ point: FPPoint, _ channel: BoardHoverChannel) {
+        diagnostics.record(channel, point: point)
+        pointer.apply(.hoverMoved(point))
+    }
+    mutating func ended(_ channel: BoardHoverChannel) {
+        diagnostics.record(channel, point: nil)
+        pointer.apply(.hoverEnded)
+    }
+}
+
+// -- Channel numbering is the diagnostics line's numbering --
+check(BoardHoverChannel.allCases.map { $0.rawValue } == [1, 2, 3],
+      "channels: overlay=1, ancestor=2, swiftUI=3 (the status-bar numbering)")
+
+// -- Diagnostics: initial state + the exact empty summary --
+var diag = BoardHoverDiagnostics()
+check(diag.totalCount == 0 && diag.lastPoint == nil && diag.lastChannel == nil,
+      "diagnostics: no events recorded initially")
+check(diag.summary == "Hover 1: 0 · 2: 0 · 3: 0 · (–, –)",
+      "diagnostics: the empty summary is the documented line")
+
+// -- Diagnostics: per-channel counting, last point/channel --
+diag.record(.overlay, point: FPPoint(x: 12.34, y: 4.54))
+check(diag.count(.overlay) == 1 && diag.count(.ancestor) == 0
+      && diag.count(.swiftUI) == 0,
+      "diagnostics: a channel-1 event increments ONLY channel 1")
+check(diag.lastChannel == .overlay
+      && diag.lastPoint == FPPoint(x: 12.34, y: 4.54),
+      "diagnostics: last channel + last point track the event")
+check(diag.summary == "Hover 1: 1 · 2: 0 · 3: 0 · (12.3, 4.5)",
+      "diagnostics: the summary formats counts + point (1 decimal)")
+diag.record(.ancestor, point: nil)
+check(diag.count(.ancestor) == 1
+      && diag.lastPoint == FPPoint(x: 12.34, y: 4.54),
+      "diagnostics: an END event counts but keeps the last point")
+diag.record(.swiftUI, point: FPPoint(x: 1, y: 2))
+check(diag.totalCount == 3 && diag.lastChannel == .swiftUI
+      && diag.summary == "Hover 1: 1 · 2: 1 · 3: 1 · (1.0, 2.0)",
+      "diagnostics: all three channels count independently")
+
+// -- Arbitration is channel-blind: every channel drives the
+//    stream identically --
+for channel in BoardHoverChannel.allCases {
+    var feed = HoverFeed()
+    feed.moved(FPPoint(x: 10, y: 10), channel)
+    check(feed.pointer.currentPoint == FPPoint(x: 10, y: 10),
+          "channels: channel \(channel.rawValue) hover feeds the current point")
+    feed.pointer.apply(.touchMoved(FPPoint(x: 20, y: 20)))
+    check(feed.pointer.currentPoint == FPPoint(x: 20, y: 20),
+          "channels: an ACTIVE touch wins over channel \(channel.rawValue) hover")
+    feed.moved(FPPoint(x: 30, y: 30), channel)
+    check(feed.pointer.currentPoint == FPPoint(x: 20, y: 20),
+          "channels: channel \(channel.rawValue) hover during a touch does not steal the point")
+    feed.pointer.apply(.touchEnded)
+    check(feed.pointer.currentPoint == FPPoint(x: 30, y: 30),
+          "channels: touch end falls back to channel \(channel.rawValue)'s latest hover point")
+    feed.ended(channel)
+    check(feed.pointer.currentPoint == nil,
+          "channels: channel \(channel.rawValue) hover end clears the point")
+    check(feed.diagnostics.count(channel) == 3
+          && feed.diagnostics.totalCount == 3,
+          "channels: channel \(channel.rawValue) recorded exactly its own 3 events")
+}
+
+// -- Cross-channel interleave: hover arrives on one channel,
+//    resumes on another after a tap (the real-world case: the
+//    channels race, the stream must not care) --
+var cross = HoverFeed()
+cross.moved(FPPoint(x: 5, y: 5), .overlay)
+cross.pointer.apply(.touchMoved(FPPoint(x: 7, y: 7)))
+cross.pointer.apply(.touchEnded)
+cross.moved(FPPoint(x: 9, y: 9), .swiftUI)
+check(cross.pointer.currentPoint == FPPoint(x: 9, y: 9),
+      "channels: hover resuming on a DIFFERENT channel after a tap tracks correctly")
+cross.moved(FPPoint(x: 11, y: 11), .ancestor)
+check(cross.pointer.currentPoint == FPPoint(x: 11, y: 11)
+      && cross.diagnostics.totalCount == 3,
+      "channels: a third channel takes over the same stream seamlessly")
+
 // MARK: - Result
 
 print("BoardFixture: \(passCount) passed, \(failCount) failed")

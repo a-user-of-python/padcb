@@ -139,6 +139,14 @@ struct PCBEditorView: View {
     /// forever once set, which froze the hover preview at the
     /// first tap — see PCBBoardState.swift.)
     @State private var pointerState = BoardPointerState()
+    /// Per-channel hover DELIVERY counters (part 5.0.2): v5.0.1's
+    /// single delivery path delivered nothing on Sean's hardware
+    /// ("Hover still dead", 2026-11-01 20:10), so v5.0.2 feeds
+    /// the stream from THREE independent channels (see
+    /// BoardHoverChannel) and counts every event per channel.
+    /// The status bar shows the counts live — Sean's screenshot
+    /// of that line names the live channel on his hardware.
+    @State private var hoverDiagnostics = BoardHoverDiagnostics()
     @State private var canvasSize: CGSize = .zero
     @State private var showGrid = true
     @State private var highlightActiveLayer = false
@@ -2298,6 +2306,15 @@ struct PCBEditorView: View {
                 .foregroundStyle(.white.opacity(0.85))
                 .lineLimit(1)
                 .fixedSize(horizontal: true, vertical: false)
+            // Hover delivery diagnostics (part 5.0.2): per-channel
+            // event counts + last hover point, live. Deliberate
+            // debug UI for this round — a follow-up strips it once
+            // delivery is proven on Sean's hardware.
+            Text(hoverDiagnostics.summary)
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.55))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
             Text("Grid \(BoardUnits.formatMil(boardState.gridMil)) mil (\(PCBBoardMerger.formatMM(gridMM)) mm)")
                 .font(.callout)
                 .foregroundStyle(.white.opacity(0.6))
@@ -2438,6 +2455,39 @@ struct PCBEditorView: View {
 
     // MARK: - Board canvas + gestures
 
+    /// THE hover entry point (part 5.0.2): every delivery channel
+    /// funnels through these two helpers — record the event
+    /// against its channel in the diagnostics, then apply it to
+    /// the ONE pointer stream. Arbitration, previews and tap
+    /// resolution are therefore identical no matter which channel
+    /// delivered the event. `PADCB-HOVER` log markers mirror the
+    /// counters for the simulator hover exercise: first event per
+    /// channel, then every 50th.
+    private func feedHoverMoved(_ boardPoint: FPPoint,
+                                channel: BoardHoverChannel) {
+        let before = hoverDiagnostics.count(channel)
+        hoverDiagnostics.record(channel, point: boardPoint)
+        pointerState.apply(.hoverMoved(boardPoint))
+        if before == 0 {
+            print("PADCB-HOVER first ch=\(channel.rawValue)"
+                + " summary=\(hoverDiagnostics.summary)")
+        } else if (before + 1) % 50 == 0 {
+            print("PADCB-HOVER ch=\(channel.rawValue)"
+                + " count=\(before + 1)"
+                + " summary=\(hoverDiagnostics.summary)")
+        }
+    }
+
+    private func feedHoverEnded(channel: BoardHoverChannel) {
+        let before = hoverDiagnostics.count(channel)
+        hoverDiagnostics.record(channel, point: nil)
+        pointerState.apply(.hoverEnded)
+        if before == 0 {
+            print("PADCB-HOVER first ch=\(channel.rawValue) (end)"
+                + " summary=\(hoverDiagnostics.summary)")
+        }
+    }
+
     private func boardCanvas(model: BoardModel) -> some View {
         GeometryReader { geo in
             Canvas { ctx, size in
@@ -2447,22 +2497,52 @@ struct PCBEditorView: View {
             .contentShape(Rectangle())
             .gesture(canvasDrag)
             .simultaneousGesture(canvasMagnify)
-            // Apple Pencil hover (part 5.0.1): a UIKit
-            // UIHoverGestureRecognizer bridge (CanvasHoverView)
-            // feeds the SAME pointer stream the touch path uses.
-            // v5.0 used SwiftUI's .onContinuousHover here AND the
-            // preview preferred a never-cleared touch point, so
-            // the hover preview froze at the first tap (see
-            // PCBBoardState.swift). No pencil = no events = the
-            // plain touch behaviour, unchanged.
+            // Apple Pencil hover, THREE independent delivery
+            // channels into the one pointer stream (part 5.0.2;
+            // forensics in CONTRACTS.md). v5.0.1's single path —
+            // a hit-test-transparent overlay (its own recognizer
+            // dead by construction) + recognizers lent to its
+            // first ancestors — delivered NOTHING on Sean's
+            // hardware. No pencil = no events on any channel =
+            // the plain touch behaviour, unchanged.
+            //
+            // Channel 2 (ancestor): a probe view behind the
+            // canvas attaches a hover recognizer to the hosting
+            // hierarchy's root view.
+            .background {
+                CanvasAncestorProbeView { location in
+                    if let location {
+                        feedHoverMoved(screenToBoard(location),
+                                       channel: .ancestor)
+                    } else {
+                        feedHoverEnded(channel: .ancestor)
+                    }
+                }
+            }
+            // Channel 1 (overlay): the overlay now participates
+            // in HOVER hit-testing (hitTest returns self for
+            // hover events, nil for touches), so its own
+            // recognizer can fire; touches still fall through.
             .overlay {
                 CanvasHoverView { location in
                     if let location {
-                        pointerState.apply(
-                            .hoverMoved(screenToBoard(location)))
+                        feedHoverMoved(screenToBoard(location),
+                                       channel: .overlay)
                     } else {
-                        pointerState.apply(.hoverEnded)
+                        feedHoverEnded(channel: .overlay)
                     }
+                }
+            }
+            // Channel 3 (SwiftUI): .onContinuousHover on the
+            // canvas container — the v5.0 feed, restored as an
+            // independent third channel.
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    feedHoverMoved(screenToBoard(location),
+                                   channel: .swiftUI)
+                case .ended:
+                    feedHoverEnded(channel: .swiftUI)
                 }
             }
             .onAppear { canvasSize = geo.size }
@@ -3866,35 +3946,34 @@ struct PCBEditorView: View {
     }
 }
 
-// MARK: - Apple Pencil hover bridge (part 5.0.1)
+// MARK: - Apple Pencil hover bridges (parts 5.0.1 + 5.0.2)
 
-/// UIKit hover delivery for the PCB canvas.
+/// UIKit hover delivery for the PCB canvas — CHANNEL 1 (overlay).
 ///
 /// Apple Pencil hover reaches apps through UIHoverGestureRecognizer
 /// (Apple's input team built Pencil hover on the pointer APIs —
 /// UIPointerInteraction / UIHoverGestureRecognizer; iPadOS 16.4+
 /// extended the recognizer to report the pencil tip's location).
-/// This view is the canvas's hover source:
 ///
-/// - It exactly overlays the canvas and NEVER hit-tests
-///   (`hitTest` -> nil), so every touch falls through to the
-///   SwiftUI canvas and its drag/pinch gestures, untouched.
-/// - It carries a UIHoverGestureRecognizer of its own, and —
-///   because hover events are delivered to the recognizers of the
-///   HIT view and its ANCESTORS, and a hit-test-transparent view
-///   is never the hit view — it also lends recognizers to its
-///   first ancestors (the container views it shares with the
-///   canvas), which ARE in the delivery chain. Every recognizer
-///   reports locations converted into THIS view's coordinates,
-///   and positions outside this view's bounds are reported as
-///   "hover ended", so stray events from hovering the panels
-///   can't leak in. Duplicate reports from several recognizers
-///   are identical values, applied idempotently.
-/// - Callbacks deliver canvas-space points (or nil when the
-///   hover ends); the editor converts to board coordinates and
-///   feeds BoardPointerState — the same stream the touch path
-///   feeds. No pencil / no hover hardware = no events, and the
-///   editor behaves exactly as the plain touch editor.
+/// v5.0.1's version of this view returned nil from hitTest
+/// UNCONDITIONALLY. That kept it touch-transparent — and also
+/// excluded it from HOVER hit-testing, so its own recognizer
+/// could never fire (delivery rested entirely on recognizers lent
+/// to its first ancestors; on Sean's hardware nothing arrived —
+/// "Hover still dead", 2026-11-01 20:10; full forensics in
+/// CONTRACTS.md "Part 5.0.2"). This version is SELECTIVELY
+/// transparent: `hitTest` returns SELF for hover events
+/// (`UIEvent.EventType.hover`) and nil for everything else. The
+/// overlay now participates in hover hit-testing — its own
+/// recognizer sits in the hit chain and fires — while every touch
+/// still falls through to the SwiftUI canvas and its drag/pinch
+/// gestures, untouched.
+///
+/// Callbacks deliver canvas-space points (or nil when the hover
+/// ends); the editor tags them `.overlay`, converts to board
+/// coordinates, and feeds the one pointer stream. Two further
+/// independent channels (ancestor recognizer, SwiftUI
+/// .onContinuousHover) feed the same stream — see boardCanvas.
 private struct CanvasHoverView: UIViewRepresentable {
     var onHover: (CGPoint?) -> Void
 
@@ -3915,8 +3994,8 @@ private struct CanvasHoverView: UIViewRepresentable {
     final class HoverView: UIView {
         var onHover: ((CGPoint?) -> Void)?
         private var ownRecognizer: UIHoverGestureRecognizer?
-        private var lentRecognizers: [ObjectIdentifier: UIHoverGestureRecognizer] = [:]
         private var hoverInside = false
+        private var armedLogged = false
 
         override init(frame: CGRect) {
             super.init(frame: frame)
@@ -3930,41 +4009,25 @@ private struct CanvasHoverView: UIViewRepresentable {
         @available(*, unavailable)
         required init?(coder: NSCoder) { fatalError("not used") }
 
-        /// Transparent to touches: the canvas below receives
-        /// every touch; this view exists for hover geometry only.
+        /// Selectively transparent: SELF for hover events (so
+        /// this view is the hover hit view and its recognizer
+        /// fires), nil for touch events (so every touch falls
+        /// through to the canvas below, exactly as before).
         override func hitTest(_ point: CGPoint,
-                              with event: UIEvent?) -> UIView? { nil }
-
-        override func didMoveToSuperview() {
-            super.didMoveToSuperview()
-            lendRecognizersToAncestors()
+                              with event: UIEvent?) -> UIView? {
+            guard let event, event.type == .hover else { return nil }
+            return bounds.contains(point) ? self : nil
         }
 
-        /// Attach one hover recognizer to each of the first few
-        /// ancestors (they are the canvas view's ancestors too, so
-        /// they sit in the hover delivery chain). Idempotent.
-        private func lendRecognizersToAncestors() {
-            var ancestor = superview
-            var depth = 0
-            while let view = ancestor, depth < 3 {
-                let key = ObjectIdentifier(view)
-                if lentRecognizers[key] == nil {
-                    let recognizer = UIHoverGestureRecognizer(
-                        target: self, action: #selector(handleHover(_:)))
-                    view.addGestureRecognizer(recognizer)
-                    lentRecognizers[key] = recognizer
-                }
-                ancestor = view.superview
-                depth += 1
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window != nil && !armedLogged {
+                armedLogged = true
+                print("PADCB-HOVER armed ch=1 (overlay hover-hit-testable)")
             }
         }
 
         func detach() {
-            let lent = lentRecognizers
-            lentRecognizers = [:]
-            for (_, recognizer) in lent {
-                recognizer.view?.removeGestureRecognizer(recognizer)
-            }
             onHover = nil
         }
 
@@ -3988,3 +4051,211 @@ private struct CanvasHoverView: UIViewRepresentable {
         }
     }
 }
+
+/// UIKit hover delivery — CHANNEL 2 (canvas hosting ancestry).
+///
+/// A probe view placed in the canvas's `.background` (the CANVAS
+/// side of the hierarchy, same frame as the canvas). When it
+/// enters a window it walks its superview chain to the TOPMOST
+/// view below the window — the UIHostingController's root view,
+/// the one ancestor EVERY view in the window's content shares —
+/// and attaches ONE UIHoverGestureRecognizer there. Hover events
+/// are delivered to the recognizers of the hit view and its
+/// ancestors; the root view is an ancestor of every hit view, so
+/// this recognizer receives every hover event in the window while
+/// it is attached. Locations are converted into the probe's
+/// (canvas) coordinates and positions outside the canvas report
+/// "hover ended", so hovering panels (or another screen sharing
+/// the window while this editor exists) can't leak points in.
+///
+/// The probe itself never hit-tests (nil always): it is behind
+/// the canvas and must not intercept touches OR hover — channel 2
+/// lives entirely on the ancestor recognizer. Attachment is
+/// idempotent, follows re-windowing, and is removed on dismantle
+/// and on leaving the window.
+private struct CanvasAncestorProbeView: UIViewRepresentable {
+    var onHover: (CGPoint?) -> Void
+
+    func makeUIView(context: Context) -> ProbeView {
+        let view = ProbeView()
+        view.onHover = onHover
+        return view
+    }
+
+    func updateUIView(_ view: ProbeView, context: Context) {
+        view.onHover = onHover
+    }
+
+    static func dismantleUIView(_ view: ProbeView, coordinator: ()) {
+        view.detach()
+    }
+
+    final class ProbeView: UIView {
+        var onHover: ((CGPoint?) -> Void)?
+        private var recognizer: UIHoverGestureRecognizer?
+        private weak var attachedView: UIView?
+        private var hoverInside = false
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            backgroundColor = .clear
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("not used") }
+
+        /// The probe never hit-tests: touches AND hover pass
+        /// through; channel 2's recognizer lives on the root
+        /// ancestor, not here.
+        override func hitTest(_ point: CGPoint,
+                              with event: UIEvent?) -> UIView? { nil }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            attachIfNeeded()
+        }
+
+        /// Attach the one recognizer to the topmost view below
+        /// the window; detach when windowless. Idempotent.
+        private func attachIfNeeded() {
+            guard let window else {
+                detachRecognizer()
+                return
+            }
+            var top: UIView = self
+            while let parent = top.superview, parent !== window {
+                top = parent
+            }
+            // `top` is now the window's content root (or self if
+            // the probe were ever a direct window subview).
+            if recognizer != nil, attachedView === top { return }
+            detachRecognizer()
+            let recognizer = UIHoverGestureRecognizer(
+                target: self, action: #selector(handleHover(_:)))
+            top.addGestureRecognizer(recognizer)
+            self.recognizer = recognizer
+            attachedView = top
+            print("PADCB-HOVER armed ch=2 (recognizer on "
+                + "\(type(of: top)))")
+        }
+
+        private func detachRecognizer() {
+            if let recognizer {
+                recognizer.view?.removeGestureRecognizer(recognizer)
+            }
+            recognizer = nil
+            attachedView = nil
+        }
+
+        func detach() {
+            detachRecognizer()
+            onHover = nil
+        }
+
+        @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+            switch recognizer.state {
+            case .began, .changed:
+                let location = recognizer.location(in: self)
+                if bounds.contains(location) {
+                    hoverInside = true
+                    onHover?(location)
+                } else if hoverInside {
+                    hoverInside = false
+                    onHover?(nil)
+                }
+            case .ended, .cancelled, .failed:
+                hoverInside = false
+                onHover?(nil)
+            default:
+                break
+            }
+        }
+    }
+}
+
+#if DEBUG
+// MARK: - Simulator hover exercise seed (part 5.0.2, DEBUG only)
+
+/// Support for the simulator hover exercise (tools/hover_check.py):
+/// a Debug build launched with `-padcbHoverCheck` seeds a tiny
+/// fixture connection table through the REAL encrypted store (if
+/// none exists) and opens the PCB editor straight onto it, so the
+/// exercise can drive the actual editor canvas with the host
+/// mouse. Compiled out of Release builds (the hover-check
+/// workflow passes SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG;
+/// the IPA build does not), and unreachable without the launch
+/// argument even in Debug.
+enum HoverCheckSeed {
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.arguments.contains("-padcbHoverCheck")
+    }
+
+    static func seedIfNeeded() {
+        guard ConnectionTableStore.availableTables().isEmpty else { return }
+        let r1 = UUID()
+        let r2 = UUID()
+        func endpoint(_ id: UUID, _ ref: String, _ pin: String) -> ConnectionEndpoint {
+            ConnectionEndpoint(instanceID: id, reference: ref, unit: 1,
+                               library: "Device", symbolName: "R",
+                               pinNumber: pin, pinName: "~",
+                               pinType: "passive")
+        }
+        func component(_ id: UUID, _ ref: String) -> ConnectionComponent {
+            ConnectionComponent(
+                instanceID: id, reference: ref, unit: 1,
+                library: "Device", symbolName: "R", value: "10k",
+                footprintReference: "Resistor_SMD:R_0603_1608Metric",
+                resolvedFootprintKey: "Resistor_SMD:R_0603_1608Metric",
+                footprintMatchKind: "property")
+        }
+        let table = ConnectionTable(
+            formatVersion: ConnectionTable.currentFormatVersion,
+            schematicTitle: "HoverCheck",
+            sourceFileName: "HoverCheck.kicad_sch",
+            generatedAt: Date(),
+            components: [component(r1, "R1"), component(r2, "R2")],
+            nets: [
+                ConnectionNet(name: "NET_A", aliases: [],
+                              endpoints: [endpoint(r1, "R1", "1"),
+                                          endpoint(r2, "R2", "1")]),
+                ConnectionNet(name: "NET_B", aliases: [],
+                              endpoints: [endpoint(r1, "R1", "2"),
+                                          endpoint(r2, "R2", "2")]),
+            ],
+            unresolvedSymbols: [])
+        do {
+            let url = try ConnectionTableStore.save(
+                table,
+                forSchematicFile: URL(fileURLWithPath: "HoverCheck.kicad_sch"))
+            print("PADCB-HOVER seeded fixture table: \(url.lastPathComponent)")
+        } catch {
+            print("PADCB-HOVER seed FAILED: \(error)")
+        }
+    }
+}
+
+/// Root for the hover exercise: seed first, then the real PCB
+/// editor (its own tasks bootstrap the stores and load the table
+/// through the normal path).
+struct HoverCheckRootView: View {
+    @State private var seeded = false
+
+    var body: some View {
+        Group {
+            if seeded {
+                PCBEditorView()
+            } else {
+                ZStack {
+                    Color(white: 0.08).ignoresSafeArea()
+                    Text("Seeding hover-check board…")
+                        .foregroundStyle(.white.opacity(0.7))
+                }
+            }
+        }
+        .task {
+            HoverCheckSeed.seedIfNeeded()
+            seeded = true
+        }
+    }
+}
+#endif
