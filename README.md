@@ -24,7 +24,8 @@ bundled as data under their license (see [Licensing](#licensing)).
 
 The app opens to two buttons — **Schematic Editor** and **PCB Editor** — and
 is built in parts, each one verified against the real KiCad libraries before
-it ships.
+it ships. It is an iPad app: on iPhone it shows a short "You need an iPad
+for this to work" notice instead of the editors (added in v3.1).
 
 ## Screenshots
 
@@ -49,8 +50,10 @@ it ships.
 | **Part 1** (v1.3) | Schematic editor: KiCad-style canvas, toolbars, symbol chooser with previews, pin-to-pin drag wiring, labels, datasheets — with the full KiCad 10.0.1 symbol libraries bundled | ✅ Shipped |
 | **Part 2** (v2.0) | File sharing, your own imported symbol libraries, encrypted connection table saved with every schematic, `.kicad_mod` footprint parser + browser, full KiCad footprint libraries bundled | ✅ Shipped |
 | **Part 3** (v3.0) | Instant search, KiCad-model symbol↔footprint matching, PCB editor shell, and schematic→PCB correspondence (the PCB editor reads the connection table and binds every pin to its footprint pad) | ✅ Shipped |
+| **Part 3.1** (v3.1) | iPhone gate — on iPhone the app shows only the "You need an iPad for this to work" notice (the iPad app is unchanged) — and **Sync from Schematic** in the PCB editor: re-read the schematic's latest *saved* encrypted connection table and rebuild the board from it, the old board staying on screen until the new one is ready (BoardFixture 57/57) | ✅ Shipped |
 | **Part 4** (v4.0) | The PCB editor becomes a working editor: move/delete footprints, route resizeable traces (45° bends, per-net), draw lines/arcs/circles/text, highlight nets, real layer/object visibility, zoom to 6000%, and boards that persist per schematic and merge (never wipe) on Sync from Schematic | ✅ Shipped |
-| **Part 5** (v5.0) | PCB depth pass: adjustable snap grid (in mils) on everything, multi-select with trace-length totals, any-layer active + configurable copper layer count, vias, copper fill zones, Flip Side (F.Cu↔B.Cu with true footprint mirroring), Pencil hover routing preview, bottom trace-width slider, and three checking tiers — live clearance check, a deterministic Manufacturing Check, and a Theory Check with an optional fully on-device AI pass | ✅ Shipped |
+| **Part 4.0.1** (v4.0.1) | App icon only: the icon's LED light-emission arrows now point down-right at 45° with pointed triangular heads. No app changes | ✅ Shipped |
+| **Part 5** (v5.0) | PCB depth pass: adjustable snap grid (in mils) on everything, multi-select with trace-length totals, any-layer active + configurable copper layer count, vias, copper fill zones, Flip Side (F.Cu↔B.Cu with true footprint mirroring), Pencil hover routing preview, bottom trace-width slider, and three checking tiers — live clearance check, a deterministic Manufacturing Check, and a Theory Check whose optional on-device AI tier is experimental (availability-proven only) | ✅ Shipped |
 | **Part 5.0.1** (v5.0.1) | Pencil hover rebuilt on KiCad's interactive-router model: v5.0's hover preview froze at the first tap (a never-cleared touch point masked every hover update — diagnosed from the shipped code). Now hover and touch feed ONE pointer stream, delivered by a real UIKit `UIHoverGestureRecognizer` bridge; the routing preview is pad-anchored with a 45° corner and grid snap exactly like KiCad's router head, the pad under the pencil lights up (red when joining it would cross nets), and the previewed point is provably the point a tap commits (BoardFixture 205/205) | ✅ Shipped |
 | **Part 5.0.2** (v5.0.2) | Pencil hover, delivery round: v5.0.1's model was right but its single delivery path delivered nothing on hardware (forensics: a hit-test-transparent overlay's own recognizer is excluded from hover hit-testing too — dead by construction — and its recognizers lent to near ancestors were a gamble on the framework's private view hierarchy). Hover now arrives on THREE independent channels into the same pointer stream — the overlay itself (hover-hit-testable, still touch-transparent), a recognizer on the hosting hierarchy's root view, and SwiftUI's continuous-hover feed — and the PCB status bar shows live per-channel event counts ("Hover 1: n · 2: n · 3: n · (x, y)") so the working channel names itself on real hardware (BoardFixture 233/233) | ✅ Shipped |
 | **Part 5.0.3** (v5.0.3) | Pencil hover, round 3 — own the hierarchy: v5.0.2's three worked-around channels still didn't reach the Pencil Pro, so the workarounds are gone. ONE dedicated UIKit interaction view sits frontmost over the board canvas and is the hit view for hover AND touches alike, with the `UIHoverGestureRecognizer` attached directly to it (Apple's canonical pattern); it consumes no touches (the editor's drag/pinch gestures attach to the canvas+interaction composite and receive them as before — proven in the simulator exercise: the view IS the hit-test result at the canvas centre, and tap + pan still land). Click a pad, hover-draw the trace through the air, click again to confirm. One primary channel + SwiftUI's feed as counted fallback ("Hover 1: n · 2: n · (x, y)"); BoardFixture 235/235 | ✅ Shipped |
@@ -149,10 +152,46 @@ connection table and builds the board:
   traces survive, parts deleted from the board are restored and named in
   the sync report, and a trace whose net disappears stays on the board,
   flagged unconnected under Problems.
-- The correspondence — and now the merge, trace, visibility and zoom
-  rules — is proven off-device by a fixture board (schematic → encrypted
-  table → board model → merged board state, every step asserted):
-  **110/110 checks**.
+- **Part 5 depth:** an adjustable snap grid in mils (default 25) applies to
+  routing, component moves and drawing; a slider at the bottom of the
+  screen sets trace width (0.1–2.0 mm) while you route; selected traces
+  report their lengths, with per-net totals in Statistics; multi-select
+  covers footprints, traces, graphics and text together (group delete for
+  all of them, group drag moves the components).
+- **Layers, vias, zones:** any layer can be the active one (routing and
+  vias refuse non-copper layers); the copper layer count is configurable
+  (2–32) and reducing it never deletes anything — items on a removed layer
+  are kept, hidden and listed under Problems. **Flip Side** moves a
+  footprint between front and back copper only, mirrored properly (pin 1
+  stays on pad 1). **Vias** are placed on a net and span the copper
+  layers. **Copper fill zones** take a polygon and a net, with clearance
+  visually cut around foreign copper — honestly a visual cut, **not a
+  true polygon pour** (no thermal reliefs).
+- **Checking, live while you work:** a clearance checker (default 8 mil,
+  adjustable) names both nets and the actual gap on any violation; pins
+  are labelled **Disconnected** (no net) vs **Unrouted** (a net, but no
+  copper yet); the **Manufacturing Check** runs 8 fixed deterministic
+  rules; the **Theory Check** runs real heuristics, plus an optional
+  on-device AI tier (Apple's FoundationModels) that is labelled
+  experimental in the app — only its availability detection is proven,
+  and nothing more is claimed for it.
+- **Segment editing (v5.1):** a trace is edited as a chain of segments,
+  KiCad-style. A tap selects the single segment under it (the readout
+  shows that segment's own length); corner handles drag to bend the
+  track, a segment drags sideways while its neighbours stretch, and
+  double-tap adds a corner on a track being edited (or selects a freshly
+  opened track whole). Deleting a segment splits the track in two at the
+  gap — the checks flag the break — and deleting a corner joins its two
+  segments straight.
+- **Pencil hover routing (v5.0.1–v5.0.3):** routing follows KiCad's
+  interactive-router model — click a pad, hover with the Apple Pencil to
+  draw the preview route through the air, click again to commit the
+  point you previewed; the status bar counts hover events per delivery
+  channel.
+- The correspondence — and now the merge, trace, layer, clearance and
+  segment-editing rules — is proven off-device by a fixture board
+  (schematic → encrypted table → board model → merged board state, every
+  step asserted): **294/294 checks**.
 
 ## How it works
 
@@ -244,4 +283,4 @@ libraries on a Mac.
 ---
 
 *PadCB is built in parts; this README describes the current shipped state
-(v3.0).*
+(v5.1).*

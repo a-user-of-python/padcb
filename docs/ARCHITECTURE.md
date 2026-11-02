@@ -1,7 +1,7 @@
 # PadCB architecture
 
 How the app is put together. Everything here describes the current shipped
-state (v3.0). For the user-facing overview, see the [README](../README.md).
+state (v5.1). For the user-facing overview, see the [README](../README.md).
 
 ## Shape of the app
 
@@ -21,7 +21,7 @@ Documents folders and in-app lists.
 | Search | `SearchEngine.swift` | The only search path in both browsers: precomputed canonical UTF-8 byte-blob indexes, single-pass bucketed ranking, run off the main thread with debounce and stale-result rejection |
 | Matching | `FootprintMatcher.swift` | Symbol↔footprint association (model below) |
 | Connection tables | `ConnectionTable.swift`, `ConnectionTableStore.swift`, `ConnectionDebugView.swift` | The encrypted netlist written on every save, its Keychain-backed store, and the temporary home-screen debug view |
-| PCB editor | `PCBBoardModel.swift`, `PCBEditorView.swift` | Board model built from a decrypted table (pin↔pad binding, anomaly list) and the KiCad-style editor shell that displays it |
+| PCB editor | `PCBBoardModel.swift`, `PCBBoardState.swift`, `PCBDesignChecks.swift`, `TheoryAIBridge.swift`, `PCBEditorView.swift` | Correspondence model built from a decrypted table (pin↔pad binding, anomaly list); the editable board state — footprints, traces and their segments, vias, zones, copper layers — persisted per connection table and merged on sync; the deterministic Manufacturing Check, the heuristic Theory Check and its experimental on-device AI bridge; and the KiCad-style editor itself |
 
 ## The proof machinery
 
@@ -34,7 +34,7 @@ compile the app's **real** sources headlessly — never a re-implementation:
 | *Footprint Audit* | `tools/FootprintDump`, `tools/FootprintCensus` | The app's footprint parser reads fixtures and the full bundled corpus: **15,430 / 15,430 footprints, 0 failures** (386,124 pads) |
 | *Part 3 Audit* | `tools/SearchBench` | A fixed 132-query battery over both corpora asserts the new search returns **identical result sets** to the previous implementation, and reports timings |
 |  | `tools/MatchCensus` | Runs the real matcher over the whole bundled corpus and reports coverage in real counts, plus cross-namespace (bundled ↔ custom) fixture assertions |
-|  | `tools/BoardFixture` | A fixture schematic → encrypted table → board model, with every pin→net→pad binding asserted by construction (43 assertions), including pin 1 on the exact pad-1 geometry and a part whose symbol *and* footprint both come from custom libraries |
+|  | `tools/BoardFixture` | A fixture schematic → encrypted table → board model, with every pin→net→pad binding asserted by construction (294 assertions, since extended to sync-merge, traces, layers and segment editing), including pin 1 on the exact pad-1 geometry and a part whose symbol *and* footprint both come from custom libraries |
 | *Build IPA* | — | Builds the unsigned IPA and verifies the bundle: bundle id, file-sharing keys, bundled library counts |
 
 ## The connection table
