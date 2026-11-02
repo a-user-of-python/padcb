@@ -1268,3 +1268,207 @@ extension BoardGeometry {
                              : point)
     }
 }
+
+// MARK: - Trace segment editing (part 5.1)
+//
+// Sean (2026-11-01 21:39): "when you click on a trace, it selects
+// the entire thing — make it into different lines that go from
+// one point to another, kind of like KiCad does." KiCad's model:
+// a track is a chain of individual SEGMENTS joined at vertices
+// (corners); you select and edit it segment by segment. The
+// persisted form does NOT change — a trace stays one polyline
+// (`BoardTrace.points`) — but every editing operation below works
+// at segment/vertex granularity, exactly like the routing code
+// above works at pad granularity.
+//
+// All of it is pure point algebra on BoardTrace values, so the
+// BoardFixture harness proves the same functions the editor's
+// gestures call. Snapping is the CALLER's job (the editor snaps
+// the drag target with BoardGrid before calling, like every other
+// move); these functions take final points.
+
+/// One segment of a trace: segment `index` runs from
+/// `points[index]` to `points[index + 1]`.
+struct BoardSegmentRef: Equatable, Hashable {
+    var traceID: UUID
+    var index: Int
+}
+
+/// One vertex (corner point) of a trace: `points[index]`.
+struct BoardVertexRef: Equatable, Hashable {
+    var traceID: UUID
+    var index: Int
+}
+
+extension BoardTrace {
+    /// How many segments the polyline has (points − 1).
+    var segmentCount: Int { max(0, points.count - 1) }
+
+    /// Length of segment `index` in mm.
+    func segmentLength(_ index: Int) -> Double {
+        points[index].distance(to: points[index + 1])
+    }
+}
+
+extension BoardGeometry {
+
+    /// The point of segment a→b closest to `point` — the
+    /// projection, clamped to the segment's ends.
+    static func closestPointOnSegment(_ point: FPPoint,
+                                      from a: FPPoint,
+                                      to b: FPPoint) -> FPPoint {
+        let abx = b.x - a.x, aby = b.y - a.y
+        let lengthSquared = abx * abx + aby * aby
+        if lengthSquared < 1e-12 { return a }
+        var t = ((point.x - a.x) * abx + (point.y - a.y) * aby) / lengthSquared
+        t = min(max(t, 0), 1)
+        return FPPoint(x: a.x + t * abx, y: a.y + t * aby)
+    }
+
+    /// The nearest segment of ONE trace within reach of `point`,
+    /// or nil. Reach is the segment analogue of `traceHit`: the
+    /// tap tolerance or half the copper width, whichever reaches
+    /// further. On an exact tie the LOWEST index wins (a tap on a
+    /// shared vertex belongs to the segment that ends there as
+    /// much as the one that starts there — the editor checks
+    /// vertices first when it cares).
+    static func segmentHit(_ trace: BoardTrace, point: FPPoint,
+                           tolerance: Double)
+        -> (index: Int, distance: Double)? {
+        let reach = max(tolerance, trace.width / 2)
+        guard trace.points.count > 1 else { return nil }
+        var best: (index: Int, distance: Double)? = nil
+        for index in 0..<trace.segmentCount {
+            let d = distance(point: point,
+                             segmentStart: trace.points[index],
+                             segmentEnd: trace.points[index + 1])
+            guard d <= reach else { continue }
+            if best == nil || d < best!.distance - 1e-12 {
+                best = (index, d)
+            }
+        }
+        return best
+    }
+
+    /// The nearest segment across a set of traces (the editor
+    /// passes the VISIBLE ones): the smallest distance wins, and
+    /// on a tie the trace LATER in the array wins — later traces
+    /// draw on top, so the tap belongs to the one Sean sees.
+    static func segmentAt(_ traces: [BoardTrace], point: FPPoint,
+                          tolerance: Double)
+        -> (trace: BoardTrace, index: Int, distance: Double)? {
+        var best: (trace: BoardTrace, index: Int, distance: Double)? = nil
+        for trace in traces {
+            guard let hit = segmentHit(trace, point: point,
+                                       tolerance: tolerance)
+            else { continue }
+            if best == nil || hit.distance <= best!.distance + 1e-12 {
+                best = (trace, hit.index, hit.distance)
+            }
+        }
+        return best
+    }
+
+    /// The nearest vertex of one trace within `tolerance`, or
+    /// nil. Vertices are points, so there is no width term — the
+    /// editor passes a handle-sized tolerance.
+    static func vertexHit(_ trace: BoardTrace, point: FPPoint,
+                          tolerance: Double)
+        -> (index: Int, distance: Double)? {
+        var best: (index: Int, distance: Double)? = nil
+        for (index, vertex) in trace.points.enumerated() {
+            let d = vertex.distance(to: point)
+            guard d <= tolerance else { continue }
+            if best == nil || d < best!.distance - 1e-12 {
+                best = (index, d)
+            }
+        }
+        return best
+    }
+
+    // -- Edit algebra (pure: trace in, trace out) --
+
+    /// Move one vertex to a new point. The two adjacent segments
+    /// follow (they share the point); an endpoint move stretches
+    /// its one segment. Nothing else about the trace changes.
+    static func traceWithVertexMoved(_ trace: BoardTrace, vertex: Int,
+                                     to point: FPPoint) -> BoardTrace {
+        guard trace.points.indices.contains(vertex) else { return trace }
+        var edited = trace
+        edited.points[vertex] = point
+        return edited
+    }
+
+    /// Translate one segment by `delta`: BOTH its endpoints move
+    /// by the same delta, so the segment keeps its length and
+    /// angle, and the neighbouring segments stretch straight to
+    /// the new endpoints (KiCad's segment drag).
+    static func traceWithSegmentMoved(_ trace: BoardTrace, segment: Int,
+                                      by delta: FPPoint) -> BoardTrace {
+        guard segment >= 0, segment < trace.segmentCount else { return trace }
+        var edited = trace
+        edited.points[segment] = FPPoint(x: edited.points[segment].x + delta.x,
+                                         y: edited.points[segment].y + delta.y)
+        edited.points[segment + 1] = FPPoint(
+            x: edited.points[segment + 1].x + delta.x,
+            y: edited.points[segment + 1].y + delta.y)
+        return edited
+    }
+
+    /// Insert a vertex on `segment` at `point`, splitting it into
+    /// two segments. The caller resolves `point` (the editor
+    /// projects the tap onto the segment, then snaps).
+    static func traceWithVertexInserted(_ trace: BoardTrace, segment: Int,
+                                        at point: FPPoint) -> BoardTrace {
+        guard segment >= 0, segment < trace.segmentCount else { return trace }
+        var edited = trace
+        edited.points.insert(point, at: segment + 1)
+        return edited
+    }
+
+    /// Remove one vertex: its two neighbouring segments join
+    /// straight (an endpoint removal just shortens the trace).
+    /// Returns nil when the trace would be left with fewer than
+    /// 2 points — a 2-point trace loses its only segment, so the
+    /// trace itself goes (the editor maps nil to removal, the
+    /// same way KiCad deletes a track whose last segment goes).
+    static func traceWithVertexRemoved(_ trace: BoardTrace, vertex: Int)
+        -> BoardTrace? {
+        guard trace.points.indices.contains(vertex) else { return trace }
+        var edited = trace
+        edited.points.remove(at: vertex)
+        return edited.points.count >= 2 ? edited : nil
+    }
+
+    /// Remove a SET of segments from one trace, splitting it at
+    /// the gaps: each maximal run of surviving segments becomes
+    /// its own trace with the SAME net (or remembered net), layer
+    /// and width. The FIRST surviving piece keeps the original
+    /// trace id (selection/identity continuity); later pieces get
+    /// fresh ids. Removing every segment removes the trace.
+    /// Indices are the trace's CURRENT segment indices.
+    static func tracesByRemovingSegments(_ trace: BoardTrace,
+                                         indices: Set<Int>) -> [BoardTrace] {
+        let count = trace.segmentCount
+        guard count > 0 else { return [trace] }
+        var pieces: [BoardTrace] = []
+        var runStart: Int? = nil
+        func closeRun(upToSegment end: Int) {
+            guard let start = runStart else { return }
+            var piece = trace
+            piece.points = Array(trace.points[start...(end + 1)])
+            if !pieces.isEmpty { piece.id = UUID() }
+            pieces.append(piece)
+            runStart = nil
+        }
+        for segment in 0..<count {
+            if indices.contains(segment) {
+                closeRun(upToSegment: segment - 1)
+            } else if runStart == nil {
+                runStart = segment
+            }
+        }
+        closeRun(upToSegment: count - 1)
+        return pieces
+    }
+}

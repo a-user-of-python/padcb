@@ -1496,6 +1496,379 @@ check(sean.pointer.currentPoint == FPPoint(x: 9, y: 4)
       && sean.diagnostics.count(.interaction) == 2,
       "interaction: after the confirming click the hover point persists under the lifted pencil")
 
+// MARK: - Part 5.1: trace segment editing
+//
+// Sean (2026-11-01 21:39): clicking a trace selected the whole
+// thing; he wants KiCad's model — a track is a chain of segments
+// joined at corners, edited segment by segment. The persisted
+// form is unchanged (one polyline); the operations below are
+// the pure algebra PCBEditorView's gestures call, proven here
+// in PCBBoardState.swift's BoardGeometry extension.
+
+// A 3-segment track: three 10 mm runs in an L + step shape.
+let segTraceID = fixedUUID("51515151-5151-4151-8151-515151515151")
+let segTrace = BoardTrace(
+    id: segTraceID, netName: "NET_A", layer: "F.Cu", width: 0.25,
+    points: [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 0),
+             FPPoint(x: 10, y: 10), FPPoint(x: 20, y: 10)])
+
+// -- Segment basics --
+check(segTrace.segmentCount == 3,
+      "segments: a 4-point track has 3 segments")
+check(approx(segTrace.segmentLength(0), 10)
+      && approx(segTrace.segmentLength(1), 10)
+      && approx(segTrace.segmentLength(2), 10)
+      && approx(segTrace.length, 30),
+      "segments: each run is 10 mm, the whole track 30 mm")
+check(BoardGeometry.closestPointOnSegment(
+        FPPoint(x: 5, y: 3), from: FPPoint(x: 0, y: 0), to: FPPoint(x: 10, y: 0))
+      == FPPoint(x: 5, y: 0),
+      "segments: the closest point is the perpendicular projection")
+check(BoardGeometry.closestPointOnSegment(
+        FPPoint(x: -4, y: 2), from: FPPoint(x: 0, y: 0), to: FPPoint(x: 10, y: 0))
+      == FPPoint(x: 0, y: 0)
+      && BoardGeometry.closestPointOnSegment(
+        FPPoint(x: 14, y: 2), from: FPPoint(x: 0, y: 0), to: FPPoint(x: 10, y: 0))
+      == FPPoint(x: 10, y: 0),
+      "segments: the projection clamps to the segment's ends")
+
+// -- Segment hit-testing (nearest wins, tolerance edges) --
+let hitA = BoardGeometry.segmentHit(segTrace, point: FPPoint(x: 5, y: 0.4),
+                                    tolerance: 0.8)
+check(hitA?.index == 0 && approx(hitA?.distance ?? -1, 0.4),
+      "segment hit: a tap over the first run picks segment 0")
+let hitB = BoardGeometry.segmentHit(segTrace, point: FPPoint(x: 10.4, y: 5),
+                                    tolerance: 0.8)
+check(hitB?.index == 1 && approx(hitB?.distance ?? -1, 0.4),
+      "segment hit: a tap over the vertical run picks segment 1")
+check(BoardGeometry.segmentHit(segTrace, point: FPPoint(x: 15, y: 10.3),
+                               tolerance: 0.8)?.index == 2,
+      "segment hit: a tap over the last run picks segment 2")
+check(BoardGeometry.segmentHit(segTrace, point: FPPoint(x: 9.8, y: -0.2),
+                               tolerance: 0.8)?.index == 0,
+      "segment hit: near a corner the NEAREST segment wins (0.2 mm beats 0.28 mm)")
+check(BoardGeometry.segmentHit(segTrace, point: FPPoint(x: 10, y: 0),
+                               tolerance: 0.8)?.index == 0,
+      "segment hit: an exact tie at a shared vertex goes to the lower index")
+check(BoardGeometry.segmentHit(segTrace, point: FPPoint(x: 5, y: 0.85),
+                               tolerance: 0.8) == nil
+      && BoardGeometry.segmentHit(segTrace, point: FPPoint(x: 5, y: 0.75),
+                                  tolerance: 0.8)?.index == 0,
+      "segment hit: beyond reach (0.85 > 0.8) misses, inside (0.75) hits")
+var wideTrace = segTrace
+wideTrace.width = 2.0
+check(BoardGeometry.segmentHit(wideTrace, point: FPPoint(x: 5, y: 0.95),
+                               tolerance: 0.8)?.index == 0,
+      "segment hit: a wide track's reach is half its width (1.0 mm beats the 0.8 tolerance)")
+
+// -- Segment picking across traces --
+let otherTrace = BoardTrace(
+    id: fixedUUID("52525252-5252-4252-8252-525252525252"),
+    netName: "VCC", layer: "F.Cu", width: 0.25,
+    points: [FPPoint(x: 0, y: 0.5), FPPoint(x: 10, y: 0.5)])
+let pickA = BoardGeometry.segmentAt([segTrace, otherTrace],
+                                    point: FPPoint(x: 5, y: 0.1),
+                                    tolerance: 0.8)
+check(pickA?.trace.id == segTraceID && pickA?.index == 0,
+      "segment pick: the nearest segment wins even when its trace comes first")
+let pickTie = BoardGeometry.segmentAt([segTrace, otherTrace],
+                                      point: FPPoint(x: 5, y: 0.25),
+                                      tolerance: 0.8)
+check(pickTie?.trace.id == otherTrace.id,
+      "segment pick: an exact tie goes to the LATER trace (it draws on top)")
+check(BoardGeometry.segmentAt([segTrace, otherTrace],
+                              point: FPPoint(x: 500, y: 500),
+                              tolerance: 0.8) == nil,
+      "segment pick: empty space picks nothing")
+
+// -- Vertex hit-testing --
+let vertexHit = BoardGeometry.vertexHit(segTrace, point: FPPoint(x: 10.3, y: 0.2),
+                                        tolerance: 0.8)
+check(vertexHit?.index == 1 && approx(vertexHit?.distance ?? -1, sqrt(0.13)),
+      "vertex hit: the corner beside the tap is found (index 1)")
+check(BoardGeometry.vertexHit(segTrace, point: FPPoint(x: 0.1, y: -0.1),
+                              tolerance: 0.8)?.index == 0,
+      "vertex hit: the first endpoint is a vertex too")
+check(BoardGeometry.vertexHit(segTrace, point: FPPoint(x: 100, y: 100),
+                              tolerance: 0.8) == nil,
+      "vertex hit: far from every corner = no vertex")
+
+// -- Vertex drag algebra (interior + endpoints) --
+let bentTrace = BoardGeometry.traceWithVertexMoved(
+    segTrace, vertex: 1, to: FPPoint(x: 12, y: 3))
+check(bentTrace.points == [FPPoint(x: 0, y: 0), FPPoint(x: 12, y: 3),
+                           FPPoint(x: 10, y: 10), FPPoint(x: 20, y: 10)],
+      "vertex move: an interior corner moves, every other point stays")
+check(approx(bentTrace.segmentLength(0), sqrt(153.0))
+      && approx(bentTrace.segmentLength(1), sqrt(53.0)),
+      "vertex move: both adjacent segments follow the corner (lengths √153, √53)")
+check(BoardGeometry.traceWithVertexMoved(
+        segTrace, vertex: 0, to: FPPoint(x: -5, y: -5)).points.first
+      == FPPoint(x: -5, y: -5),
+      "vertex move: the first endpoint moves freely (it may leave its pad)")
+check(BoardGeometry.traceWithVertexMoved(
+        segTrace, vertex: 3, to: FPPoint(x: 25, y: 10)).points.last
+      == FPPoint(x: 25, y: 10),
+      "vertex move: the last endpoint moves freely too")
+// The editor's drag composition: snap the raw target with the
+// board grid, THEN move — the corner lands on the grid exactly.
+let snappedTarget = BoardGrid.snap(FPPoint(x: 12.3, y: 3.2), gridMil: 25)
+check(BoardGeometry.traceWithVertexMoved(
+        segTrace, vertex: 1, to: snappedTarget).points[1] == snappedTarget
+      && snappedTarget != FPPoint(x: 12.3, y: 3.2),
+      "vertex move: the editor's snap-then-move composition lands on the 25 mil grid")
+
+// -- Segment drag algebra --
+let slidTrace = BoardGeometry.traceWithSegmentMoved(
+    segTrace, segment: 1, by: FPPoint(x: 2, y: -3))
+check(slidTrace.points == [FPPoint(x: 0, y: 0), FPPoint(x: 12, y: -3),
+                           FPPoint(x: 12, y: 7), FPPoint(x: 20, y: 10)],
+      "segment move: BOTH endpoints translate by the delta, the rest stay")
+check(approx(slidTrace.segmentLength(1), 10)
+      && approx(slidTrace.segmentLength(0), sqrt(153.0)),
+      "segment move: the moved segment keeps its length; the neighbour stretches")
+
+// -- Vertex insertion --
+let splitOnce = BoardGeometry.traceWithVertexInserted(
+    segTrace, segment: 0, at: FPPoint(x: 4, y: 0))
+check(splitOnce.points == [FPPoint(x: 0, y: 0), FPPoint(x: 4, y: 0),
+                           FPPoint(x: 10, y: 0), FPPoint(x: 10, y: 10),
+                           FPPoint(x: 20, y: 10)]
+      && splitOnce.segmentCount == 4,
+      "vertex insert: the corner lands at index 1 and the segment becomes two")
+check(approx(splitOnce.length, segTrace.length),
+      "vertex insert: an on-line corner changes no length")
+check(BoardGeometry.traceWithVertexInserted(
+        segTrace, segment: 0, at: FPPoint(x: 5, y: 2)).length > segTrace.length,
+      "vertex insert: an off-line corner lengthens the track (it really bends)")
+
+// -- Vertex removal (neighbours join straight) --
+let joinedTrace = BoardGeometry.traceWithVertexRemoved(segTrace, vertex: 1)
+check(joinedTrace?.points == [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 10),
+                              FPPoint(x: 20, y: 10)],
+      "vertex remove: an interior corner goes and its segments join straight")
+check(approx(joinedTrace?.segmentLength(0) ?? -1, sqrt(200.0)),
+      "vertex remove: the joined run is one straight √200 segment")
+check(BoardGeometry.traceWithVertexRemoved(segTrace, vertex: 0)?.points
+      == [FPPoint(x: 10, y: 0), FPPoint(x: 10, y: 10), FPPoint(x: 20, y: 10)],
+      "vertex remove: removing the first endpoint shortens the track")
+check(BoardGeometry.traceWithVertexRemoved(segTrace, vertex: 3)?.points
+      == [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 0), FPPoint(x: 10, y: 10)],
+      "vertex remove: removing the last endpoint shortens the track")
+let twoPointTrace = BoardTrace(
+    id: fixedUUID("53535353-5353-4353-8353-535353535353"),
+    netName: "NET_A", layer: "F.Cu", width: 0.25,
+    points: [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 0)])
+check(BoardGeometry.traceWithVertexRemoved(twoPointTrace, vertex: 0) == nil,
+      "vertex remove: a 2-point track loses its only segment -> the track goes (nil)")
+
+// -- Segment deletion splits the track --
+let pieces = BoardGeometry.tracesByRemovingSegments(segTrace, indices: [1])
+check(pieces.count == 2,
+      "segment delete: removing the middle segment splits the track in two")
+check(pieces[0].points == [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 0)]
+      && pieces[0].id == segTraceID,
+      "segment delete: the head piece keeps the points before the gap AND the trace id")
+check(pieces[1].points == [FPPoint(x: 10, y: 10), FPPoint(x: 20, y: 10)]
+      && pieces[1].id != segTraceID,
+      "segment delete: the tail piece keeps the points after the gap, with a fresh id")
+check(pieces.allSatisfy {
+    $0.netName == "NET_A" && $0.layer == "F.Cu" && approx($0.width, 0.25)
+}, "segment delete: both pieces keep the net, layer and width")
+check(approx(pieces.reduce(0) { $0 + $1.length } + segTrace.segmentLength(1),
+             segTrace.length),
+      "segment delete: copper is conserved — pieces + the removed run = the original length")
+let headRemoved = BoardGeometry.tracesByRemovingSegments(segTrace, indices: [0])
+check(headRemoved.count == 1
+      && headRemoved[0].points == [FPPoint(x: 10, y: 0), FPPoint(x: 10, y: 10),
+                                   FPPoint(x: 20, y: 10)]
+      && headRemoved[0].id == segTraceID,
+      "segment delete: removing the FIRST segment leaves one piece (keeps the id)")
+let tailRemoved = BoardGeometry.tracesByRemovingSegments(segTrace, indices: [2])
+check(tailRemoved.count == 1
+      && tailRemoved[0].points == [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 0),
+                                   FPPoint(x: 10, y: 10)]
+      && tailRemoved[0].id == segTraceID,
+      "segment delete: removing the LAST segment leaves one piece (keeps the id)")
+check(BoardGeometry.tracesByRemovingSegments(twoPointTrace, indices: [0]).isEmpty,
+      "segment delete: removing a 2-point track's only segment removes the track")
+let fivePointTrace = BoardTrace(
+    id: fixedUUID("54545454-5454-4454-8454-545454545454"),
+    netName: "NET_B", layer: "B.Cu", width: 0.4,
+    points: [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 0), FPPoint(x: 10, y: 10),
+             FPPoint(x: 20, y: 10), FPPoint(x: 20, y: 20)])
+let twoGaps = BoardGeometry.tracesByRemovingSegments(fivePointTrace,
+                                                     indices: [0, 2])
+check(twoGaps.count == 2
+      && twoGaps[0].points == [FPPoint(x: 10, y: 0), FPPoint(x: 10, y: 10)]
+      && twoGaps[1].points == [FPPoint(x: 20, y: 10), FPPoint(x: 20, y: 20)]
+      && twoGaps[0].id == fivePointTrace.id && twoGaps[1].id != fivePointTrace.id,
+      "segment delete: two gaps in one pass leave the two surviving runs")
+var lostNetTrace = segTrace
+lostNetTrace.netName = nil
+lostNetTrace.disconnectedNetName = "VCC"
+let lostPieces = BoardGeometry.tracesByRemovingSegments(lostNetTrace, indices: [1])
+check(lostPieces.count == 2 && lostPieces.allSatisfy {
+    $0.netName == nil && $0.disconnectedNetName == "VCC"
+}, "segment delete: pieces of an unconnected track keep its remembered net name")
+
+// -- Undo/redo round-trips, mirroring the editor exactly: one
+//    mutateBoard pushes ONE whole-state snapshot; undo pops it.
+var editState51 = BoardState()
+editState51.traces = [segTrace]
+var undoStack51: [BoardState] = []
+var redoStack51: [BoardState] = []
+func simMutate51(_ change: (inout BoardState) -> Void) {
+    undoStack51.append(editState51)
+    redoStack51.removeAll()
+    change(&editState51)
+}
+func simUndo51() {
+    redoStack51.append(editState51)
+    editState51 = undoStack51.removeLast()
+}
+func simRedo51() {
+    undoStack51.append(editState51)
+    editState51 = redoStack51.removeLast()
+}
+let originalState51 = editState51
+
+simMutate51 { state in
+    state.traces[0] = BoardGeometry.traceWithVertexMoved(
+        state.traces[0], vertex: 1, to: FPPoint(x: 12, y: 3))
+}
+check(editState51 != originalState51
+      && editState51.traces[0].points[1] == FPPoint(x: 12, y: 3),
+      "undo: a corner drag commits as one state change")
+simUndo51()
+check(editState51 == originalState51,
+      "undo: one undo restores the pre-drag track exactly")
+simRedo51()
+check(editState51.traces[0].points[1] == FPPoint(x: 12, y: 3),
+      "redo: redo replays the corner drag")
+simUndo51()
+
+simMutate51 { state in
+    state.traces[0] = BoardGeometry.traceWithSegmentMoved(
+        state.traces[0], segment: 1, by: FPPoint(x: 2, y: -3))
+}
+simUndo51()
+check(editState51 == originalState51,
+      "undo: a segment drag undoes in one step")
+
+simMutate51 { state in
+    state.traces[0] = BoardGeometry.traceWithVertexInserted(
+        state.traces[0], segment: 0, at: FPPoint(x: 4, y: 0))
+}
+simUndo51()
+check(editState51 == originalState51,
+      "undo: a corner insert undoes in one step")
+
+simMutate51 { state in
+    state.traces[0] = BoardGeometry.traceWithVertexRemoved(
+        state.traces[0], vertex: 1)!
+}
+simUndo51()
+check(editState51 == originalState51,
+      "undo: a corner removal undoes in one step")
+
+simMutate51 { state in
+    state.traces = BoardGeometry.tracesByRemovingSegments(
+        state.traces[0], indices: [1])
+}
+check(editState51.traces.count == 2,
+      "undo: the split is live before undo (2 traces)")
+simUndo51()
+check(editState51 == originalState51 && editState51.traces.count == 1,
+      "undo: one undo un-splits the track (original id and points)")
+simRedo51()
+check(editState51.traces.count == 2,
+      "redo: redo replays the split")
+simUndo51()
+
+// -- Persistence: an edited + split board round-trips exactly.
+var persistState51 = BoardState()
+persistState51.traces = BoardGeometry.tracesByRemovingSegments(
+    BoardGeometry.traceWithVertexMoved(segTrace, vertex: 1,
+                                       to: FPPoint(x: 12, y: 3)),
+    indices: [1])
+do {
+    try BoardStateStore.save(persistState51, tableStem: "fixture51",
+                             in: stateDir)
+    check(BoardStateStore.load(tableStem: "fixture51", in: stateDir) == persistState51,
+          "persistence: a bent + split board saves and reloads exactly (points, pieces, ids)")
+    let encoded = try JSONEncoder().encode(persistState51)
+    let decoded = try JSONDecoder().decode(BoardState.self, from: encoded)
+    check(decoded == persistState51,
+          "persistence: the board JSON round-trip preserves the edited traces")
+} catch {
+    check(false, "persistence: save/load threw \(error)")
+}
+
+// -- Downstream checks read the edited model (no stale caches):
+//    connectivity lengths follow a corner move and a split, and
+//    the clearance check sees a corner dragged into range.
+var downState = BoardState()
+downState.knownReferences = ["R1", "U1", "X1"]
+downState.traces = [
+    BoardTrace(id: fixedUUID("55555555-5555-4555-8555-555555555555"),
+               netName: "NET_A", layer: "F.Cu", width: 0.25,
+               points: [FPPoint(x: 300, y: 300), FPPoint(x: 310, y: 300),
+                        FPPoint(x: 310, y: 310)]),
+]
+func downConnectivity(_ state: BoardState) -> [String: NetConnectivity] {
+    BoardConnectivity.analyze(
+        model: PCBBoardMerger.apply(state: state, to: board,
+                                    isSync: false).model,
+        copperCount: 4)
+}
+check(approx(downConnectivity(downState)["NET_A"]?.traceLength ?? -1, 20),
+      "downstream: connectivity reads the track's routed length (20 mm)")
+var downMoved = downState
+downMoved.traces[0] = BoardGeometry.traceWithVertexMoved(
+    downMoved.traces[0], vertex: 1, to: FPPoint(x: 320, y: 300))
+check(approx(downConnectivity(downMoved)["NET_A"]?.traceLength ?? -1,
+             20 + sqrt(200.0)),
+      "downstream: a corner move updates the net's routed length at once")
+var downSplit = downMoved
+downSplit.traces = BoardGeometry.tracesByRemovingSegments(
+    downSplit.traces[0], indices: [0])
+check(approx(downConnectivity(downSplit)["NET_A"]?.traceLength ?? -1,
+             sqrt(200.0)),
+      "downstream: after a split, the net's length is the surviving piece's")
+
+var clearState51 = BoardState()
+clearState51.knownReferences = ["R1", "U1", "X1"]
+clearState51.traces = [
+    BoardTrace(id: fixedUUID("56565656-5656-4656-8656-565656565656"),
+               netName: "NET_A", layer: "F.Cu", width: 0.25,
+               points: [FPPoint(x: 0, y: 200), FPPoint(x: 20, y: 200)]),
+    BoardTrace(id: fixedUUID("57575757-5757-4757-8757-575757575757"),
+               netName: "VCC", layer: "F.Cu", width: 0.25,
+               points: [FPPoint(x: 0, y: 205), FPPoint(x: 20, y: 205)]),
+]
+func clearViolations51(_ state: BoardState) -> [ClearanceViolation] {
+    BoardClearance.violations(
+        model: PCBBoardMerger.apply(state: state, to: board,
+                                    isSync: false).model,
+        copperCount: 4, clearanceMM: BoardUnits.mm(fromMil: 8))
+}
+check(!clearViolations51(clearState51).contains {
+    $0.itemA.contains("trace") && $0.itemB.contains("trace")
+}, "downstream: tracks 5 mm apart raise no clearance violation")
+var clearMoved = clearState51
+clearMoved.traces[0] = BoardGeometry.traceWithVertexMoved(
+    clearMoved.traces[0], vertex: 1, to: FPPoint(x: 20, y: 204.9))
+check(clearViolations51(clearMoved).contains {
+    $0.itemA.contains("trace") && $0.itemB.contains("trace")
+    && Set([$0.netA, $0.netB]) == Set(["NET_A", "VCC"])
+}, "downstream: dragging a corner into another net's clearance flags it at once")
+
+// -- The segment subtotal readout format (Sean's Part-5 style,
+//    applied to segments): lengths print mm + mil together.
+check(BoardUnits.formatLength(mm: 42.6) == "42.6 mm · 1677.2 mil",
+      "segments: the subtotal readout formats \"42.6 mm · 1677.2 mil\"")
+
 // MARK: - Result
 
 print("BoardFixture: \(passCount) passed, \(failCount) failed")

@@ -17,6 +17,12 @@ import UIKit
 ///   (mixed selections allowed; a trace subtotal shows whenever
 ///   traces are selected). Dragging a selected component moves the
 ///   selected components together. Delete removes the selection.
+/// - Traces edit KiCad-style, segment by segment (part 5.1): a
+///   tap selects the ONE segment under it, the selected track's
+///   corners show as handles — drag a corner to bend the track,
+///   drag a segment to move it (neighbours stretch), double-tap
+///   adds a corner, and deleting a segment splits the track at
+///   the gap (the checks flag the break, like KiCad).
 /// - Route Tracks lays real, resizeable copper traces with KiCad's
 ///   45° bend rule; a width slider lives at the bottom while the
 ///   tool is active; Apple Pencil hover previews the next segment.
@@ -81,13 +87,18 @@ struct PCBEditorView: View {
     enum BoardSelection: Equatable, Hashable {
         case component(String)
         case trace(UUID)
+        /// One segment of a trace (part 5.1): segment index runs
+        /// points[index] → points[index + 1].
+        case segment(UUID, Int)
+        /// One vertex (corner) of a trace (part 5.1).
+        case vertex(UUID, Int)
         case graphic(UUID)
         case via(UUID)
         case zone(UUID)
     }
 
     private enum DragMode {
-        case undecided, pan, moveComponents, moveVia
+        case undecided, pan, moveComponents, moveVia, moveVertex, moveSegment
     }
 
     /// Which chooser the net-picker sheet is serving.
@@ -126,6 +137,32 @@ struct PCBEditorView: View {
     @State private var movingViaID: UUID? = nil
     @State private var moveViaStart: FPPoint? = nil
     @State private var moveViaPreview: FPPoint? = nil
+    /// Trace segment editing drags (part 5.1): the trace being
+    /// reshaped, the vertex/segment index grabbed, the points at
+    /// drag start, and the live preview points (committed through
+    /// mutateBoard on release = one undo step, like every move).
+    @State private var editDragTraceID: UUID? = nil
+    @State private var editDragIndex: Int = 0
+    @State private var editDragStartPoints: [FPPoint] = []
+    @State private var editDragPreviewPoints: [FPPoint]? = nil
+    /// Double-tap disambiguation (part 5.1): when a segment tap
+    /// FRESHLY selects a trace that was not being edited (primary
+    /// was not that trace's segment/vertex/whole), the tap is
+    /// remembered; a double-tap landing on that same segment
+    /// within the window selects the WHOLE trace (Sean's item 1),
+    /// while a double-tap on a trace already being edited inserts
+    /// a vertex there (item 4). Both of Sean's sentences hold —
+    /// they just can't both own a double-tap on an untouched
+    /// trace, so the first double-tap opens the trace up and
+    /// later ones add corners.
+    @State private var freshSegmentTap: (traceID: UUID, index: Int, time: Date)? = nil
+    /// When handleDoubleTap last promoted a trace to whole-track
+    /// selection: the double-tap's second press may reach the tap
+    /// path AFTER the promotion (gesture delivery order between
+    /// the drag gesture and the tap gesture is not guaranteed),
+    /// and that late tap must not narrow the selection straight
+    /// back to a segment.
+    @State private var wholeTracePromotion: (traceID: UUID, time: Date)? = nil
     /// In Multi mode, the component a press started on: if the
     /// press ends as a tap, it toggles; if it becomes a drag, the
     /// selected group moves. (Decided at drag end — see canvasDrag.)
@@ -285,6 +322,55 @@ struct PCBEditorView: View {
         return model?.zones.first { $0.id == id }
     }
 
+    /// The primary selection as ONE segment of a trace (part 5.1),
+    /// resolved against the live model (nil when the trace or the
+    /// segment index no longer exists).
+    private var selectedSegment: (trace: BoardTrace, index: Int)? {
+        guard case .segment(let id, let index)? = primarySelection,
+              let trace = model?.traces.first(where: { $0.id == id }),
+              index >= 0, index < trace.segmentCount else { return nil }
+        return (trace, index)
+    }
+
+    /// The primary selection as ONE vertex of a trace (part 5.1).
+    private var selectedVertex: (trace: BoardTrace, index: Int)? {
+        guard case .vertex(let id, let index)? = primarySelection,
+              let trace = model?.traces.first(where: { $0.id == id }),
+              trace.points.indices.contains(index) else { return nil }
+        return (trace, index)
+    }
+
+    /// The trace being segment-edited, if any: the primary
+    /// selection is that trace whole, one of its segments, or one
+    /// of its vertices. Its vertices show as handles and its
+    /// segments/vertices are draggable.
+    private var editTraceID: UUID? {
+        switch primarySelection {
+        case .trace(let id): return id
+        case .segment(let id, _): return id
+        case .vertex(let id, _): return id
+        default: return nil
+        }
+    }
+
+    private var editTrace: BoardTrace? {
+        guard let id = editTraceID else { return nil }
+        return model?.traces.first { $0.id == id }
+    }
+
+    /// The selected segments across the whole selection set
+    /// (multi-select, part 5.1), resolved against the live model.
+    private var selectedSegments: [(trace: BoardTrace, index: Int)] {
+        guard let model else { return [] }
+        return selections.compactMap { item in
+            guard case .segment(let id, let index) = item,
+                  let trace = model.traces.first(where: { $0.id == id }),
+                  index >= 0, index < trace.segmentCount
+            else { return nil }
+            return (trace, index)
+        }
+    }
+
     private var selectedTraces: [BoardTrace] {
         guard let model else { return [] }
         return model.traces.filter {
@@ -316,11 +402,14 @@ struct PCBEditorView: View {
     private func clearSelection() {
         selections = []
         primarySelection = nil
+        freshSegmentTap = nil
     }
 
     /// "3 objects · 2 traces · 25.40 mm · 1000 mil total" — the
     /// traces subtotal Sean pinned: shown whenever the selection
-    /// contains traces, in single AND mixed selections.
+    /// contains traces, in single AND mixed selections. Part 5.1
+    /// adds the same treatment for individual segments:
+    /// "· 3 segments · 42.6 mm · 1677.2 mil total".
     private var selectionSummaryText: String? {
         guard !selections.isEmpty else { return nil }
         var text = selections.count == 1 ? "1 object" : "\(selections.count) objects"
@@ -328,6 +417,12 @@ struct PCBEditorView: View {
         if !traces.isEmpty {
             let total = traces.reduce(0) { $0 + $1.length }
             text += " · \(traces.count) trace\(traces.count == 1 ? "" : "s")"
+                + " · \(BoardUnits.formatLength(mm: total)) total"
+        }
+        let segments = selectedSegments
+        if !segments.isEmpty {
+            let total = segments.reduce(0) { $0 + $1.trace.segmentLength($1.index) }
+            text += " · \(segments.count) segment\(segments.count == 1 ? "" : "s")"
                 + " · \(BoardUnits.formatLength(mm: total)) total"
         }
         return text
@@ -797,6 +892,14 @@ struct PCBEditorView: View {
             return model.components.contains { $0.reference == reference }
         case .trace(let id):
             return model.traces.contains { $0.id == id }
+        case .segment(let id, let index):
+            return model.traces.contains {
+                $0.id == id && index >= 0 && index < $0.segmentCount
+            }
+        case .vertex(let id, let index):
+            return model.traces.contains {
+                $0.id == id && $0.points.indices.contains(index)
+            }
         case .graphic(let id):
             return model.graphics.contains { $0.id == id }
         case .via(let id):
@@ -1671,7 +1774,7 @@ struct PCBEditorView: View {
                     .font(.callout.weight(.bold))
                     .foregroundStyle(.white)
                     .lineLimit(3)
-                Text("The item below is the last one tapped. Delete removes the whole selection; dragging moves the selected components together (tracks stay put).")
+                Text("The item below is the last one tapped. Delete removes the whole selection. Dragging moves the selected components together; a selected track segment or corner drags on its own.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(4)
@@ -1689,6 +1792,10 @@ struct PCBEditorView: View {
             }
             if let component = selectedComponent {
                 componentDetail(component)
+            } else if let segment = selectedSegment {
+                segmentDetail(segment.trace, index: segment.index)
+            } else if let vertex = selectedVertex {
+                vertexDetail(vertex.trace, index: vertex.index)
             } else if let trace = selectedTrace {
                 traceDetail(trace)
             } else if let via = selectedVia {
@@ -1800,6 +1907,73 @@ struct PCBEditorView: View {
         }
     }
 
+    /// One segment of a track (part 5.1): the readout Sean asked
+    /// for — net, layer, width, and THIS segment's length — plus
+    /// the whole-track context and the way out to whole-track
+    /// selection.
+    private func segmentDetail(_ trace: BoardTrace, index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Track Segment")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            detailRow("Segment", "\(index + 1) of \(trace.segmentCount)")
+            detailRow("Net", trace.netName
+                      ?? trace.disconnectedNetName.map { "was \($0) — unconnected" }
+                      ?? "Unconnected")
+            detailRow("Layer", trace.layer)
+            detailRow("Width", "\(PCBBoardMerger.formatMM(trace.width)) mm")
+            detailRow("Segment Length",
+                      BoardUnits.formatLength(mm: trace.segmentLength(index)))
+            detailRow("Whole Track", BoardUnits.formatLength(mm: trace.length))
+            Text("Drag this segment to move it — the segments next to it stretch to follow. Drag a round corner handle to bend the track. Double-tap a segment of this track to add a corner there.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(4)
+            Button {
+                selectOnly(.trace(trace.id))
+            } label: {
+                Label("Select Whole Track", systemImage: "square.stack.3d.up")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            .padding(.top, 2)
+            deleteSelectionButton("Delete Segment")
+        }
+    }
+
+    /// One corner (vertex) of a track (part 5.1).
+    private func vertexDetail(_ trace: BoardTrace, index: Int) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Track Corner")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            detailRow("Corner", "\(index + 1) of \(trace.points.count)")
+            detailRow("Net", trace.netName
+                      ?? trace.disconnectedNetName.map { "was \($0) — unconnected" }
+                      ?? "Unconnected")
+            detailRow("Layer", trace.layer)
+            detailRow("Position",
+                      "\(fmt(trace.points[index].x)), \(fmt(trace.points[index].y)) mm")
+            Text("Drag the corner to bend the track — the two segments at this corner follow. Deleting the corner joins its segments into one straight run.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(4)
+            Button {
+                selectOnly(.trace(trace.id))
+            } label: {
+                Label("Select Whole Track", systemImage: "square.stack.3d.up")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            .padding(.top, 2)
+            deleteSelectionButton("Delete Corner")
+        }
+    }
+
     private func traceDetail(_ trace: BoardTrace) -> some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Track")
@@ -1868,10 +2042,10 @@ struct PCBEditorView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
-            Text("Width changes redraw immediately and are saved with the board.")
+            Text("Width changes redraw immediately and are saved with the board. Tap one segment of this track to edit just that piece — drag its corners to reshape the track.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(2)
+                .lineLimit(3)
             deleteSelectionButton("Delete Track")
         }
     }
@@ -2541,6 +2715,16 @@ struct PCBEditorView: View {
             // outside that delivery chain.)
             .gesture(canvasDrag)
             .simultaneousGesture(canvasMagnify)
+            // Double-tap (part 5.1): whole-track select on a
+            // freshly opened trace, corner insert on one being
+            // edited — see handleDoubleTap. The two constituent
+            // presses ALSO reach the drag gesture as ordinary
+            // taps; both paths are written to compose (the taps
+            // select the segment, the double-tap then upgrades
+            // or inserts).
+            .onTapGesture(count: 2) { location in
+                handleDoubleTap(at: screenToBoard(location))
+            }
             // Channel 2 (SwiftUI fallback): .onContinuousHover on
             // the canvas container — the v5.0 feed, kept as an
             // independent counted fallback. No pencil = no events
@@ -2588,6 +2772,18 @@ struct PCBEditorView: View {
                         movingViaID = via.id
                         moveViaStart = via.center
                         moveViaPreview = via.center
+                    } else if activeTool == .select,
+                              selectionFilter.allows(.trace),
+                              let active = editTrace,
+                              visibility.traceShown(active),
+                              beginTraceEditDrag(trace: active, at: startBoard) {
+                        // A corner or segment of the track being
+                        // edited claimed the press (part 5.1) —
+                        // dragMode and the edit-drag state were
+                        // set by the helper. Checked BEFORE
+                        // components: endpoints sit on pads, inside
+                        // footprint bounds, and must not drag the
+                        // component instead.
                     } else if activeTool == .select, let model,
                               visibility.showFootprints,
                               selectionFilter.allows(.component),
@@ -2623,11 +2819,49 @@ struct PCBEditorView: View {
                         dragMode = .pan
                     }
                 }
+                let dragDelta = FPPoint(
+                    x: Double(value.translation.width) / scale,
+                    y: Double(value.translation.height) / scale)
                 switch dragMode {
                 case .pan:
                     if let start = dragStartOffset {
                         offset = CGPoint(x: start.x + value.translation.width,
                                          y: start.y + value.translation.height)
+                    }
+                case .moveVertex:
+                    // The grabbed corner follows the pointer,
+                    // snapped to the grid like every other move;
+                    // its two segments follow through the shared
+                    // point (the preview IS the edited polyline).
+                    if editDragStartPoints.indices.contains(editDragIndex) {
+                        let start = editDragStartPoints[editDragIndex]
+                        var preview = editDragStartPoints
+                        preview[editDragIndex] = snapPoint(FPPoint(
+                            x: start.x + dragDelta.x,
+                            y: start.y + dragDelta.y))
+                        editDragPreviewPoints = preview
+                    }
+                case .moveSegment:
+                    // Both endpoints move by ONE delta, derived by
+                    // snapping the segment's first endpoint — the
+                    // segment keeps its exact length and angle, and
+                    // the neighbours stretch (part 5.1).
+                    let index = editDragIndex
+                    if editDragStartPoints.count > index + 1 {
+                        let startA = editDragStartPoints[index]
+                        let snappedA = snapPoint(FPPoint(
+                            x: startA.x + dragDelta.x,
+                            y: startA.y + dragDelta.y))
+                        let applied = FPPoint(x: snappedA.x - startA.x,
+                                              y: snappedA.y - startA.y)
+                        var preview = editDragStartPoints
+                        preview[index] = FPPoint(
+                            x: preview[index].x + applied.x,
+                            y: preview[index].y + applied.y)
+                        preview[index + 1] = FPPoint(
+                            x: preview[index + 1].x + applied.x,
+                            y: preview[index + 1].y + applied.y)
+                        editDragPreviewPoints = preview
                     }
                 case .moveComponents:
                     let delta = FPPoint(
@@ -2681,6 +2915,11 @@ struct PCBEditorView: View {
                     if dragMode == .pan, let start = dragStartOffset {
                         offset = start
                         handleTap(at: screenToBoard(value.location))
+                    } else if dragMode == .moveVertex || dragMode == .moveSegment {
+                        // A press that didn't travel is a tap:
+                        // resolve it through the normal tap path
+                        // (corner select / segment select).
+                        handleTap(at: screenToBoard(value.location))
                     } else if dragMode == .moveComponents {
                         if multiSelect, let reference = dragTapReference {
                             toggleSelection(.component(reference))
@@ -2712,6 +2951,22 @@ struct PCBEditorView: View {
                     }
                     if !multiSelect { selectOnly(.via(id)) }
                     setStatus("Via moved — saved with the board.")
+                } else if dragMode == .moveVertex || dragMode == .moveSegment,
+                          let id = editDragTraceID,
+                          let preview = editDragPreviewPoints,
+                          preview != editDragStartPoints {
+                    // One mutateBoard for the whole drag = one
+                    // undo step (part 5.1), like every other move.
+                    let cornerDrag = dragMode == .moveVertex
+                    mutateBoard { state in
+                        if let position = state.traces.firstIndex(
+                            where: { $0.id == id }) {
+                            state.traces[position].points = preview
+                        }
+                    }
+                    setStatus(cornerDrag
+                              ? "Corner moved — the track's new shape is saved with the board."
+                              : "Segment moved — its neighbours stretched to follow. Saved with the board.")
                 }
                 dragMode = .undecided
                 dragStartOffset = nil
@@ -2721,7 +2976,46 @@ struct PCBEditorView: View {
                 moveViaStart = nil
                 moveViaPreview = nil
                 dragTapReference = nil
+                editDragTraceID = nil
+                editDragStartPoints = []
+                editDragPreviewPoints = nil
             }
+    }
+
+    /// Trace-edit drag claim (part 5.1): a press on a corner of
+    /// the track being edited starts a corner drag; a press on
+    /// the selected segment (or on any segment, when the whole
+    /// track is selected) starts a segment drag. Sets the drag
+    /// mode + edit-drag state and returns true when claimed.
+    private func beginTraceEditDrag(trace: BoardTrace, at startBoard: FPPoint) -> Bool {
+        if let vertex = BoardGeometry.vertexHit(
+            trace, point: startBoard,
+            tolerance: max(tapToleranceMM, 4.5 / scale)) {
+            dragMode = .moveVertex
+            editDragTraceID = trace.id
+            editDragIndex = vertex.index
+            editDragStartPoints = trace.points
+            editDragPreviewPoints = trace.points
+            return true
+        }
+        let grabbed: Int?
+        if case .segment(let id, let index)? = primarySelection, id == trace.id {
+            grabbed = BoardGeometry.segmentHit(
+                trace, point: startBoard, tolerance: tapToleranceMM)?.index == index
+                ? index : nil
+        } else if case .trace(let id)? = primarySelection, id == trace.id {
+            grabbed = BoardGeometry.segmentHit(
+                trace, point: startBoard, tolerance: tapToleranceMM)?.index
+        } else {
+            grabbed = nil
+        }
+        guard let grabbed else { return false }
+        dragMode = .moveSegment
+        editDragTraceID = trace.id
+        editDragIndex = grabbed
+        editDragStartPoints = trace.points
+        editDragPreviewPoints = trace.points
+        return true
     }
 
     private var canvasMagnify: some Gesture {
@@ -2769,6 +3063,62 @@ struct PCBEditorView: View {
         }
     }
 
+    /// "NET_A segment 2 of 4 on F.Cu — 12.70 mm · 500 mil long":
+    /// the tapped segment named in full (part 5.1: net, layer and
+    /// THAT segment's length; the width rides in the detail panel).
+    private func segmentStatusText(_ trace: BoardTrace, _ index: Int) -> String {
+        let net = trace.netName ?? trace.disconnectedNetName ?? "Unconnected"
+        return "\(net) segment \(index + 1) of \(trace.segmentCount) on \(trace.layer)"
+            + " — \(BoardUnits.formatLength(mm: trace.segmentLength(index))) long."
+            + " Drag it or a corner to reshape the track."
+    }
+
+    /// Double-tap on the canvas (Select tool, part 5.1). Sean's
+    /// two sentences: a double-tap selects the WHOLE trace, and a
+    /// double-tap on a segment inserts a vertex. They can't both
+    /// own the same gesture on an untouched trace, so: a
+    /// double-tap whose first tap FRESHLY opened the trace (see
+    /// freshSegmentTap) selects the whole trace; a double-tap on
+    /// a trace already being edited inserts a vertex at the
+    /// tapped segment — projected onto the segment, then snapped,
+    /// so the new corner sits on the copper and on the grid.
+    private func handleDoubleTap(at point: FPPoint) {
+        guard activeTool == .select, let model,
+              selectionFilter.allows(.trace) else { return }
+        guard let hit = BoardGeometry.segmentAt(
+            model.traces.filter { visibility.traceShown($0) },
+            point: point, tolerance: tapToleranceMM) else { return }
+        if let fresh = freshSegmentTap,
+           fresh.traceID == hit.trace.id, fresh.index == hit.index,
+           Date().timeIntervalSince(fresh.time) < 0.6,
+           editTraceID == hit.trace.id {
+            freshSegmentTap = nil
+            wholeTracePromotion = (hit.trace.id, Date())
+            selectOnly(.trace(hit.trace.id))
+            setStatus("Whole track selected — \(BoardUnits.formatLength(mm: hit.trace.length)) on \(hit.trace.layer). Tap one segment to edit just that piece.")
+            return
+        }
+        guard editTraceID == hit.trace.id else {
+            // Not editing this trace and not a fresh open: the
+            // double-tap just re-selects the segment (the two
+            // plain taps already did) — nothing more to do.
+            return
+        }
+        let a = hit.trace.points[hit.index]
+        let b = hit.trace.points[hit.index + 1]
+        let inserted = snapPoint(
+            BoardGeometry.closestPointOnSegment(point, from: a, to: b))
+        let traceID = hit.trace.id, segment = hit.index
+        mutateBoard { state in
+            if let position = state.traces.firstIndex(where: { $0.id == traceID }) {
+                state.traces[position] = BoardGeometry.traceWithVertexInserted(
+                    state.traces[position], segment: segment, at: inserted)
+            }
+        }
+        selectOnly(.vertex(traceID, segment + 1))
+        setStatus("Corner added — drag it to shape the track.")
+    }
+
     private func handleSelectTap(model: BoardModel, point: FPPoint) {
         let tolerance = tapToleranceMM
         if selectionFilter.allows(.via),
@@ -2779,12 +3129,58 @@ struct PCBEditorView: View {
             applyTapSelection(.via(via.id))
             return
         }
+        // Vertex handles of the track being edited (part 5.1):
+        // endpoints sit ON pads, inside footprint bounds, so the
+        // handles are checked before traces and components alike.
+        if selectionFilter.allows(.trace), let active = editTrace,
+           visibility.traceShown(active),
+           let vertex = BoardGeometry.vertexHit(
+               active, point: point,
+               tolerance: max(tolerance, 4.5 / scale)) {
+            selectOnly(.vertex(active.id, vertex.index))
+            setStatus("Corner \(vertex.index + 1) of \(active.points.count) — drag it to bend the track, or Delete to join its segments straight.")
+            return
+        }
+        // Traces select SEGMENT by segment (part 5.1): the
+        // nearest segment under the tap, across the visible
+        // traces — never the whole track from a plain tap.
         if selectionFilter.allows(.trace),
-           let trace = model.traces.reversed().first(where: {
-               visibility.traceShown($0)
-                   && BoardGeometry.traceHit($0, point: point, tolerance: tolerance)
-           }) {
-            applyTapSelection(.trace(trace.id))
+           let hit = BoardGeometry.segmentAt(
+               model.traces.filter { visibility.traceShown($0) },
+               point: point, tolerance: tolerance) {
+            if multiSelect {
+                toggleSelection(.segment(hit.trace.id, hit.index))
+            } else if case .trace(let selectedID)? = primarySelection,
+                      selectedID == hit.trace.id,
+                      let promotion = wholeTracePromotion,
+                      promotion.traceID == hit.trace.id,
+                      Date().timeIntervalSince(promotion.time) < 0.6 {
+                // The second press of the double-tap that just
+                // promoted this trace, delivered late: keep the
+                // whole-track selection it produced.
+                return
+            } else {
+                // A tap that OPENS a fresh track (it wasn't being
+                // edited) arms the double-tap whole-track path;
+                // the second tap of that double-tap leaves the
+                // flag standing for handleDoubleTap; taps within
+                // an editing session disarm it (their double-taps
+                // insert vertices instead).
+                if let fresh = freshSegmentTap,
+                   fresh.traceID == hit.trace.id,
+                   fresh.index == hit.index,
+                   Date().timeIntervalSince(fresh.time) < 0.6 {
+                    // In-flight double-tap: leave the flag.
+                } else if editTraceID != hit.trace.id {
+                    freshSegmentTap = (hit.trace.id, hit.index, Date())
+                } else {
+                    freshSegmentTap = nil
+                }
+                selectOnly(.segment(hit.trace.id, hit.index))
+            }
+            if selections.contains(.segment(hit.trace.id, hit.index)) {
+                setStatus(segmentStatusText(hit.trace, hit.index))
+            }
             return
         }
         if selectionFilter.allows(.zone),
@@ -2844,11 +3240,13 @@ struct PCBEditorView: View {
             deleteSelection()
             return
         }
-        if let trace = model.traces.reversed().first(where: {
-            visibility.traceShown($0)
-                && BoardGeometry.traceHit($0, point: point, tolerance: tolerance)
-        }) {
-            selectOnly(.trace(trace.id))
+        // The Delete tool works at selection's granularity
+        // (part 5.1): the tapped SEGMENT goes and the track
+        // splits at the gap — KiCad's delete does the same.
+        if let hit = BoardGeometry.segmentAt(
+            model.traces.filter { visibility.traceShown($0) },
+            point: point, tolerance: tolerance) {
+            selectOnly(.segment(hit.trace.id, hit.index))
             deleteSelection()
             return
         }
@@ -2876,13 +3274,38 @@ struct PCBEditorView: View {
     }
 
     /// Delete the WHOLE selection (part 5: group delete covers
-    /// components, traces, vias, zones and graphics together).
+    /// components, traces, vias, zones and graphics together.
+    /// Part 5.1: segments and corners join in — a deleted segment
+    /// SPLITS its track at the gap (same net/layer/width on both
+    /// pieces; the connectivity checks flag the break, which is
+    /// the honest result, not a bug), and a deleted corner joins
+    /// its two segments into one straight run).
     private func deleteSelection() {
         guard !selections.isEmpty else { return }
         let doomed = selections
         clearSelection()
         var removedComponents: [String] = []
         var counts: [String] = []
+        var splitHappened = false
+        // Segment/corner deletions, keyed by trace. A whole-trace
+        // deletion of the same id wins over its segment edits.
+        let doomedTraceIDs = Set(doomed.compactMap { item -> UUID? in
+            if case .trace(let id) = item { return id }
+            return nil
+        })
+        var segmentDeletes: [UUID: Set<Int>] = [:]
+        var vertexDelete: (traceID: UUID, index: Int)? = nil
+        for item in doomed {
+            switch item {
+            case .segment(let id, let index) where !doomedTraceIDs.contains(id):
+                segmentDeletes[id, default: []].insert(index)
+            case .vertex(let id, let index) where !doomedTraceIDs.contains(id):
+                // At most one: corner taps always select singly.
+                if vertexDelete == nil { vertexDelete = (id, index) }
+            default:
+                break
+            }
+        }
         mutateBoard { state in
             for item in doomed {
                 switch item {
@@ -2911,7 +3334,62 @@ struct PCBEditorView: View {
                         state.zones.removeAll { $0.id == id }
                         counts.append("fill")
                     }
+                case .segment, .vertex:
+                    break // handled below, in index order
                 }
+            }
+            // Corner first: removing it merges its two segments,
+            // so the doomed segment indices of the same trace
+            // remap before the split runs.
+            if let vertexDelete,
+               let position = state.traces.firstIndex(
+                   where: { $0.id == vertexDelete.traceID }) {
+                let trace = state.traces[position]
+                let v = vertexDelete.index
+                if let edited = BoardGeometry.traceWithVertexRemoved(
+                    trace, vertex: v) {
+                    state.traces[position] = edited
+                } else {
+                    state.traces.remove(at: position)
+                }
+                counts.append("corner")
+                if let doomed = segmentDeletes[vertexDelete.traceID] {
+                    var remapped = Set<Int>()
+                    for s in doomed {
+                        if v == 0 {
+                            // Point 0 and segment 0 went together;
+                            // later segments shift down one.
+                            if s > 0 { remapped.insert(s - 1) }
+                        } else if v == trace.points.count - 1 {
+                            // The last point and last segment went
+                            // together; earlier segments keep index.
+                            if s < v - 1 { remapped.insert(s) }
+                        } else if s < v - 1 {
+                            remapped.insert(s)
+                        } else if s == v - 1 || s == v {
+                            // Either half of the merged segment was
+                            // doomed: the merged segment is doomed.
+                            remapped.insert(v - 1)
+                        } else {
+                            remapped.insert(s - 1)
+                        }
+                    }
+                    segmentDeletes[vertexDelete.traceID] = remapped
+                }
+            }
+            // Segment splits: each trace's doomed set is applied
+            // in ONE pass over its original indices.
+            for (id, indices) in segmentDeletes {
+                guard let position = state.traces.firstIndex(
+                    where: { $0.id == id }) else { continue }
+                let pieces = BoardGeometry.tracesByRemovingSegments(
+                    state.traces[position], indices: indices)
+                if pieces.count != 1
+                    || pieces.first?.points != state.traces[position].points {
+                    splitHappened = true
+                }
+                state.traces.replaceSubrange(position...position, with: pieces)
+                for _ in indices { counts.append("segment") }
             }
         }
         var parts: [String] = []
@@ -2920,6 +3398,9 @@ struct PCBEditorView: View {
         }
         if !counts.isEmpty {
             parts.append("\(counts.count) item(s) deleted (\(counts.joined(separator: ", ")))")
+        }
+        if splitHappened {
+            parts.append("the track is split at the gap — Problems flags the break until it's routed again")
         }
         setStatus(parts.isEmpty ? "Nothing deleted." : parts.joined(separator: " · "))
     }
@@ -2935,7 +3416,10 @@ struct PCBEditorView: View {
         for item in selections {
             switch item {
             case .component(let reference): components.append(reference)
-            case .trace(let id):
+            case .trace(let id), .segment(let id, _), .vertex(let id, _):
+                // A segment or corner stands for its whole trace
+                // here: the layer belongs to the trace, so flipping
+                // with a segment selected flips its track.
                 if let trace = model.traces.first(where: { $0.id == id }),
                    BoardLayers.flipDestinations.contains(trace.layer) {
                     traces.append(trace)
@@ -3225,6 +3709,24 @@ struct PCBEditorView: View {
         return via.center
     }
 
+    /// The points a trace is DRAWN with: the live preview points
+    /// while a corner/segment drag is reshaping it (part 5.1),
+    /// else its saved points.
+    private func displayTracePoints(_ trace: BoardTrace) -> [FPPoint] {
+        if editDragTraceID == trace.id, let preview = editDragPreviewPoints {
+            return preview
+        }
+        return trace.points
+    }
+
+    /// True when the primary selection is a corner of this trace
+    /// (part 5.1): the whole track gets the selection underlay as
+    /// context, the corner itself is marked by its handle.
+    private func isVertexPrimary(_ traceID: UUID) -> Bool {
+        if case .vertex(let id, _)? = primarySelection { return id == traceID }
+        return false
+    }
+
     private func drawBoard(ctx: GraphicsContext, size: CGSize, model: BoardModel) {
         var ctx = ctx
         ctx.fill(Path(CGRect(origin: .zero, size: size)),
@@ -3315,8 +3817,9 @@ struct PCBEditorView: View {
         for trace in model.traces where visibility.traceShown(trace) {
             guard trace.points.count > 1 else { continue }
             let isSelected = selections.contains(.trace(trace.id))
+                || isVertexPrimary(trace.id)
             var path = Path()
-            for (index, point) in trace.points.enumerated() {
+            for (index, point) in displayTracePoints(trace).enumerated() {
                 let screen = boardToScreen(point)
                 if index == 0 { path.move(to: screen) } else { path.addLine(to: screen) }
             }
@@ -3356,6 +3859,22 @@ struct PCBEditorView: View {
             ctx.opacity = Double(key.alphaSteps) / 100
             ctx.stroke(path, with: .color(color), style: style)
             ctx.opacity = 1
+        }
+        // Selected segments (part 5.1) draw OVER the batched
+        // pass with a hot core, so ONE segment reads as the
+        // selection — not the whole track running under it.
+        for selected in selectedSegments {
+            let trace = selected.trace
+            guard visibility.traceShown(trace) else { continue }
+            let points = displayTracePoints(trace)
+            var path = Path()
+            path.move(to: boardToScreen(points[selected.index]))
+            path.addLine(to: boardToScreen(points[selected.index + 1]))
+            let width = max(1.2, CGFloat(trace.width * scale))
+            ctx.stroke(path, with: .color(.white.opacity(0.9)),
+                       style: StrokeStyle(lineWidth: width + 5, lineCap: .round))
+            ctx.stroke(path, with: .color(Color(red: 1.0, green: 0.85, blue: 0.2)),
+                       style: StrokeStyle(lineWidth: width + 1.5, lineCap: .round))
         }
     }
 
@@ -3681,8 +4200,26 @@ struct PCBEditorView: View {
             case .pad(let target):
                 drawPadHoverRing(&ctx, target: target, refused: false)
             case .trace(let id):
-                if let trace = model.traces.first(where: { $0.id == id }),
-                   trace.points.count > 1 {
+                if activeTool == .select,
+                   let segment = BoardGeometry.segmentAt(
+                       model.traces.filter { visibility.traceShown($0) },
+                       point: pointer, tolerance: tapToleranceMM),
+                   segment.trace.id == id {
+                    // Segment hover (part 5.1): in the Select
+                    // tool the segment is the unit of work, so
+                    // the hover light covers just the segment a
+                    // tap would select — the v5.0.1 whole-trace
+                    // hover light, narrowed to the segment.
+                    let points = segment.trace.points
+                    var path = Path()
+                    path.move(to: boardToScreen(points[segment.index]))
+                    path.addLine(to: boardToScreen(points[segment.index + 1]))
+                    ctx.stroke(path, with: .color(.white.opacity(0.55)),
+                               style: StrokeStyle(
+                                   lineWidth: max(1.2, CGFloat(segment.trace.width * scale)) + 3,
+                                   lineCap: .round))
+                } else if let trace = model.traces.first(where: { $0.id == id }),
+                          trace.points.count > 1 {
                     var path = Path()
                     for (index, point) in trace.points.enumerated() {
                         let screen = boardToScreen(point)
@@ -3694,6 +4231,29 @@ struct PCBEditorView: View {
                                    lineWidth: max(1.2, CGFloat(trace.width * scale)) + 3,
                                    lineCap: .round, lineJoin: .round))
                 }
+            }
+        }
+        // Vertex handles (part 5.1): while a track is being
+        // edited in the Select tool, its corners show as round
+        // handles — drag one to bend the track. The chosen corner
+        // (when the primary selection IS a corner) is orange and
+        // larger. Handles follow the live drag preview points.
+        if activeTool == .select, let id = editTraceID,
+           let trace = model.traces.first(where: { $0.id == id }),
+           visibility.traceShown(trace) {
+            let points = displayTracePoints(trace)
+            for (index, point) in points.enumerated() {
+                let screen = boardToScreen(point)
+                let isChosen = selectedVertex?.trace.id == id
+                    && selectedVertex?.index == index
+                let radius: CGFloat = isChosen ? 5.5 : 4
+                let rect = CGRect(x: screen.x - radius, y: screen.y - radius,
+                                  width: 2 * radius, height: 2 * radius)
+                ctx.fill(Path(ellipseIn: rect),
+                         with: .color(isChosen ? .orange : .white))
+                ctx.stroke(Path(ellipseIn: rect),
+                           with: .color(.black.opacity(0.65)),
+                           style: StrokeStyle(lineWidth: 1))
             }
         }
     }
