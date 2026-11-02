@@ -22,47 +22,67 @@ func log(_ message: String) {
 }
 
 // Bring the Simulator to the front — it only forwards the host
-// pointer while it is the active app.
-if let sim = NSRunningApplication
-    .runningApplications(withBundleIdentifier: "com.apple.iphonesimulator")
-    .first {
-    sim.activate(options: [.activateAllWindows])
-    log("activated Simulator (pid \(sim.processIdentifier))")
-} else {
-    log("Simulator app not running")
+// pointer while it is the active app. The driver opens the app
+// first (a headless `simctl boot` starts no GUI); wait for it.
+var simApp: NSRunningApplication? = nil
+for _ in 0..<30 {
+    simApp = NSRunningApplication
+        .runningApplications(withBundleIdentifier: "com.apple.iphonesimulator")
+        .first
+    if simApp != nil { break }
+    Thread.sleep(forTimeInterval: 2.0)
 }
-Thread.sleep(forTimeInterval: 1.0)
-
-// Find the device window: the largest on-screen window owned by
-// the Simulator.
-guard let windows = CGWindowListCopyWindowInfo(
-    [.optionOnScreenOnly, .excludeDesktopElements],
-    kCGNullWindowID) as? [[String: Any]] else {
-    log("cannot list windows")
+guard let sim = simApp else {
+    log("Simulator app not running")
     exit(1)
 }
-var best: CGRect? = nil
-for window in windows {
-    guard let owner = window[kCGWindowOwnerName as String] as? String,
-          owner == "Simulator",
-          let layer = window[kCGWindowLayer as String] as? Int, layer == 0,
-          let boundsDict = window[kCGWindowBounds as String] as? [String: Any],
-          let bounds = CGRect(dictionaryRepresentation: boundsDict as CFDictionary)
-    else { continue }
-    if best == nil || bounds.width * bounds.height > best!.width * best!.height {
-        best = bounds
+sim.activate(options: [.activateAllWindows])
+log("activated Simulator (pid \(sim.processIdentifier))")
+
+// Find the device window: the largest on-screen window owned by
+// the Simulator. The window can take seconds to appear after the
+// app opens — poll for up to a minute.
+func deviceWindow() -> CGRect? {
+    guard let windows = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements],
+        kCGNullWindowID) as? [[String: Any]] else { return nil }
+    var best: CGRect? = nil
+    for window in windows {
+        guard let owner = window[kCGWindowOwnerName as String] as? String,
+              owner == "Simulator",
+              let layer = window[kCGWindowLayer as String] as? Int,
+              layer == 0,
+              let boundsDict = window[kCGWindowBounds as String]
+                as? [String: Any],
+              let bounds = CGRect(dictionaryRepresentation:
+                                    boundsDict as CFDictionary)
+        else { continue }
+        if best == nil
+            || bounds.width * bounds.height > best!.width * best!.height {
+            best = bounds
+        }
     }
+    return best
 }
-guard let frame = best, frame.width > 200, frame.height > 200 else {
+var found: CGRect? = nil
+for _ in 0..<30 {
+    if let w = deviceWindow(), w.width > 200, w.height > 200 {
+        found = w
+        break
+    }
+    Thread.sleep(forTimeInterval: 2.0)
+}
+guard let frame = found else {
     log("no Simulator device window found")
     exit(1)
 }
 log("device window: \(frame)")
 
-// Sweep the central band (the PCB canvas area: right of the tool
-// rail, left of the right panel, below the menu strips).
-let xs: [CGFloat] = [0.30, 0.42, 0.54, 0.46, 0.34]
-let ys: [CGFloat] = [0.40, 0.52, 0.64, 0.58, 0.46]
+// Sweep the canvas area (right of the 96 pt tool rail, left of
+// the 320 pt right panel, below the menu strips) — fractions
+// chosen to stay on the canvas in portrait AND landscape.
+let xs: [CGFloat] = [0.16, 0.24, 0.32, 0.40, 0.28]
+let ys: [CGFloat] = [0.35, 0.50, 0.65, 0.55, 0.45]
 for round in 0..<3 {
     for i in 0..<xs.count {
         let point = CGPoint(x: frame.minX + frame.width * xs[i],

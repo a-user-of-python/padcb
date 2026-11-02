@@ -139,10 +139,15 @@ def main():
             failure = "hover channels never armed (canvas never appeared?)"
 
         if failure is None:
+            # Open the Simulator GUI: `simctl boot` runs the device
+            # headless (no window, no host pointer, no hover at
+            # all). The pilot waits for the window to appear.
+            subprocess.run(["open", "-a", "Simulator"],
+                           capture_output=True)
             # Let the board settle, then sweep the host mouse.
             time.sleep(5)
             pilot_run = subprocess.run([pilot], capture_output=True,
-                                       text=True, timeout=180)
+                                       text=True, timeout=300)
             with open(os.path.join(out_dir, "pilot.log"), "w") as f:
                 f.write(pilot_run.stdout + pilot_run.stderr)
             print(f"pilot exit: {pilot_run.returncode}", flush=True)
