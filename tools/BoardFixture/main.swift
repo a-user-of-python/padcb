@@ -1167,6 +1167,189 @@ check(flippedTrace.points == fixtureTrace.points
       && approx(flippedTrace.length, fixtureTrace.length),
       "flip: a trace moved F.Cu -> B.Cu keeps identical coordinates")
 
+// MARK: - Part 5.0.1: pointer stream + KiCad-modelled routing
+//
+// Sean's device verdict on v5.0: Pencil hover while routing did
+// not work. Diagnosis (code): the preview read
+// `cursorBoard ?? hoverBoard`, and cursorBoard was written on
+// every touch and NEVER cleared — the tap that starts a route
+// froze the preview at the start pad and masked hover forever.
+// The fix: ONE pointer stream (BoardPointerState) + the routing
+// resolution (routePreview / routeTap) in the audit-compiled
+// BoardGeometry, modelled on KiCad's PNS LINE_PLACER
+// (Start / Move(aP, aEndItem) / FixRoute): the preview head is
+// pad-anchored within tolerance, and the point it shows IS the
+// point a tap commits.
+
+// -- Pointer arbitration: touch wins only while it is down --
+var pointer = BoardPointerState()
+check(pointer.currentPoint == nil,
+      "pointer: no current point before any event")
+pointer.apply(.hoverMoved(FPPoint(x: 10, y: 10)))
+check(pointer.currentPoint == FPPoint(x: 10, y: 10),
+      "pointer: hover feeds the current point")
+pointer.apply(.touchMoved(FPPoint(x: 20, y: 20)))
+check(pointer.currentPoint == FPPoint(x: 20, y: 20),
+      "pointer: an ACTIVE touch wins over hover")
+pointer.apply(.touchEnded)
+check(pointer.currentPoint == FPPoint(x: 10, y: 10),
+      "pointer: touch end falls back to the live hover point (the v5.0 freeze scenario)")
+pointer.apply(.hoverMoved(FPPoint(x: 30, y: 30)))
+check(pointer.currentPoint == FPPoint(x: 30, y: 30),
+      "pointer: hover keeps tracking after a tap")
+pointer.apply(.hoverEnded)
+check(pointer.currentPoint == nil,
+      "pointer: hover end clears the current point")
+
+// -- Route resolution against the real fixture board --
+let hoverTol = 0.8
+let u1Pad1Centre = BoardGeometry.padCenter(u1, binding(u1, "1").pad!)
+let u1Pad4Centre = BoardGeometry.padCenter(u1, binding(u1, "4").pad!)
+let freeProbe = FPPoint(x: 1000.3, y: 999.7)
+
+// Preview anchored on the same-net pad: exact centre, no refusal.
+let previewPad = BoardGeometry.routePreview(
+    board, from: u1Pad4Centre, pointer: u1Pad1Centre,
+    routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
+check(approx(previewPad.endPoint.x, u1Pad1Centre.x)
+      && approx(previewPad.endPoint.y, u1Pad1Centre.y),
+      "route preview: over pad 1 the head anchors on its EXACT centre")
+check(previewPad.target?.netName == "NET_A"
+      && previewPad.target?.reference == "U1"
+      && previewPad.target?.padNumber == "1",
+      "route preview: the anchored target is U1 pad 1 (NET_A)")
+check(!previewPad.joinRefused,
+      "route preview: a same-net pad is not refused")
+
+// Preview over a FOREIGN pad: anchored on it, but flagged refused.
+let previewForeign = BoardGeometry.routePreview(
+    board, from: u1Pad1Centre, pointer: u1Pad4Centre,
+    routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
+check(previewForeign.target?.netName == "NET_B" && previewForeign.joinRefused,
+      "route preview: a foreign-net pad under the pointer is flagged join-refused")
+check(approx(previewForeign.endPoint.x, u1Pad4Centre.x)
+      && approx(previewForeign.endPoint.y, u1Pad4Centre.y),
+      "route preview: the refused head still shows the pad it would hit")
+
+// Just NEAR a pad (inside tolerance, off-centre): pad anchoring
+// beats grid snap — the head lands on the centre, not the grid.
+let nearPadProbe = FPPoint(x: u1Pad1Centre.x + 1.0, y: u1Pad1Centre.y + 0.3)
+let previewNear = BoardGeometry.routePreview(
+    board, from: u1Pad4Centre, pointer: nearPadProbe,
+    routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
+check(previewNear.target != nil
+      && approx(previewNear.endPoint.x, u1Pad1Centre.x)
+      && approx(previewNear.endPoint.y, u1Pad1Centre.y),
+      "route preview: within tolerance of a pad, the head snaps to the pad centre")
+
+// Free space: grid snap applies; snap off = the raw point.
+let previewFree = BoardGeometry.routePreview(
+    board, from: u1Pad1Centre, pointer: freeProbe,
+    routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
+check(previewFree.target == nil && !previewFree.joinRefused,
+      "route preview: free space has no pad target and no refusal")
+check(previewFree.endPoint == BoardGrid.snap(freeProbe, gridMil: 25)
+      && previewFree.endPoint != freeProbe,
+      "route preview: a free point is grid-snapped (25 mil grid)")
+let previewFreeRaw = BoardGeometry.routePreview(
+    board, from: u1Pad1Centre, pointer: freeProbe,
+    routeNet: "NET_A", snapEnabled: false, gridMil: 25, tolerance: hoverTol)
+check(previewFreeRaw.endPoint == freeProbe,
+      "route preview: snap OFF leaves the free point untouched")
+// The 45° corner of a long diagonal head runs at exactly 45°.
+let previewCorner = BoardGeometry.routePreview(
+    board, from: FPPoint(x: 0, y: 0), pointer: freeProbe,
+    routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
+check(previewCorner.corner != nil
+      && approx(previewCorner.corner!.x, previewCorner.corner!.y),
+      "route preview: the corner of a diagonal head sits on the 45° line")
+
+// -- Tap resolution: the same algebra, committed --
+check(BoardGeometry.routeTap(board, point: freeProbe, routingActive: false,
+                             routeNet: nil, snapEnabled: true, gridMil: 25,
+                             tolerance: hoverTol) == .needsPad,
+      "route tap: not routing + no pad = needsPad (nothing starts)")
+if case .startPad(let startTarget) = BoardGeometry.routeTap(
+    board, point: u1Pad1Centre, routingActive: false,
+    routeNet: nil, snapEnabled: true, gridMil: 25, tolerance: hoverTol) {
+    check(startTarget.netName == "NET_A"
+          && approx(startTarget.center.x, u1Pad1Centre.x)
+          && approx(startTarget.center.y, u1Pad1Centre.y),
+          "route tap: not routing + pad = startPad on its exact centre (NET_A)")
+} else {
+    check(false, "route tap: not routing + pad = startPad")
+}
+check(BoardGeometry.routeTap(board, point: u1Pad4Centre, routingActive: true,
+                             routeNet: "NET_A", snapEnabled: true, gridMil: 25,
+                             tolerance: hoverTol) == .refusedForeignNet("NET_B"),
+      "route tap: routing NET_A onto a NET_B pad is refused, by name")
+if case .finishAtPad(let finishTarget) = BoardGeometry.routeTap(
+    board, point: u1Pad1Centre, routingActive: true,
+    routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol) {
+    check(approx(finishTarget.center.x, u1Pad1Centre.x)
+          && approx(finishTarget.center.y, u1Pad1Centre.y),
+          "route tap: routing onto the same-net pad finishes on its centre")
+} else {
+    check(false, "route tap: routing onto the same-net pad = finishAtPad")
+}
+if case .finishAtPad(let adoptTarget) = BoardGeometry.routeTap(
+    board, point: u1Pad4Centre, routingActive: true,
+    routeNet: nil, snapEnabled: true, gridMil: 25, tolerance: hoverTol) {
+    check(adoptTarget.netName == "NET_B",
+          "route tap: an unconnected track finishing on a pad adopts its net (NET_B), not refused")
+} else {
+    check(false, "route tap: unconnected track + pad = finishAtPad (adopt)")
+}
+check(BoardGeometry.routeTap(board, point: freeProbe, routingActive: true,
+                             routeNet: "NET_A", snapEnabled: true, gridMil: 25,
+                             tolerance: hoverTol)
+      == .appendPoint(BoardGrid.snap(freeProbe, gridMil: 25)),
+      "route tap: routing + free point appends the grid-snapped point")
+
+// -- THE guarantee: preview endpoint == tap point, probe by probe --
+for probe in [u1Pad1Centre, u1Pad4Centre, nearPadProbe, freeProbe] {
+    let preview = BoardGeometry.routePreview(
+        board, from: u1Pad1Centre, pointer: probe,
+        routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
+    switch BoardGeometry.routeTap(board, point: probe, routingActive: true,
+                                  routeNet: "NET_A", snapEnabled: true,
+                                  gridMil: 25, tolerance: hoverTol) {
+    case .appendPoint(let committed):
+        check(committed == preview.endPoint,
+              "preview==tap: free probe \(probe) commits where the head showed")
+    case .finishAtPad(let target):
+        check(target.center == preview.endPoint && preview.target != nil,
+              "preview==tap: pad probe \(probe) finishes where the head showed")
+    case .refusedForeignNet(let net):
+        check(preview.joinRefused && preview.target?.netName == net,
+              "preview==tap: foreign probe \(probe) is the pad the preview flagged")
+    default:
+        check(false, "preview==tap: probe \(probe) resolved unexpectedly")
+    }
+}
+
+// -- Hover targets (KiCad's hover highlight) --
+if case .pad(let hoverPad) = BoardGeometry.hoverTarget(
+    board, point: u1Pad1Centre, tolerance: hoverTol) {
+    check(hoverPad.reference == "U1" && hoverPad.padNumber == "1"
+          && hoverPad.netName == "NET_A",
+          "hover: over pad 1 the hover target is that pad (U1/1, NET_A)")
+} else {
+    check(false, "hover: over pad 1 the hover target is the pad")
+}
+var hoverModel = board
+let hoverTrace = BoardTrace(
+    id: fixedUUID("50505050-5050-4050-8050-505050505050"),
+    netName: "NET_A", layer: "F.Cu", width: 0.25,
+    points: [FPPoint(x: 300, y: 300), FPPoint(x: 310, y: 300)])
+hoverModel.traces = [hoverTrace]
+check(BoardGeometry.hoverTarget(hoverModel, point: FPPoint(x: 305, y: 300.1),
+                                tolerance: hoverTol) == .trace(hoverTrace.id),
+      "hover: over a trace (no pad near) the hover target is the trace")
+check(BoardGeometry.hoverTarget(board, point: FPPoint(x: 2000, y: 2000),
+                                tolerance: hoverTol) == nil,
+      "hover: empty board space has no hover target")
+
 // MARK: - Result
 
 print("BoardFixture: \(passCount) passed, \(failCount) failed")

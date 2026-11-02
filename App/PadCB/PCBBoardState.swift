@@ -993,3 +993,201 @@ enum BoardGeometry {
     /// Standard track widths offered in the editor (mm).
     static let trackWidthPresets: [Double] = [0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0]
 }
+
+// MARK: - Pointer stream + routing interaction (part 5.0.1)
+
+/// One pointer event for the PCB canvas. Hover and touch are TWO
+/// SOURCES FEEDING ONE STREAM: the UIKit hover recognizer reports
+/// `.hoverMoved` / `.hoverEnded`; the canvas drag gesture reports
+/// `.touchMoved` / `.touchEnded`. Everything downstream (previews,
+/// the status-bar readout, anchor resolution) reads the single
+/// `BoardPointerState`, never a source directly.
+///
+/// Why this exists (the v5.0 hover failure, diagnosed 2026-11-01):
+/// v5.0 kept TWO optional points — `cursorBoard` (touch) and
+/// `hoverBoard` (pencil hover) — and the preview read
+/// `cursorBoard ?? hoverBoard`. But `cursorBoard` was WRITTEN on
+/// every touch (drag change AND drag end) and NEVER cleared, so
+/// the tap that STARTS a route froze it at the start pad forever
+/// and every later hover position was masked: the prospective
+/// segment never followed the hovering pencil. Here the touch
+/// point wins ONLY while a touch is actually down
+/// (`touchActive`), and `.touchEnded` clears it — hover resumes
+/// the instant the finger/pencil lifts.
+enum BoardPointerEvent: Equatable {
+    case hoverMoved(FPPoint)
+    case hoverEnded
+    case touchMoved(FPPoint)
+    case touchEnded
+}
+
+/// The canvas's single pointer state (see BoardPointerEvent).
+struct BoardPointerState: Equatable {
+    /// Last hover position (pencil or pointer), nil when the
+    /// pointer is not over the canvas.
+    private(set) var hoverPoint: FPPoint? = nil
+    /// Last touch position while a touch is down.
+    private(set) var touchPoint: FPPoint? = nil
+    /// True between a touch's first move and its end.
+    private(set) var touchActive = false
+
+    /// The point previews follow: the touch point while a touch
+    /// is down, else the hover point.
+    var currentPoint: FPPoint? { touchActive ? touchPoint : hoverPoint }
+
+    mutating func apply(_ event: BoardPointerEvent) {
+        switch event {
+        case .hoverMoved(let point):
+            hoverPoint = point
+        case .hoverEnded:
+            hoverPoint = nil
+        case .touchMoved(let point):
+            touchPoint = point
+            touchActive = true
+        case .touchEnded:
+            touchActive = false
+            touchPoint = nil
+        }
+    }
+}
+
+/// A pad resolved as a pointer target: everything the editor
+/// needs to anchor on it, highlight it, and talk about it.
+struct BoardPadTarget: Equatable {
+    var reference: String
+    var padNumber: String
+    var netName: String?
+    /// Board-space pad centre (side-aware — a flipped part's pad
+    /// centre is its mirrored centre).
+    var center: FPPoint
+    /// Effective pad size (mm), for the hover highlight ring.
+    var width: Double
+    var height: Double
+}
+
+/// What the pointer is over, for KiCad-style hover highlighting.
+enum BoardHoverTarget: Equatable {
+    case pad(BoardPadTarget)
+    case trace(UUID)
+}
+
+/// The resolved live preview of an in-progress track — KiCad's
+/// router "head" (pns_line_placer.h: `Move(aP, aEndItem)` re-routes
+/// the volatile head to the pointer point on every motion event,
+/// taking the item under the pointer as the end anchor). The
+/// endpoint is the PAD CENTRE when a pad is within tolerance
+/// (end-item anchoring), else the grid-snapped pointer.
+struct BoardRoutePreview: Equatable {
+    /// Where the head lands if the user anchors right now.
+    var endPoint: FPPoint
+    /// The 45° corner between the last anchored point and
+    /// `endPoint` (nil when the direct segment is already legal).
+    var corner: FPPoint?
+    /// The pad the endpoint is anchored to, if any.
+    var target: BoardPadTarget?
+    /// True when the target pad carries a DIFFERENT net than the
+    /// track being routed — KiCad refuses the join, and so does
+    /// the tap (same rule, same function family: see routeTap).
+    var joinRefused: Bool
+}
+
+/// The resolution of a tap in the Route Tracks tool. The view maps
+/// each case to its status copy and side effects; ALL the geometry
+/// (pad snap, grid snap, net refusal) is decided here so a tap and
+/// the hover preview can never disagree — the preview's endpoint
+/// IS the point a tap would anchor.
+enum BoardRouteTap: Equatable {
+    /// Not routing yet: start the track on this pad.
+    case startPad(BoardPadTarget)
+    /// Routing: a free waypoint (grid-snapped per the settings).
+    case appendPoint(FPPoint)
+    /// Routing: the tap lands on a pad — anchor its centre and
+    /// finish the track there.
+    case finishAtPad(BoardPadTarget)
+    /// Routing: the tap lands on a pad of a different net (the
+    /// net's name) — refused, nothing is appended.
+    case refusedForeignNet(String)
+    /// Not routing yet and no pad under the tap: nothing to start.
+    case needsPad
+}
+
+extension BoardGeometry {
+
+    /// The pad under a board point as a BoardPadTarget (nil when
+    /// no pad is within `tolerance`).
+    static func padTarget(_ model: BoardModel, point: FPPoint,
+                          tolerance: Double) -> BoardPadTarget? {
+        guard let hit = padAt(model, point: point, tolerance: tolerance)
+        else { return nil }
+        let effective = boardPad(hit.component, hit.pad)
+        return BoardPadTarget(
+            reference: hit.component.reference,
+            padNumber: hit.pad.number,
+            netName: hit.netName,
+            center: padCenter(hit.component, hit.pad),
+            width: effective.width, height: effective.height)
+    }
+
+    /// What a hovering pointer highlights: a pad wins over a
+    /// trace (pads are the precise targets; a trace is the
+    /// fallback when no pad is near).
+    static func hoverTarget(_ model: BoardModel, point: FPPoint,
+                            tolerance: Double) -> BoardHoverTarget? {
+        if let target = padTarget(model, point: point, tolerance: tolerance) {
+            return .pad(target)
+        }
+        if let trace = traceAt(model, point: point, tolerance: tolerance) {
+            return .trace(trace.id)
+        }
+        return nil
+    }
+
+    /// Resolve the live route preview for a pointer position
+    /// (KiCad's `Move`): pad-anchored when a pad is within
+    /// tolerance, grid-snapped otherwise.
+    static func routePreview(_ model: BoardModel, from last: FPPoint,
+                             pointer: FPPoint, routeNet: String?,
+                             snapEnabled: Bool, gridMil: Double,
+                             tolerance: Double) -> BoardRoutePreview {
+        if let target = padTarget(model, point: pointer, tolerance: tolerance) {
+            let refused = routeNet != nil && target.netName != nil
+                && target.netName != routeNet
+            return BoardRoutePreview(
+                endPoint: target.center,
+                corner: routeCorner(from: last, to: target.center),
+                target: target, joinRefused: refused)
+        }
+        let end = snapEnabled ? BoardGrid.snap(pointer, gridMil: gridMil)
+                              : pointer
+        return BoardRoutePreview(
+            endPoint: end,
+            corner: routeCorner(from: last, to: end),
+            target: nil, joinRefused: false)
+    }
+
+    /// Resolve a Route Tracks tap (KiCad's `FixRoute`: a click
+    /// commits the head at the pointer, anchored on the end item).
+    /// The answer for any point is built from the same pad/snap
+    /// resolution as `routePreview`, so the point the preview
+    /// shows is the point the tap commits.
+    static func routeTap(_ model: BoardModel, point: FPPoint,
+                         routingActive: Bool, routeNet: String?,
+                         snapEnabled: Bool, gridMil: Double,
+                         tolerance: Double) -> BoardRouteTap {
+        let target = padTarget(model, point: point, tolerance: tolerance)
+        guard routingActive else {
+            guard let target else { return .needsPad }
+            return .startPad(target)
+        }
+        if let target {
+            if let routing = routeNet, let padNet = target.netName,
+               routing != padNet {
+                return .refusedForeignNet(padNet)
+            }
+            return .finishAtPad(target)
+        }
+        return .appendPoint(snapEnabled
+                             ? BoardGrid.snap(point, gridMil: gridMil)
+                             : point)
+    }
+}

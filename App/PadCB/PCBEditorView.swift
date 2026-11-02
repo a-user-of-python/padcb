@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// PCB editor (parts 4 + 5) — a WORKING editor modelled on KiCad
 /// 10's PCB editor (pcbnew): merged title/table bar on top, menu
@@ -130,12 +131,14 @@ struct PCBEditorView: View {
     /// selected group moves. (Decided at drag end — see canvasDrag.)
     @State private var dragTapReference: String? = nil
     @State private var pinchStartScale: Double? = nil
-    @State private var cursorBoard: FPPoint? = nil
-    /// Apple Pencil hover position (part 5) — the prospective
-    /// routing/drawing point when no touch is down. Nil without a
-    /// pencil (or mouse) over the canvas; everything degrades to
-    /// the plain touch behaviour.
-    @State private var hoverBoard: FPPoint? = nil
+    /// The canvas's ONE pointer stream (part 5.0.1): hover (UIKit
+    /// recognizer) and touch (drag gesture) both feed
+    /// `BoardPointerState`; previews follow its `currentPoint` —
+    /// the touch point while a touch is down, else the hover
+    /// point. (v5.0 kept two optionals and preferred the touch one
+    /// forever once set, which froze the hover preview at the
+    /// first tap — see PCBBoardState.swift.)
+    @State private var pointerState = BoardPointerState()
     @State private var canvasSize: CGSize = .zero
     @State private var showGrid = true
     @State private var highlightActiveLayer = false
@@ -2336,8 +2339,8 @@ struct PCBEditorView: View {
     }
 
     private var cursorText: String {
-        guard let cursorBoard else { return "X —  Y —" }
-        return "X \(fmt(cursorBoard.x)) mm  Y \(fmt(cursorBoard.y)) mm"
+        guard let point = pointerState.currentPoint else { return "X —  Y —" }
+        return "X \(fmt(point.x)) mm  Y \(fmt(point.y)) mm"
     }
 
     private var boardInfoText: String {
@@ -2444,16 +2447,22 @@ struct PCBEditorView: View {
             .contentShape(Rectangle())
             .gesture(canvasDrag)
             .simultaneousGesture(canvasMagnify)
-            // Apple Pencil hover (part 5): while routing or
-            // drawing, the prospective segment follows the pencil
-            // BEFORE it touches. No pencil = no events = the plain
-            // touch behaviour, unchanged.
-            .onContinuousHover { phase in
-                switch phase {
-                case .active(let location):
-                    hoverBoard = screenToBoard(location)
-                case .ended:
-                    hoverBoard = nil
+            // Apple Pencil hover (part 5.0.1): a UIKit
+            // UIHoverGestureRecognizer bridge (CanvasHoverView)
+            // feeds the SAME pointer stream the touch path uses.
+            // v5.0 used SwiftUI's .onContinuousHover here AND the
+            // preview preferred a never-cleared touch point, so
+            // the hover preview froze at the first tap (see
+            // PCBBoardState.swift). No pencil = no events = the
+            // plain touch behaviour, unchanged.
+            .overlay {
+                CanvasHoverView { location in
+                    if let location {
+                        pointerState.apply(
+                            .hoverMoved(screenToBoard(location)))
+                    } else {
+                        pointerState.apply(.hoverEnded)
+                    }
                 }
             }
             .onAppear { canvasSize = geo.size }
@@ -2469,7 +2478,7 @@ struct PCBEditorView: View {
     private var canvasDrag: some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
-                cursorBoard = screenToBoard(value.location)
+                pointerState.apply(.touchMoved(screenToBoard(value.location)))
                 if dragMode == .undecided {
                     dragStartOffset = offset
                     let startBoard = screenToBoard(value.startLocation)
@@ -2555,7 +2564,10 @@ struct PCBEditorView: View {
                 }
             }
             .onEnded { value in
-                cursorBoard = screenToBoard(value.location)
+                // The touch is up: the pointer stream falls back
+                // to hover (part 5.0.1). The tap resolution below
+                // uses the gesture's own end location, as before.
+                pointerState.apply(.touchEnded)
                 let moved = hypot(value.translation.width, value.translation.height)
                 if moved < 5 {
                     // A tap. A pan-tap undoes its micro-pan and goes
@@ -2880,8 +2892,6 @@ struct PCBEditorView: View {
     // MARK: - Routing (Route Tracks)
 
     private func handleRouteTap(model: BoardModel, point: FPPoint) {
-        let padHit = BoardGeometry.padAt(model, point: point,
-                                          tolerance: tapToleranceMM)
         if !routingActive {
             // Routing needs copper (part 5): say so instead of
             // quietly laying a track on silk.
@@ -2890,33 +2900,39 @@ struct PCBEditorView: View {
                           warning: true)
                 return
             }
-            guard let padHit else {
-                setStatus("Tap a pad to start the track.", warning: true)
-                return
-            }
-            routeNet = padHit.netName
-            routePoints = [BoardGeometry.padCenter(padHit.component, padHit.pad)]
-            if let net = padHit.netName {
-                setStatus("Routing \(net) from \(padHit.component.reference) pad "
-                          + "\(padHit.pad.number) on \(activeLayer) — tap "
+        }
+        // All geometry (pad snap, grid snap, net refusal) is
+        // resolved by BoardGeometry.routeTap — the SAME resolution
+        // the hover preview renders (part 5.0.1), so the segment
+        // Sean sees while hovering is the segment the tap commits.
+        switch BoardGeometry.routeTap(model: model, point: point,
+                                      routingActive: routingActive,
+                                      routeNet: routeNet,
+                                      snapEnabled: snapEnabled,
+                                      gridMil: boardState.gridMil,
+                                      tolerance: tapToleranceMM) {
+        case .needsPad:
+            setStatus("Tap a pad to start the track.", warning: true)
+        case .startPad(let target):
+            routeNet = target.netName
+            routePoints = [target.center]
+            if let net = target.netName {
+                setStatus("Routing \(net) from \(target.reference) pad "
+                          + "\(target.padNumber) on \(activeLayer) — tap "
                           + "waypoints, then the target pad.")
             } else {
-                setStatus("Routing an unconnected track from \(padHit.component.reference) "
-                          + "pad \(padHit.pad.number) — tap waypoints, then a pad or Finish.")
+                setStatus("Routing an unconnected track from \(target.reference) "
+                          + "pad \(target.padNumber) — tap waypoints, then a pad or Finish.")
             }
-            return
-        }
-        if let padHit {
-            if let routing = routeNet, let padNet = padHit.netName, routing != padNet {
-                setStatus("That's net \(padNet) — this track is \(routing) and "
-                          + "can't join a different net.", warning: true)
-                return
-            }
-            if routeNet == nil { routeNet = padHit.netName }
-            appendRoutePoint(BoardGeometry.padCenter(padHit.component, padHit.pad))
+        case .refusedForeignNet(let padNet):
+            setStatus("That's net \(padNet) — this track is \(routeNet ?? "") and "
+                      + "can't join a different net.", warning: true)
+        case .finishAtPad(let target):
+            if routeNet == nil { routeNet = target.netName }
+            appendRoutePoint(target.center)
             finishRoute()
-        } else {
-            appendRoutePoint(snapPoint(point))
+        case .appendPoint(let snapped):
+            appendRoutePoint(snapped)
         }
     }
 
@@ -3446,20 +3462,27 @@ struct PCBEditorView: View {
     }
 
     private func drawPreviews(_ ctx: inout GraphicsContext, model: BoardModel) {
-        // The pointer for previews: the touch point while touching,
-        // else the Apple Pencil hover point (part 5). The
-        // prospective point follows the same rules as a tap would:
-        // grid snap for free points.
-        let pointer = cursorBoard ?? hoverBoard
-        // Routing: laid points + the 45° preview to the pointer.
+        // The pointer for previews comes from the ONE pointer
+        // stream (part 5.0.1): the touch point while a touch is
+        // down, else the Apple Pencil hover point.
+        let pointer = pointerState.currentPoint
+        // Routing: laid points + the 45° preview head to the
+        // pointer. The head is resolved by BoardGeometry.routePreview
+        // — KiCad's Move(aP, aEndItem): pad-anchored (the exact pad
+        // centre) when a pad is within tolerance, grid-snapped
+        // otherwise, and IDENTICAL to what a tap would commit
+        // (routeTap shares the resolution).
         if routingActive {
             var points = routePoints
+            var preview: BoardRoutePreview? = nil
             if let pointer, let last = points.last {
-                let prospective = snapPoint(pointer)
-                if let corner = BoardGeometry.routeCorner(from: last, to: prospective) {
-                    points.append(corner)
-                }
-                points.append(prospective)
+                let resolved = BoardGeometry.routePreview(
+                    model: model, from: last, pointer: pointer,
+                    routeNet: routeNet, snapEnabled: snapEnabled,
+                    gridMil: boardState.gridMil, tolerance: tapToleranceMM)
+                preview = resolved
+                if let corner = resolved.corner { points.append(corner) }
+                points.append(resolved.endPoint)
             }
             var path = Path()
             for (index, point) in points.enumerated() {
@@ -3475,6 +3498,13 @@ struct PCBEditorView: View {
                 ctx.fill(Path(ellipseIn: CGRect(x: screen.x - 3, y: screen.y - 3,
                                                 width: 6, height: 6)),
                          with: .color(.white))
+            }
+            // KiCad-style end-item feedback: the pad the head is
+            // anchored to lights up — red when joining it would
+            // cross nets (the tap would be refused).
+            if let target = preview?.target {
+                drawPadHoverRing(&ctx, target: target,
+                                 refused: preview?.joinRefused ?? false)
             }
         }
         // Zone drawing: vertices so far + preview edge.
@@ -3528,6 +3558,48 @@ struct PCBEditorView: View {
             ctx.stroke(path, with: .color(.white.opacity(0.8)),
                        style: StrokeStyle(lineWidth: 1.4, dash: [5, 4]))
         }
+        // Hover highlight (part 5.0.1): when the pointer HOVERS
+        // (no touch down) and no track is in progress, the pad or
+        // trace under the pencil lights up — KiCad's hover
+        // feedback, so Sean can see what a tap would act on.
+        if !routingActive, !pointerState.touchActive, let pointer,
+           let hover = BoardGeometry.hoverTarget(
+               model: model, point: pointer, tolerance: tapToleranceMM) {
+            switch hover {
+            case .pad(let target):
+                drawPadHoverRing(&ctx, target: target, refused: false)
+            case .trace(let id):
+                if let trace = model.traces.first(where: { $0.id == id }),
+                   trace.points.count > 1 {
+                    var path = Path()
+                    for (index, point) in trace.points.enumerated() {
+                        let screen = boardToScreen(point)
+                        if index == 0 { path.move(to: screen) }
+                        else { path.addLine(to: screen) }
+                    }
+                    ctx.stroke(path, with: .color(.white.opacity(0.55)),
+                               style: StrokeStyle(
+                                   lineWidth: max(1.2, CGFloat(trace.width * scale)) + 3,
+                                   lineCap: .round, lineJoin: .round))
+                }
+            }
+        }
+    }
+
+    /// The hover ring around a pad target: warm yellow normally,
+    /// red when anchoring there would be refused (foreign net).
+    private func drawPadHoverRing(_ ctx: inout GraphicsContext,
+                                  target: BoardPadTarget, refused: Bool) {
+        let centre = boardToScreen(target.center)
+        let w = CGFloat(target.width * scale) + 9
+        let h = CGFloat(target.height * scale) + 9
+        let rect = CGRect(x: centre.x - w / 2, y: centre.y - h / 2,
+                          width: w, height: h)
+        let colour = refused ? Color.red
+                             : Color(red: 1.0, green: 0.85, blue: 0.2)
+        ctx.stroke(Path(roundedRect: rect, cornerRadius: 4),
+                   with: .color(colour),
+                   style: StrokeStyle(lineWidth: 2))
     }
 
     private func drawComponent(_ ctx: inout GraphicsContext,
@@ -3790,6 +3862,129 @@ struct PCBEditorView: View {
                     .opacity(alpha)),
                      at: CGPoint(x: centre.x, y: centre.y + h / 2 + 2),
                      anchor: UnitPoint(x: 0.5, y: 0))
+        }
+    }
+}
+
+// MARK: - Apple Pencil hover bridge (part 5.0.1)
+
+/// UIKit hover delivery for the PCB canvas.
+///
+/// Apple Pencil hover reaches apps through UIHoverGestureRecognizer
+/// (Apple's input team built Pencil hover on the pointer APIs —
+/// UIPointerInteraction / UIHoverGestureRecognizer; iPadOS 16.4+
+/// extended the recognizer to report the pencil tip's location).
+/// This view is the canvas's hover source:
+///
+/// - It exactly overlays the canvas and NEVER hit-tests
+///   (`hitTest` -> nil), so every touch falls through to the
+///   SwiftUI canvas and its drag/pinch gestures, untouched.
+/// - It carries a UIHoverGestureRecognizer of its own, and —
+///   because hover events are delivered to the recognizers of the
+///   HIT view and its ANCESTORS, and a hit-test-transparent view
+///   is never the hit view — it also lends recognizers to its
+///   first ancestors (the container views it shares with the
+///   canvas), which ARE in the delivery chain. Every recognizer
+///   reports locations converted into THIS view's coordinates,
+///   and positions outside this view's bounds are reported as
+///   "hover ended", so stray events from hovering the panels
+///   can't leak in. Duplicate reports from several recognizers
+///   are identical values, applied idempotently.
+/// - Callbacks deliver canvas-space points (or nil when the
+///   hover ends); the editor converts to board coordinates and
+///   feeds BoardPointerState — the same stream the touch path
+///   feeds. No pencil / no hover hardware = no events, and the
+///   editor behaves exactly as the plain touch editor.
+private struct CanvasHoverView: UIViewRepresentable {
+    var onHover: (CGPoint?) -> Void
+
+    func makeUIView(context: Context) -> HoverView {
+        let view = HoverView()
+        view.onHover = onHover
+        return view
+    }
+
+    func updateUIView(_ view: HoverView, context: Context) {
+        view.onHover = onHover
+    }
+
+    static func dismantleUIView(_ view: HoverView, coordinator: ()) {
+        view.detach()
+    }
+
+    final class HoverView: UIView {
+        var onHover: ((CGPoint?) -> Void)?
+        private var ownRecognizer: UIHoverGestureRecognizer?
+        private var lentRecognizers: [ObjectIdentifier: UIHoverGestureRecognizer] = [:]
+        private var hoverInside = false
+
+        override init(frame: CGRect) {
+            super.init(frame: frame)
+            backgroundColor = .clear
+            let recognizer = UIHoverGestureRecognizer(
+                target: self, action: #selector(handleHover(_:)))
+            addGestureRecognizer(recognizer)
+            ownRecognizer = recognizer
+        }
+
+        @available(*, unavailable)
+        required init?(coder: NSCoder) { fatalError("not used") }
+
+        /// Transparent to touches: the canvas below receives
+        /// every touch; this view exists for hover geometry only.
+        override func hitTest(_ point: CGPoint,
+                              with event: UIEvent?) -> UIView? { nil }
+
+        override func didMoveToSuperview() {
+            super.didMoveToSuperview()
+            lendRecognizersToAncestors()
+        }
+
+        /// Attach one hover recognizer to each of the first few
+        /// ancestors (they are the canvas view's ancestors too, so
+        /// they sit in the hover delivery chain). Idempotent.
+        private func lendRecognizersToAncestors() {
+            var ancestor = superview
+            var depth = 0
+            while let view = ancestor, depth < 3 {
+                let key = ObjectIdentifier(view)
+                if lentRecognizers[key] == nil {
+                    let recognizer = UIHoverGestureRecognizer(
+                        target: self, action: #selector(handleHover(_:)))
+                    view.addGestureRecognizer(recognizer)
+                    lentRecognizers[key] = recognizer
+                }
+                ancestor = view.superview
+                depth += 1
+            }
+        }
+
+        func detach() {
+            let lent = lentRecognizers
+            lentRecognizers = [:]
+            for (_, recognizer) in lent {
+                recognizer.view?.removeGestureRecognizer(recognizer)
+            }
+            onHover = nil
+        }
+
+        @objc private func handleHover(_ recognizer: UIHoverGestureRecognizer) {
+            switch recognizer.state {
+            case .began, .changed:
+                let location = recognizer.location(in: self)
+                if bounds.contains(location) {
+                    hoverInside = true
+                    onHover?(location)
+                } else if hoverInside {
+                    hoverInside = false
+                    onHover?(nil)
+                }
+            case .ended, .cancelled, .failed:
+                hoverInside = false
+                onHover?(nil)
+            default:
+                break
+            }
         }
     }
 }
