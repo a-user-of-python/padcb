@@ -1203,13 +1203,14 @@ check(pointer.currentPoint == nil,
 
 // -- Route resolution against the real fixture board --
 let hoverTol = 0.8
-let u1Pad1Centre = BoardGeometry.padCenter(u1, binding(u1, "1").pad!)
-let u1Pad4Centre = BoardGeometry.padCenter(u1, binding(u1, "4").pad!)
+// (u1Pad1Centre is already declared in the part-5 section above;
+// the pad-4 centre gets its own name here.)
+let u1Pad4Centre501 = BoardGeometry.padCenter(u1Shelf, binding(u1, "4").pad!)
 let freeProbe = FPPoint(x: 1000.3, y: 999.7)
 
 // Preview anchored on the same-net pad: exact centre, no refusal.
 let previewPad = BoardGeometry.routePreview(
-    board, from: u1Pad4Centre, pointer: u1Pad1Centre,
+    board, from: u1Pad4Centre501, pointer: u1Pad1Centre,
     routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
 check(approx(previewPad.endPoint.x, u1Pad1Centre.x)
       && approx(previewPad.endPoint.y, u1Pad1Centre.y),
@@ -1223,19 +1224,19 @@ check(!previewPad.joinRefused,
 
 // Preview over a FOREIGN pad: anchored on it, but flagged refused.
 let previewForeign = BoardGeometry.routePreview(
-    board, from: u1Pad1Centre, pointer: u1Pad4Centre,
+    board, from: u1Pad1Centre, pointer: u1Pad4Centre501,
     routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
 check(previewForeign.target?.netName == "NET_B" && previewForeign.joinRefused,
       "route preview: a foreign-net pad under the pointer is flagged join-refused")
-check(approx(previewForeign.endPoint.x, u1Pad4Centre.x)
-      && approx(previewForeign.endPoint.y, u1Pad4Centre.y),
+check(approx(previewForeign.endPoint.x, u1Pad4Centre501.x)
+      && approx(previewForeign.endPoint.y, u1Pad4Centre501.y),
       "route preview: the refused head still shows the pad it would hit")
 
 // Just NEAR a pad (inside tolerance, off-centre): pad anchoring
 // beats grid snap — the head lands on the centre, not the grid.
 let nearPadProbe = FPPoint(x: u1Pad1Centre.x + 1.0, y: u1Pad1Centre.y + 0.3)
 let previewNear = BoardGeometry.routePreview(
-    board, from: u1Pad4Centre, pointer: nearPadProbe,
+    board, from: u1Pad4Centre501, pointer: nearPadProbe,
     routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
 check(previewNear.target != nil
       && approx(previewNear.endPoint.x, u1Pad1Centre.x)
@@ -1279,7 +1280,7 @@ if case .startPad(let startTarget) = BoardGeometry.routeTap(
 } else {
     check(false, "route tap: not routing + pad = startPad")
 }
-check(BoardGeometry.routeTap(board, point: u1Pad4Centre, routingActive: true,
+check(BoardGeometry.routeTap(board, point: u1Pad4Centre501, routingActive: true,
                              routeNet: "NET_A", snapEnabled: true, gridMil: 25,
                              tolerance: hoverTol) == .refusedForeignNet("NET_B"),
       "route tap: routing NET_A onto a NET_B pad is refused, by name")
@@ -1293,7 +1294,7 @@ if case .finishAtPad(let finishTarget) = BoardGeometry.routeTap(
     check(false, "route tap: routing onto the same-net pad = finishAtPad")
 }
 if case .finishAtPad(let adoptTarget) = BoardGeometry.routeTap(
-    board, point: u1Pad4Centre, routingActive: true,
+    board, point: u1Pad4Centre501, routingActive: true,
     routeNet: nil, snapEnabled: true, gridMil: 25, tolerance: hoverTol) {
     check(adoptTarget.netName == "NET_B",
           "route tap: an unconnected track finishing on a pad adopts its net (NET_B), not refused")
@@ -1307,7 +1308,7 @@ check(BoardGeometry.routeTap(board, point: freeProbe, routingActive: true,
       "route tap: routing + free point appends the grid-snapped point")
 
 // -- THE guarantee: preview endpoint == tap point, probe by probe --
-for probe in [u1Pad1Centre, u1Pad4Centre, nearPadProbe, freeProbe] {
+for probe in [u1Pad1Centre, u1Pad4Centre501, nearPadProbe, freeProbe] {
     let preview = BoardGeometry.routePreview(
         board, from: u1Pad1Centre, pointer: probe,
         routeNet: "NET_A", snapEnabled: true, gridMil: 25, tolerance: hoverTol)
