@@ -331,7 +331,9 @@ final class SchematicDocument: ObservableObject {
             var instanceIDs: [UUID] = []
         }
         var parts: [Part] = []
-        for symbol in ordered where !symbol.isPowerSymbol {
+        // Power symbols are excluded (KiCad annotation does the
+        // same): their references are the "#PWR…" kind.
+        for symbol in ordered where !symbol.reference.hasPrefix("#") {
             let key = "\(symbol.library)\u{1}\(symbol.symbolName)\u{1}\(symbol.reference)"
             if let idx = parts.firstIndex(where: {
                 $0.key == key && !$0.units.contains(symbol.unit)

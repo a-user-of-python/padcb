@@ -582,7 +582,7 @@ enum SchematicERC {
 
         // -- Duplicate reference + unit --
         var byRefUnit: [String: [PlacedSymbol]] = [:]
-        for placed in state.symbols where !placed.isPowerSymbol {
+        for placed in state.symbols where !placed.reference.hasPrefix("#") {
             byRefUnit["\(placed.reference)\u{1}\(placed.unit)", default: []]
                 .append(placed)
         }
@@ -600,7 +600,7 @@ enum SchematicERC {
         var unannotated: [ERCFinding] = []
         var seenParts = Set<String>()
         for placed in state.symbols
-        where !placed.isPowerSymbol
+        where !placed.reference.hasPrefix("#")
             && !SchematicDocument.isAnnotated(placed.reference) {
             let partKey = "\(placed.library)\u{1}\(placed.symbolName)\u{1}\(placed.reference)"
             guard seenParts.insert(partKey).inserted else { continue }
