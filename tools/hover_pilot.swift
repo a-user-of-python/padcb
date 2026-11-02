@@ -83,15 +83,28 @@ log("device window: \(frame)")
 // chosen to stay on the canvas in portrait AND landscape.
 let xs: [CGFloat] = [0.16, 0.24, 0.32, 0.40, 0.28]
 let ys: [CGFloat] = [0.35, 0.50, 0.65, 0.55, 0.45]
+// Deliver a mouse-moved at a global point THREE ways: warp the
+// real cursor, post to the HID event tap, and post DIRECTLY to
+// the Simulator process (postToPid bypasses window-server
+// routing — some CI sessions drop tap-posted synthetic events).
+func deliver(_ point: CGPoint, pid: pid_t) {
+    CGWarpMouseCursorPosition(point)
+    if let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
+                           mouseCursorPosition: point, mouseButton: .left) {
+        event.post(tap: .cghidEventTap)
+        event.postToPid(pid)
+    }
+}
+
+// Start OUTSIDE the window and cross the boundary first, so the
+// Simulator sees a pointer ENTER, not just positions inside.
+deliver(CGPoint(x: frame.minX - 40, y: frame.midY), pid: sim.processIdentifier)
+Thread.sleep(forTimeInterval: 1.0)
 for round in 0..<3 {
     for i in 0..<xs.count {
         let point = CGPoint(x: frame.minX + frame.width * xs[i],
                             y: frame.minY + frame.height * ys[i])
-        CGWarpMouseCursorPosition(point)
-        if let event = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved,
-                               mouseCursorPosition: point, mouseButton: .left) {
-            event.post(tap: .cghidEventTap)
-        }
+        deliver(point, pid: sim.processIdentifier)
         log("round \(round) move \(Int(point.x)),\(Int(point.y))")
         Thread.sleep(forTimeInterval: 1.6)
     }
