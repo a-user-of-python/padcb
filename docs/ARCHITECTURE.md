@@ -1,7 +1,7 @@
 # PadCB architecture
 
 How the app is put together. Everything here describes the current shipped
-state (v5.1). For the user-facing overview, see the [README](../README.md).
+state (v5.2). For the user-facing overview, see the [README](../README.md).
 
 ## Shape of the app
 
@@ -77,3 +77,59 @@ with the same number in the matched footprint, using the pad's real
 `.kicad_mod` geometry. Pins with no pad, pads with no pin, and unresolved
 footprints are reported as anomalies, never dropped; power symbols are
 excluded from the board and listed separately.
+
+## v5.2 — pointer pipeline, board layers, and the check/index layer
+
+The PCB editor's pointer path was rebuilt after the v5.1 device
+report ("whenever I use hover the ui shakes back and forth"):
+
+- **Pointer ownership.** `BoardPointerModel` (an ObservableObject in
+  PCBEditorView.swift) owns the one `BoardPointerState`, the
+  per-channel delivery diagnostics, and a coalescing throttle
+  (at most one applied point per 1/60 s, latest wins, trailing
+  point flushed on a 60 Hz timer). Only the canvas host and the
+  status-bar readout observe it, so a hover event no longer
+  re-evaluates the editor body. `BoardPointerState` keeps a hover
+  slot PER delivery channel plus a freshness clock: the live point
+  is the freshest live slot, and a channel's end-event clears only
+  its own slot (v5.1 shared one slot — the arbitration half of the
+  shake).
+- **The route head is stateful** (`BoardRouteHead`, PCBBoardState
+  .swift), mirroring KiCad's PNS LINE_PLACER posture: it carries
+  the resolved endpoint, target pad and 45° corner across events
+  with hysteresis (pad stickiness over a 1.6× exit band, snap-cell
+  stickiness over a 0.8×grid band, corner carry while the carried
+  corner stays legal). Preview and tap commit resolve through the
+  same head — what hovers is what commits; cold taps equal the
+  pure resolution. The preview is resolved on pointer events into
+  a cache; drawing never resolves.
+- **Two canvas layers** (pcbnew's VIEW/GAL separation): a static
+  layer draws the whole board + ratsnest and re-renders only when
+  its Equatable token changes (model/checks/selection/transform);
+  a preview layer above it draws everything pointer-driven.
+- **Spatial index** (`BoardSpatialIndex`): a uniform 2 mm grid
+  over pads/segments/traces/vias/components/zones/graphics whose
+  queries replicate the previous linear scans exactly (winner
+  rules and tie-breaks included; fixture-proven over 3,000 random
+  queries × 7 lookups, 0 mismatches). It rebuilds in
+  `refreshChecks` — the single choke point every model mutation
+  already passed through — together with connectivity, clearance
+  and the **ratsnest** (`BoardRatsnest`: MST over unconnected pad
+  groups, Prim over nearest-pad links).
+- **Checks growth:** Manufacturing runs 10 rules (9: via annular
+  ring ≥ 5 mil; 10: courtyard overlap from `*.CrtYd` bounds),
+  rules 1–8 unchanged. The schematic editor gained an ERC
+  (`SchematicERC`, ConnectionTable.swift) that derives its nets
+  from the REAL connection-table build — pin census, driven-ness,
+  output conflicts, duplicate/unannotated references (power
+  symbols exempt), unresolved symbols, floating labels — plus
+  KiCad-style automatic annotation (first-free number per prefix,
+  sheet order, one undo step) in SchematicDocument.
+- **Symbol bodies:** the KiCad parser now routes style-2
+  sub-symbols to an alternate-body table (`altUnits`), so De
+  Morgan bodies render; style-1 output is byte-identical
+  (Geometry Audit stays 0). `PlacedSymbol.bodyStyle` is an
+  additive optional (absent = standard body), and all
+  properties-card edits flow through `SchematicDocument
+  .editSymbol`, which records exactly one undo step per real
+  change.
