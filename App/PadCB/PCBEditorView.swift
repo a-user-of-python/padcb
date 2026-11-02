@@ -2469,10 +2469,10 @@ struct PCBEditorView: View {
         hoverDiagnostics.record(channel, point: boardPoint)
         pointerState.apply(.hoverMoved(boardPoint))
         if before == 0 {
-            print("PADCB-HOVER first ch=\(channel.rawValue)"
+            padcbHoverPrint("PADCB-HOVER first ch=\(channel.rawValue)"
                 + " summary=\(hoverDiagnostics.summary)")
         } else if (before + 1) % 50 == 0 {
-            print("PADCB-HOVER ch=\(channel.rawValue)"
+            padcbHoverPrint("PADCB-HOVER ch=\(channel.rawValue)"
                 + " count=\(before + 1)"
                 + " summary=\(hoverDiagnostics.summary)")
         }
@@ -2483,7 +2483,7 @@ struct PCBEditorView: View {
         hoverDiagnostics.record(channel, point: nil)
         pointerState.apply(.hoverEnded)
         if before == 0 {
-            print("PADCB-HOVER first ch=\(channel.rawValue) (end)"
+            padcbHoverPrint("PADCB-HOVER first ch=\(channel.rawValue) (end)"
                 + " summary=\(hoverDiagnostics.summary)")
         }
     }
@@ -3946,6 +3946,29 @@ struct PCBEditorView: View {
     }
 }
 
+/// Diagnostics output for the hover channels (part 5.0.2):
+/// always to stdout; when the process was launched with
+/// `-padcbHoverCheck` (the simulator hover exercise), ALSO
+/// appended to Documents/hover-markers.txt — the exercise reads
+/// the counters back from the app container, immune to stdio
+/// buffering in the console stream. A normal launch never
+/// touches the file.
+func padcbHoverPrint(_ message: String) {
+    print(message)
+    guard ProcessInfo.processInfo.arguments
+        .contains("-padcbHoverCheck") else { return }
+    let url = PadCBPaths.documentsDirectory
+        .appendingPathComponent("hover-markers.txt")
+    let line = message + "\n"
+    if let handle = try? FileHandle(forWritingTo: url) {
+        _ = handle.seekToEndOfFile()
+        if let data = line.data(using: .utf8) { handle.write(data) }
+        try? handle.close()
+    } else {
+        try? line.write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
 // MARK: - Apple Pencil hover bridges (parts 5.0.1 + 5.0.2)
 
 /// UIKit hover delivery for the PCB canvas — CHANNEL 1 (overlay).
@@ -4023,7 +4046,7 @@ private struct CanvasHoverView: UIViewRepresentable {
             super.didMoveToWindow()
             if window != nil && !armedLogged {
                 armedLogged = true
-                print("PADCB-HOVER armed ch=1 (overlay hover-hit-testable)")
+                padcbHoverPrint("PADCB-HOVER armed ch=1 (overlay hover-hit-testable)")
             }
         }
 
@@ -4135,7 +4158,7 @@ private struct CanvasAncestorProbeView: UIViewRepresentable {
             top.addGestureRecognizer(recognizer)
             self.recognizer = recognizer
             attachedView = top
-            print("PADCB-HOVER armed ch=2 (recognizer on "
+            padcbHoverPrint("PADCB-HOVER armed ch=2 (recognizer on "
                 + "\(type(of: top)))")
         }
 
@@ -4191,7 +4214,9 @@ enum HoverCheckSeed {
     }
 
     static func seedIfNeeded() {
-        guard ConnectionTableStore.availableTables().isEmpty else { return }
+        let existing = ConnectionTableStore.availableTables()
+        padcbHoverPrint("PADCB-HOVER seed: \(existing.count) table(s) present")
+        guard existing.isEmpty else { return }
         let r1 = UUID()
         let r2 = UUID()
         func endpoint(_ id: UUID, _ ref: String, _ pin: String) -> ConnectionEndpoint {
@@ -4227,9 +4252,9 @@ enum HoverCheckSeed {
             let url = try ConnectionTableStore.save(
                 table,
                 forSchematicFile: URL(fileURLWithPath: "HoverCheck.kicad_sch"))
-            print("PADCB-HOVER seeded fixture table: \(url.lastPathComponent)")
+            padcbHoverPrint("PADCB-HOVER seeded fixture table: \(url.lastPathComponent)")
         } catch {
-            print("PADCB-HOVER seed FAILED: \(error)")
+            padcbHoverPrint("PADCB-HOVER seed FAILED: \(error)")
         }
     }
 }

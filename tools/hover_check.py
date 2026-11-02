@@ -4,11 +4,16 @@ Debug build of PadCB (compiled with the DEBUG compilation
 condition so the -padcbHoverCheck seed is live), launch it into
 the PCB editor on the seeded fixture board, then sweep the HOST
 mouse over the simulator window with tools/hover_pilot.swift so
-the app receives real pointer hover events. The app's PADCB-HOVER
-log markers report the per-channel counters (channel 1 = overlay
+the app receives real pointer hover events.
+
+The app mirrors its PADCB-HOVER markers to
+Documents/hover-markers.txt inside its container (the console
+stream is stdio-buffered and cannot be trusted live); this
+script polls that file for the "armed" markers, and reads the
+final per-channel counts from it (channel 1 = overlay
 recognizer, 2 = ancestor recognizer, 3 = SwiftUI
-.onContinuousHover); this script parses the final counts and
-fails if the channels never armed or every counter stayed at 0.
+.onContinuousHover). It fails if the channels never arm or every
+counter stayed at 0, and screenshots the simulator either way.
 
 Usage: hover_check.py <PadCB.app> <output-dir>
 """
@@ -46,7 +51,7 @@ def main():
     if not ios:
         raise SystemExit("no available iOS simulator runtime")
     runtime = ios[-1]["identifier"]
-    print(f"runtime: {ios[-1]['name']} ({runtime})")
+    print(f"runtime: {ios[-1]['name']} ({runtime})", flush=True)
 
     types = json.loads(simctl("list", "devicetypes", "-j"))["devicetypes"]
     by_name = {t["name"]: t for t in types}
@@ -73,68 +78,95 @@ def main():
             capture_output=True, text=True)
         if r.returncode == 0 and r.stdout.strip():
             udid = r.stdout.strip()
-            print(f"device: {dtype['name']} ({udid})")
+            print(f"device: {dtype['name']} ({udid})", flush=True)
             break
-        print(f"{dtype['name']} refused: {r.stderr.strip()[:120]}")
+        print(f"{dtype['name']} refused: {r.stderr.strip()[:120]}",
+              flush=True)
     if not udid:
         raise SystemExit("could not create an iPad simulator")
 
+    failure = None
+    counts = (0, 0, 0)
+    armed_channels = []
     try:
         simctl("boot", udid)
         simctl("bootstatus", udid, "-b")
         simctl("install", udid, app_path)
-        print("app installed")
+        print("app installed", flush=True)
+
+        container = simctl("get_app_container", udid, APP_ID, "data")
+        marker_file = os.path.join(
+            container, "Documents", "hover-markers.txt")
+        print(f"marker file: {marker_file}", flush=True)
+
+        def markers():
+            try:
+                with open(marker_file) as f:
+                    return f.read()
+            except OSError:
+                return ""
 
         # Compile the host-mouse pilot.
         pilot = "/tmp/hover_pilot"
         run("xcrun", "swiftc", "-O", "-o", pilot,
             os.path.join(tools_dir, "hover_pilot.swift"))
-        print("pilot compiled")
+        print("pilot compiled", flush=True)
 
         log_path = os.path.join(out_dir, "app-console.log")
         log_file = open(log_path, "w")
         proc = subprocess.Popen(
-            ["xcrun", "simctl", "launch", "--console", udid, APP_ID,
-             "-padcbHoverCheck"],
+            ["xcrun", "simctl", "launch", "--console-pty", udid,
+             APP_ID, "-padcbHoverCheck"],
             stdout=log_file, stderr=subprocess.STDOUT, text=True)
-        print(f"app launched (console pid {proc.pid})")
+        print(f"app launched (console pid {proc.pid})", flush=True)
 
-        def log_text():
-            log_file.flush()
-            try:
-                with open(log_path) as f:
-                    return f.read()
-            except OSError:
-                return ""
-
-        # Wait for the hover channels to arm (the canvas appeared).
-        armed = False
-        deadline = time.time() + 120
+        # Wait for the hover channels to arm (the canvas appeared)
+        # — the seed + library bootstrap can take a while in the
+        # simulator, so allow 4 minutes.
+        deadline = time.time() + 240
         while time.time() < deadline:
-            if "PADCB-HOVER armed" in log_text():
-                armed = True
+            if "PADCB-HOVER armed" in markers():
                 break
             if proc.poll() is not None:
+                failure = (f"app process exited early "
+                           f"(code {proc.returncode})")
                 break
-            time.sleep(2)
-        print(f"channels armed: {armed}")
-        if not armed:
-            print("---- app console log ----")
-            print(log_text()[-4000:])
-            raise SystemExit("hover channels never armed "
-                             "(canvas never appeared?)")
+            time.sleep(3)
+        armed_channels = sorted(set(re.findall(
+            r"PADCB-HOVER armed ch=(\d)", markers())))
+        print(f"armed markers: channels {armed_channels}", flush=True)
+        if not armed_channels and failure is None:
+            failure = "hover channels never armed (canvas never appeared?)"
 
-        # Let the board finish loading, then sweep the host mouse.
-        time.sleep(5)
-        pilot_run = subprocess.run([pilot], capture_output=True,
-                                   text=True, timeout=120)
-        with open(os.path.join(out_dir, "pilot.log"), "w") as f:
-            f.write(pilot_run.stdout + pilot_run.stderr)
-        print(f"pilot exit: {pilot_run.returncode}")
-        time.sleep(3)
+        if failure is None:
+            # Let the board settle, then sweep the host mouse.
+            time.sleep(5)
+            pilot_run = subprocess.run([pilot], capture_output=True,
+                                       text=True, timeout=180)
+            with open(os.path.join(out_dir, "pilot.log"), "w") as f:
+                f.write(pilot_run.stdout + pilot_run.stderr)
+            print(f"pilot exit: {pilot_run.returncode}", flush=True)
+            time.sleep(3)
 
+        # Evidence either way: what the simulator actually shows.
         shot = os.path.join(out_dir, "hover.png")
         simctl("io", udid, "screenshot", shot, check=False)
+
+        text = markers()
+        with open(os.path.join(out_dir, "hover-markers.txt"), "w") as f:
+            f.write(text)
+        summaries = SUMMARY_RE.findall(text)
+        if summaries:
+            counts = tuple(int(v) for v in summaries[-1])
+        print(f"final hover counts: ch1={counts[0]} ch2={counts[1]} "
+              f"ch3={counts[2]} (from {len(summaries)} summaries)",
+              flush=True)
+        with open(os.path.join(out_dir, "verdict.txt"), "w") as f:
+            f.write(f"armed={armed_channels}\n"
+                    f"counts ch1={counts[0]} ch2={counts[1]} "
+                    f"ch3={counts[2]}\n"
+                    f"failure={failure}\n")
+
         simctl("terminate", udid, APP_ID, check=False)
         try:
             proc.wait(timeout=15)
@@ -142,24 +174,16 @@ def main():
             proc.kill()
         log_file.close()
 
-        text = log_text()
-        summaries = SUMMARY_RE.findall(text)
-        counts = tuple(int(v) for v in summaries[-1]) if summaries else (0, 0, 0)
-        armed_channels = sorted(set(re.findall(
-            r"PADCB-HOVER armed ch=(\d)", text)))
-        print(f"armed markers: channels {armed_channels}")
-        print(f"final hover counts: ch1={counts[0]} ch2={counts[1]} "
-              f"ch3={counts[2]} (from {len(summaries)} summaries)")
-        with open(os.path.join(out_dir, "verdict.txt"), "w") as f:
-            f.write(f"armed={armed_channels}\n"
-                    f"counts ch1={counts[0]} ch2={counts[1]} "
-                    f"ch3={counts[2]}\n")
+        if failure is not None:
+            print("---- markers ----", flush=True)
+            print(text[-2000:] or "(no marker file content)", flush=True)
+            raise SystemExit(failure)
         if counts == (0, 0, 0):
-            print("---- app console log (tail) ----")
-            print(text[-4000:])
+            print("---- markers ----", flush=True)
+            print(text[-2000:], flush=True)
             raise SystemExit("ZERO hover events on every channel")
         print("HOVER EXERCISE: at least one channel delivered "
-              "events in the simulator")
+              "events in the simulator", flush=True)
     finally:
         subprocess.run(["xcrun", "simctl", "shutdown", udid],
                        capture_output=True)
