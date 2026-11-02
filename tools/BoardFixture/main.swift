@@ -1890,7 +1890,7 @@ check(BoardUnits.formatLength(mm: 42.6) == "42.6 mm · 1677.2 mil",
 
 /// v5.1 BoardPointerState semantics, replicated (one shared
 /// hover point; an untagged end from ANY channel nils it).
-private struct LegacyPointer52 {
+struct LegacyPointer52 {
     var hoverPoint: FPPoint? = nil
     var currentPoint: FPPoint? { hoverPoint }
     mutating func moved(_ p: FPPoint) { hoverPoint = p }
