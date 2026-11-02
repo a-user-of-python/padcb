@@ -2114,7 +2114,7 @@ struct PCBEditorView: View {
                     ForEach(Array(report.rules.enumerated()), id: \.offset) { _, rule in
                         Section {
                             if rule.violations.isEmpty {
-                                Text(rule.detail)
+                                Text("Pass — nothing to report.")
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                             } else {
