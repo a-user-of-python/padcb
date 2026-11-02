@@ -2111,7 +2111,7 @@ struct PCBEditorView: View {
                     Text("Settings")
                 }
                 if let report {
-                    ForEach(report.rules, id: \.name) { rule in
+                    ForEach(Array(report.rules.enumerated()), id: \.offset) { _, rule in
                         Section {
                             if rule.violations.isEmpty {
                                 Text(rule.detail)
@@ -3286,10 +3286,12 @@ struct PCBEditorView: View {
         ctx.fill(path, with: .color(copperColor(zone.layer)))
         ctx.opacity = 1
 
-        // Clearance cuts, clipped to the fill.
+        // Clearance cuts, clipped to the fill. (GraphicsContext
+        // is a value type — the clipped copy leaves the caller's
+        // context untouched.)
         let clearance = BoardUnits.mm(fromMil: boardState.clearanceMil)
-        ctx.saveGState()
-        ctx.clip(to: path)
+        var cutCtx = ctx
+        cutCtx.clip(to: path)
         let background = Color(red: 0.043, green: 0.055, blue: 0.043)
         for component in model.components {
             guard let footprint = component.footprint else { continue }
@@ -3310,11 +3312,11 @@ struct PCBEditorView: View {
                     else { outline.addLine(to: screen) }
                 }
                 outline.closeSubpath()
-                ctx.stroke(outline, with: .color(background),
-                           style: StrokeStyle(
-                               lineWidth: CGFloat(2 * clearance * scale),
-                               lineCap: .round, lineJoin: .round))
-                ctx.fill(outline, with: .color(background))
+                cutCtx.stroke(outline, with: .color(background),
+                              style: StrokeStyle(
+                                  lineWidth: CGFloat(2 * clearance * scale),
+                                  lineCap: .round, lineJoin: .round))
+                cutCtx.fill(outline, with: .color(background))
             }
         }
         for trace in model.traces
@@ -3325,19 +3327,18 @@ struct PCBEditorView: View {
                 let screen = boardToScreen(point)
                 if index == 0 { line.move(to: screen) } else { line.addLine(to: screen) }
             }
-            ctx.stroke(line, with: .color(background),
-                       style: StrokeStyle(
-                           lineWidth: CGFloat((trace.width + 2 * clearance) * scale),
-                           lineCap: .round, lineJoin: .round))
+            cutCtx.stroke(line, with: .color(background),
+                          style: StrokeStyle(
+                              lineWidth: CGFloat((trace.width + 2 * clearance) * scale),
+                              lineCap: .round, lineJoin: .round))
         }
         for via in model.vias where via.netName != zone.netName {
             let centre = boardToScreen(via.center)
             let r = CGFloat((via.diameter / 2 + clearance) * scale)
-            ctx.fill(Path(ellipseIn: CGRect(x: centre.x - r, y: centre.y - r,
-                                            width: 2 * r, height: 2 * r)),
-                     with: .color(background))
+            cutCtx.fill(Path(ellipseIn: CGRect(x: centre.x - r, y: centre.y - r,
+                                               width: 2 * r, height: 2 * r)),
+                        with: .color(background))
         }
-        ctx.restoreGState()
 
         ctx.stroke(path, with: .color(copperColor(zone.layer).opacity(0.9)),
                    style: StrokeStyle(lineWidth: 1.2))
@@ -3386,14 +3387,16 @@ struct PCBEditorView: View {
                                   size: CGFloat, color: Color, at point: CGPoint,
                                   anchor: UnitPoint, axisX: CGFloat,
                                   bold: Bool = false) {
-        ctx.saveGState()
-        ctx.translateBy(x: 2 * axisX, y: 0)
-        ctx.scaleBy(x: -1, y: 1)
-        ctx.draw(Text(text)
+        // GraphicsContext is a value type: a copy carries its own
+        // transform state, so mirroring never leaks into the
+        // caller's context.
+        var mctx = ctx
+        mctx.translateBy(x: 2 * axisX, y: 0)
+        mctx.scaleBy(x: -1, y: 1)
+        mctx.draw(Text(text)
             .font(.system(size: size, weight: bold ? .bold : .regular))
             .foregroundColor(color),
                  at: point, anchor: anchor)
-        ctx.restoreGState()
     }
 
     private func drawGraphicOverlay(_ ctx: inout GraphicsContext,
