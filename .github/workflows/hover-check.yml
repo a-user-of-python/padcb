@@ -55,6 +55,11 @@ jobs:
           test -s App/PadCB/Footprints/FootprintIndex.json
 
       - name: Build app for iOS Simulator (Debug + DEBUG condition)
+        # Ad-hoc signed WITH entitlements: the connection-table
+        # store keeps its AES key in the Keychain, and an unsigned
+        # simulator build gets errSecMissingEntitlement (-34018)
+        # from SecItem — the seed cannot write its fixture table
+        # without an application-identifier entitlement.
         run: |
           xcodebuild -project App/PadCB.xcodeproj \
             -scheme PadCB \
@@ -62,8 +67,11 @@ jobs:
             -configuration Debug \
             -derivedDataPath build/simdd \
             SWIFT_ACTIVE_COMPILATION_CONDITIONS=DEBUG \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=YES \
+            CODE_SIGNING_REQUIRED=YES \
+            CODE_SIGN_IDENTITY=- \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_ENTITLEMENTS=../tools/HoverCheck.entitlements \
             build
 
       - name: Hover exercise (host-mouse sweep, per-channel counts)

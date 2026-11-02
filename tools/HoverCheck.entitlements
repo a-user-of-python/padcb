@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Simulator hover exercise ONLY (part 5.0.2): the Debug
+	     simulator build is ad-hoc signed with these entitlements
+	     so the connection-table store's Keychain key works in the
+	     simulator (an unsigned build gets errSecMissingEntitlement
+	     -34018). The team prefix is a placeholder — the simulator
+	     does not validate team membership. Never used by the
+	     device/IPA build. -->
+	<key>application-identifier</key>
+	<string>AAAAAAAAAA.com.user.padcb</string>
+	<key>keychain-access-groups</key>
+	<array>
+		<string>AAAAAAAAAA.com.user.padcb</string>
+	</array>
+</dict>
+</plist>
