@@ -1869,6 +1869,804 @@ check(clearViolations51(clearMoved).contains {
 check(BoardUnits.formatLength(mm: 42.6) == "42.6 mm · 1677.2 mil",
       "segments: the subtotal readout formats \"42.6 mm · 1677.2 mil\"")
 
+// MARK: - Part 5.2: hover oscillation, route head, spatial index,
+//         ratsnest, new checks, placement tools, ERC, De Morgan
+//
+// Sean's v5.1 device report (2026-11-02 08:44): "whenever I use
+// hover the ui shakes back and forth". Diagnosis (CONTRACTS.md,
+// Part 5.2): three mechanisms, two of them proven below against
+// the shipped semantics — (1) channel arbitration: BOTH hover
+// channels are live on his hardware and v5.1's single shared
+// hover point was nilled by EITHER channel's end, so the
+// SwiftUI channel's churn blinked the stream; (2) boundary
+// dither: the PURE route resolution re-derives the endpoint
+// from the instantaneous pointer, so snap-cell / pad-rim /
+// diagonal boundaries flip per event; (3) whole-board
+// invalidation per event (view-side; the coalescing throttle
+// below is its model half). The legacy pointer semantics are
+// replicated here verbatim-in-miniature from the v5.1
+// PCBBoardState.swift so the oscillation is demonstrated
+// against the semantics that actually shipped, not a strawman.
+
+/// v5.1 BoardPointerState semantics, replicated (one shared
+/// hover point; an untagged end from ANY channel nils it).
+private struct LegacyPointer52 {
+    var hoverPoint: FPPoint? = nil
+    var currentPoint: FPPoint? { hoverPoint }
+    mutating func moved(_ p: FPPoint) { hoverPoint = p }
+    mutating func ended() { hoverPoint = nil }
+}
+
+// -- (1) Channel arbitration: interleaved dual-channel stream --
+
+let hoverP52 = FPPoint(x: 12.3, y: 4.5)
+var legacy52 = LegacyPointer52()
+var legacyTransitions52 = 0
+var legacyLast52: FPPoint?? = nil
+for _ in 0..<60 {
+    // One physical hover, two live channels: the interaction
+    // channel moves steadily; the SwiftUI channel restarts its
+    // phase (end + active) around it — v5.1 funnels both into
+    // the same point.
+    legacy52.moved(hoverP52)
+    if legacyLast52 != nil, legacy52.currentPoint != legacyLast52! {
+        legacyTransitions52 += 1
+    }
+    legacyLast52 = legacy52.currentPoint
+    legacy52.ended()
+    if legacyLast52 != nil, legacy52.currentPoint != legacyLast52! {
+        legacyTransitions52 += 1
+    }
+    legacyLast52 = legacy52.currentPoint
+    legacy52.moved(hoverP52)
+    if legacyLast52 != nil, legacy52.currentPoint != legacyLast52! {
+        legacyTransitions52 += 1
+    }
+    legacyLast52 = legacy52.currentPoint
+}
+check(legacyTransitions52 >= 100,
+      "5.2 arbitration: v5.1 semantics oscillate under dual-channel churn (\(legacyTransitions52) transitions)")
+
+var pointer52 = BoardPointerState()
+var newTransitions52 = 0
+var newLast52: FPPoint?? = nil
+for _ in 0..<60 {
+    pointer52.applyHoverMoved(hoverP52, channel: .interaction)
+    if newLast52 != nil, pointer52.currentPoint != newLast52! {
+        newTransitions52 += 1
+    }
+    newLast52 = pointer52.currentPoint
+    pointer52.applyHoverEnded(channel: .swiftUI)
+    if newLast52 != nil, pointer52.currentPoint != newLast52! {
+        newTransitions52 += 1
+    }
+    newLast52 = pointer52.currentPoint
+    pointer52.applyHoverMoved(hoverP52, channel: .swiftUI)
+    if newLast52 != nil, pointer52.currentPoint != newLast52! {
+        newTransitions52 += 1
+    }
+    newLast52 = pointer52.currentPoint
+    pointer52.applyHoverEnded(channel: .swiftUI)
+    if newLast52 != nil, pointer52.currentPoint != newLast52! {
+        newTransitions52 += 1
+    }
+    newLast52 = pointer52.currentPoint
+}
+check(newTransitions52 == 0 && pointer52.currentPoint == hoverP52,
+      "5.2 arbitration: per-channel slots never blink under the same churn (\(newTransitions52) transitions)")
+pointer52.applyHoverEnded(channel: .interaction)
+check(pointer52.currentPoint == nil,
+      "5.2 arbitration: when BOTH channels have ended the point clears")
+
+// Stationary hover: 200 identical moves, zero state change
+// after the first.
+var stationary52 = BoardPointerState()
+stationary52.applyHoverMoved(hoverP52, channel: .interaction)
+var stationaryStable52 = true
+for _ in 0..<200 {
+    stationary52.applyHoverMoved(hoverP52, channel: .interaction)
+    stationary52.applyHoverEnded(channel: .swiftUI)
+    if stationary52.currentPoint != hoverP52 { stationaryStable52 = false }
+}
+check(stationaryStable52,
+      "5.2 arbitration: a stationary hover is perfectly still for 200 events")
+
+// -- (2) Route head hysteresis --
+
+/// A small controlled board for the head tests: one pad at the
+/// origin (route start) and one at (30, 0), both on NET_A.
+func synth52Pad(_ number: String, _ x: Double, _ y: Double,
+                w: Double = 1.0, h: Double = 1.0) -> KiCadFootprintPad {
+    KiCadFootprintPad(number: number, type: .smd, shape: .rect,
+                      x: x, y: y, rotation: 0, width: w, height: h,
+                      drill: nil, layers: ["F.Cu"], roundrectRatio: nil,
+                      chamferRatio: nil, rectDelta: nil, primitives: [],
+                      customAnchor: nil)
+}
+func synth52Component(_ reference: String, origin: FPPoint,
+                      pads: [KiCadFootprintPad],
+                      nets: [String: String]) -> BoardComponent {
+    BoardComponent(
+        reference: reference, value: "V", symbolKey: "L:S",
+        footprintKey: "G:F", matchKind: nil,
+        footprint: KiCadFootprint(name: "F", description: "", tags: [],
+                                  attributes: [], properties: [:],
+                                  pads: pads, graphics: [],
+                                  skippedNodeCounts: [:]),
+        pins: pads.map {
+            BoardPinBinding(pinNumber: $0.number, pinName: "",
+                            pinType: "passive",
+                            netName: nets[$0.number], pad: $0)
+        },
+        anomalies: [], notes: [], origin: origin, boundsSize: (w: 4, h: 4))
+}
+let headBoard52 = BoardModel(
+    tableTitle: "Head", sourceFileName: "head.json",
+    components: [
+        synth52Component("S1", origin: FPPoint(x: 0, y: 0),
+                         pads: [synth52Pad("1", 0, 0, w: 2, h: 2)],
+                         nets: ["1": "NET_A"]),
+        synth52Component("S2", origin: FPPoint(x: 30, y: 0),
+                         pads: [synth52Pad("1", 0, 0, w: 1, h: 1)],
+                         nets: ["1": "NET_A"]),
+    ],
+    globalAnomalies: [], excludedPowerReferences: [], netCount: 1,
+    netNames: ["NET_A"])
+let headFrom52 = FPPoint(x: 0, y: 0)
+let gridMil52 = 25.0
+
+// Snap-boundary straddle: the pointer dithers ±0.05 mm across
+// the snap boundary at x = 9.8425 (cells 9.525 / 10.16).
+var legacyEnds52 = Set<String>()
+var head52 = BoardRouteHead()
+var headEnds52 = Set<String>()
+for i in 0..<40 {
+    let px = i % 2 == 0 ? 9.80 : 9.89
+    let probe = FPPoint(x: px, y: 3.0)
+    let legacy = BoardGeometry.routePreview(
+        headBoard52, from: headFrom52, pointer: probe, routeNet: "NET_A",
+        snapEnabled: true, gridMil: gridMil52, tolerance: 0.8)
+    legacyEnds52.insert("\(legacy.endPoint.x),\(legacy.endPoint.y)")
+    let resolved = head52.resolve(
+        headBoard52, from: headFrom52, pointer: probe, routeNet: "NET_A",
+        snapEnabled: true, gridMil: gridMil52, tolerance: 0.8)
+    headEnds52.insert("\(resolved.endPoint.x),\(resolved.endPoint.y)")
+}
+check(legacyEnds52.count == 2,
+      "5.2 head: the pure resolution dithers between 2 endpoints on a snap boundary (got \(legacyEnds52.count))")
+check(headEnds52.count == 1,
+      "5.2 head: snap stickiness holds ONE endpoint through the same dither (got \(headEnds52.count))")
+// ...and the head still follows a genuine move.
+let followed52 = head52.resolve(
+    headBoard52, from: headFrom52, pointer: FPPoint(x: 12.0, y: 3.0),
+    routeNet: "NET_A", snapEnabled: true, gridMil: gridMil52, tolerance: 0.8)
+check(approx(followed52.endPoint.x, 12.065) && approx(followed52.endPoint.y, 3.175),
+      "5.2 head: a genuine move re-resolves (stickiness is not stickiness-forever)")
+
+// Pad-rim straddle: S2's pad (centre (30,0), 1x1) has its
+// tolerance rim at x = 31.3 for tolerance 0.8.
+var rimLegacy52 = Set<String>()
+var rimHead52 = BoardRouteHead()
+var rimHeadEnds52 = Set<String>()
+for i in 0..<40 {
+    let px = i % 2 == 0 ? 31.25 : 31.35
+    let probe = FPPoint(x: px, y: 0)
+    let legacy = BoardGeometry.routePreview(
+        headBoard52, from: headFrom52, pointer: probe, routeNet: "NET_A",
+        snapEnabled: true, gridMil: gridMil52, tolerance: 0.8)
+    rimLegacy52.insert("\(legacy.endPoint.x),\(legacy.endPoint.y)")
+    let resolved = rimHead52.resolve(
+        headBoard52, from: headFrom52, pointer: probe, routeNet: "NET_A",
+        snapEnabled: true, gridMil: gridMil52, tolerance: 0.8)
+    rimHeadEnds52.insert("\(resolved.endPoint.x),\(resolved.endPoint.y)")
+}
+check(rimLegacy52.count == 2,
+      "5.2 head: the pure resolution flips pad-anchor/free on the pad rim (got \(rimLegacy52.count))")
+check(rimHeadEnds52.count == 1
+      && rimHeadEnds52.first == "30.0,0.0",
+      "5.2 head: pad stickiness holds the anchor through the rim dither (got \(rimHeadEnds52))")
+// Preview == tap through the head: anchored stickiness commits
+// the anchored pad.
+let rimTap52 = rimHead52.tapResolution(
+    headBoard52, from: headFrom52, point: FPPoint(x: 31.35, y: 0),
+    routingActive: true, routeNet: "NET_A", snapEnabled: true,
+    gridMil: gridMil52, tolerance: 0.8)
+if case .finishAtPad(let tapTarget) = rimTap52 {
+    check(tapTarget.reference == "S2",
+          "5.2 head: a tap during anchor stickiness finishes on the previewed pad")
+} else {
+    check(false, "5.2 head: a tap during anchor stickiness finishes on the previewed pad (got \(rimTap52))")
+}
+// A cold tap (no routing) is the pure routeTap answer verbatim.
+var coldHead52 = BoardRouteHead()
+check(coldHead52.tapResolution(
+        headBoard52, from: nil, point: FPPoint(x: 20, y: 20),
+        routingActive: false, routeNet: nil, snapEnabled: true,
+        gridMil: gridMil52, tolerance: 0.8)
+      == BoardGeometry.routeTap(
+        headBoard52, point: FPPoint(x: 20, y: 20), routingActive: false,
+        routeNet: nil, snapEnabled: true, gridMil: gridMil52, tolerance: 0.8),
+      "5.2 head: a cold start tap equals the pure routeTap")
+
+// Slow near-diagonal sweep WITH sub-cell jitter: the remainder
+// orientation (vertical vs horizontal axis segment) must flip
+// at most once through the head, many times through the pure
+// resolution.
+func remainderOrientation52(_ preview: BoardRoutePreview, from: FPPoint) -> String {
+    guard let corner = preview.corner else { return "diag" }
+    return preview.endPoint.x == corner.x ? "V" : "H"
+}
+func orientationFlips52(_ orientations: [String]) -> Int {
+    var flips = 0
+    var lastAxis: String? = nil
+    for o in orientations where o != "diag" {
+        if let lastAxis, o != lastAxis { flips += 1 }
+        lastAxis = o
+    }
+    return flips
+}
+var legacyOrient52: [String] = []
+var headOrient52: [String] = []
+var sweepHead52 = BoardRouteHead()
+for t in 0...80 {
+    let along = Double(t) * 0.1
+    // Along-track jitter ±0.2 mm: near the diagonal crossing this
+    // moves the raw point back and forth ACROSS the diagonal
+    // through `from` — the dither that flip-flops a pure
+    // resolution.
+    let jitter = (t % 2 == 0 ? 0.2 : -0.2) * 0.7071
+    let probe = FPPoint(x: 4 + along + jitter,
+                        y: 8 - along - jitter)
+    let legacy = BoardGeometry.routePreview(
+        headBoard52, from: headFrom52, pointer: probe, routeNet: "NET_A",
+        snapEnabled: true, gridMil: gridMil52, tolerance: 0.8)
+    legacyOrient52.append(remainderOrientation52(legacy, from: headFrom52))
+    let resolved = sweepHead52.resolve(
+        headBoard52, from: headFrom52, pointer: probe, routeNet: "NET_A",
+        snapEnabled: true, gridMil: gridMil52, tolerance: 0.8)
+    headOrient52.append(remainderOrientation52(resolved, from: headFrom52))
+}
+check(orientationFlips52(legacyOrient52) >= 3,
+      "5.2 head: the pure resolution flip-flops on a jittered diagonal sweep (\(orientationFlips52(legacyOrient52)) flips)")
+check(orientationFlips52(headOrient52) <= 1,
+      "5.2 head: the stateful head crosses the diagonal at most once (\(orientationFlips52(headOrient52)) flips)")
+
+// -- (3) Pointer throttle: coalescing --
+
+var throttle52 = BoardPointerThrottle()
+var admitted52: [FPPoint] = []
+let offerCount52 = 240
+for i in 0..<offerCount52 {
+    let t = Double(i) / 240.0
+    let p = FPPoint(x: Double(i), y: 0)
+    if let admitted = throttle52.offer(p, at: t) { admitted52.append(admitted) }
+    if let flushed = throttle52.flush(at: t) { admitted52.append(flushed) }
+}
+check(admitted52.count >= 55 && admitted52.count <= 65,
+      "5.2 throttle: 240 offers in 1 s admit ~60 points (got \(admitted52.count))")
+var throttleEnd52 = BoardPointerThrottle()
+_ = throttleEnd52.offer(FPPoint(x: 1, y: 1), at: 0)
+_ = throttleEnd52.offer(FPPoint(x: 2, y: 2), at: 0.001)
+check(throttleEnd52.hasPending, "5.2 throttle: a mid-window offer is pending")
+throttleEnd52.end()
+check(!throttleEnd52.hasPending && throttleEnd52.flush(at: 10) == nil,
+      "5.2 throttle: end() owes no trailing point")
+
+// -- Spatial index: equality with the linear scans + timing --
+
+/// Deterministic PRNG (LCG) for the synthetic boards.
+struct LCG52: RandomNumberGenerator {
+    var state: UInt64
+    mutating func next() -> UInt64 {
+        state = state &* 6364136223846793005 &+ 1442695040888963407
+        return state >> 11
+    }
+}
+var rng52 = LCG52(state: 0x5EED_0052)
+func rand52(_ upper: Double) -> Double {
+    Double(rng52.next() % 1_000_000) / 1_000_000.0 * upper
+}
+
+var synthComponents52: [BoardComponent] = []
+for c in 0..<120 {
+    var pads: [KiCadFootprintPad] = []
+    var nets: [String: String] = [:]
+    for p in 0..<8 {
+        pads.append(synth52Pad("\(p + 1)", rand52(6) - 3, rand52(6) - 3,
+                               w: 0.8, h: 0.8))
+        nets["\(p + 1)"] = "NET_\(p % 3)"
+    }
+    synthComponents52.append(synth52Component(
+        "C\(c)", origin: FPPoint(x: rand52(200), y: rand52(200)),
+        pads: pads, nets: nets))
+}
+var synthTraces52: [BoardTrace] = []
+for t in 0..<400 {
+    var points: [FPPoint] = []
+    var p = FPPoint(x: rand52(200), y: rand52(200))
+    for _ in 0..<(2 + t % 4) {
+        points.append(p)
+        p = FPPoint(x: p.x + rand52(20) - 10, y: p.y + rand52(20) - 10)
+    }
+    synthTraces52.append(BoardTrace(
+        id: UUID(), netName: "NET_\(t % 3)", layer: "F.Cu",
+        width: 0.25, points: points))
+}
+var synthVias52: [BoardVia] = []
+for v in 0..<60 {
+    synthVias52.append(BoardVia(
+        id: UUID(), netName: "NET_\(v % 3)",
+        center: FPPoint(x: rand52(200), y: rand52(200)),
+        diameter: 0.6, drill: 0.3))
+}
+var synthZones52: [BoardZone] = []
+for z in 0..<12 {
+    let cx = rand52(180), cy = rand52(180)
+    synthZones52.append(BoardZone(
+        id: UUID(), netName: "NET_\(z % 3)", layer: "F.Cu",
+        points: [FPPoint(x: cx, y: cy), FPPoint(x: cx + 15, y: cy),
+                 FPPoint(x: cx + 15, y: cy + 15), FPPoint(x: cx, y: cy + 15)]))
+}
+var synthGraphics52: [BoardGraphicItem] = []
+for g in 0..<30 {
+    synthGraphics52.append(BoardGraphicItem(
+        id: UUID(), kind: .line, layer: "Dwgs.User",
+        points: [FPPoint(x: rand52(200), y: rand52(200)),
+                 FPPoint(x: rand52(200), y: rand52(200))]))
+}
+let synthBoard52 = BoardModel(
+    tableTitle: "Synth", sourceFileName: "synth.json",
+    components: synthComponents52, globalAnomalies: [],
+    excludedPowerReferences: [], netCount: 3,
+    netNames: ["NET_0", "NET_1", "NET_2"],
+    traces: synthTraces52, graphics: synthGraphics52,
+    vias: synthVias52, zones: synthZones52)
+let synthIndex52 = BoardSpatialIndex.build(synthBoard52)
+
+var indexMismatches52 = 0
+for q in 0..<3000 {
+    let point = FPPoint(x: rand52(210) - 5, y: rand52(210) - 5)
+    let tolerance = q % 2 == 0 ? 0.8 : 2.5
+    let linPad = BoardGeometry.padAt(synthBoard52, point: point, tolerance: tolerance)
+    let idxPad = synthIndex52.padAt(synthBoard52, point: point, tolerance: tolerance)
+    if (linPad?.component.reference, linPad?.pad.number, linPad?.netName)
+        != (idxPad?.component.reference, idxPad?.pad.number, idxPad?.netName) {
+        indexMismatches52 += 1
+    }
+    if BoardGeometry.traceAt(synthBoard52, point: point, tolerance: tolerance)?.id
+        != synthIndex52.traceAt(synthBoard52, point: point, tolerance: tolerance)?.id {
+        indexMismatches52 += 1
+    }
+    if BoardGeometry.componentAt(synthBoard52, point: point)?.reference
+        != synthIndex52.componentAt(synthBoard52, point: point)?.reference {
+        indexMismatches52 += 1
+    }
+    if BoardGeometry.viaAt(synthBoard52, point: point, tolerance: tolerance)?.id
+        != synthIndex52.viaAt(synthBoard52, point: point, tolerance: tolerance)?.id {
+        indexMismatches52 += 1
+    }
+    if BoardGeometry.zoneAt(synthBoard52, point: point, tolerance: tolerance)?.id
+        != synthIndex52.zoneAt(synthBoard52, point: point, tolerance: tolerance)?.id {
+        indexMismatches52 += 1
+    }
+    if BoardGeometry.graphicAt(synthBoard52, point: point, tolerance: tolerance)?.id
+        != synthIndex52.graphicAt(synthBoard52, point: point, tolerance: tolerance)?.id {
+        indexMismatches52 += 1
+    }
+    let linSeg = BoardGeometry.segmentAt(synthBoard52.traces, point: point,
+                                         tolerance: tolerance)
+    let idxSeg = synthIndex52.segmentAt(synthBoard52, point: point,
+                                        tolerance: tolerance)
+    if linSeg?.trace.id != idxSeg?.trace.id
+        || linSeg?.index != idxSeg?.index
+        || (linSeg != nil && idxSeg != nil
+            && !approx(linSeg!.distance, idxSeg!.distance)) {
+        indexMismatches52 += 1
+    }
+    if q % 15 == 0 {
+        let linHover = BoardGeometry.hoverTarget(synthBoard52, point: point, tolerance: tolerance)
+        let idxHover = synthIndex52.hoverTarget(synthBoard52, point: point, tolerance: tolerance)
+        if linHover != idxHover { indexMismatches52 += 1 }
+    }
+}
+check(indexMismatches52 == 0,
+      "5.2 index: 3,000 random queries x 7 lookups match the linear scans exactly (\(indexMismatches52) mismatches)")
+
+// Timing (host numbers — printed for the record, gated loosely):
+// 2,000 hover-target resolutions, linear vs indexed.
+var probes52: [FPPoint] = []
+for _ in 0..<2000 { probes52.append(FPPoint(x: rand52(200), y: rand52(200))) }
+let linearStart52 = Date()
+var linearHits52 = 0
+for p in probes52 {
+    if BoardGeometry.hoverTarget(synthBoard52, point: p, tolerance: 0.8) != nil {
+        linearHits52 += 1
+    }
+}
+let linearTime52 = Date().timeIntervalSince(linearStart52)
+let indexStart52 = Date()
+var indexHits52 = 0
+for p in probes52 {
+    if synthIndex52.hoverTarget(synthBoard52, point: p, tolerance: 0.8) != nil {
+        indexHits52 += 1
+    }
+}
+let indexTime52 = Date().timeIntervalSince(indexStart52)
+print(String(format: "5.2 index timing (host): linear %.3f s, indexed %.3f s for 2,000 hover targets (%.1fx)",
+             linearTime52, indexTime52, linearTime52 / max(indexTime52, 1e-6)))
+check(linearHits52 == indexHits52 && indexTime52 < linearTime52,
+      "5.2 index: indexed hover targets agree and run faster on the synthetic board")
+
+// -- Ratsnest --
+
+func ratsnestBoard52(traces: [BoardTrace]) -> BoardModel {
+    BoardModel(
+        tableTitle: "RN", sourceFileName: "rn.json",
+        components: [
+            synth52Component("A", origin: FPPoint(x: 0, y: 0),
+                             pads: [synth52Pad("1", 0, 0), synth52Pad("2", 10, 0)],
+                             nets: ["1": "N", "2": "N"]),
+            synth52Component("B", origin: FPPoint(x: 100, y: 0),
+                             pads: [synth52Pad("1", 0, 0), synth52Pad("2", 10, 0)],
+                             nets: ["1": "N", "2": "N"]),
+            synth52Component("C", origin: FPPoint(x: 0, y: 100),
+                             pads: [synth52Pad("1", 0, 0)],
+                             nets: ["1": "SOLO"]),
+        ],
+        globalAnomalies: [], excludedPowerReferences: [], netCount: 2,
+        netNames: ["N", "SOLO"], traces: traces)
+}
+let rnOpen52 = BoardRatsnest.segments(model: ratsnestBoard52(traces: []),
+                                      copperCount: 4)
+check(rnOpen52.count == 3 && rnOpen52.allSatisfy { $0.netName == "N" },
+      "5.2 ratsnest: 4 unconnected pads of one net give a 3-segment MST (got \(rnOpen52.count))")
+let rnTotal52 = rnOpen52.reduce(0) { $0 + $1.from.distance(to: $1.to) }
+check(approx(rnTotal52, 110),
+      "5.2 ratsnest: the MST takes the two 10 mm in-part links and the 90 mm bridge (total \(rnTotal52))")
+let rnBridged52 = BoardRatsnest.segments(
+    model: ratsnestBoard52(traces: [BoardTrace(
+        id: UUID(), netName: "N", layer: "F.Cu", width: 0.25,
+        points: [FPPoint(x: 10, y: 0), FPPoint(x: 100, y: 0)])]),
+    copperCount: 4)
+check(rnBridged52.count == 2,
+      "5.2 ratsnest: a routed bridge merges two groups (got \(rnBridged52.count))")
+let rnDone52 = BoardRatsnest.segments(
+    model: ratsnestBoard52(traces: [BoardTrace(
+        id: UUID(), netName: "N", layer: "F.Cu", width: 0.25,
+        points: [FPPoint(x: 0, y: 0), FPPoint(x: 10, y: 0),
+                 FPPoint(x: 100, y: 0), FPPoint(x: 110, y: 0)])]),
+    copperCount: 4)
+check(rnDone52.isEmpty,
+      "5.2 ratsnest: a fully routed net (and a single-pad net) show no lines")
+
+// -- Manufacturing rules 9 + 10 (1-8 untouched) --
+
+let mfgBase52 = ratsnestBoard52(traces: [])
+var mfgModel52 = mfgBase52
+mfgModel52.vias = [
+    BoardVia(id: UUID(), netName: "N", center: FPPoint(x: 50, y: 50),
+             diameter: 0.5, drill: 0.3),   // ring 0.10 mm = 3.9 mil: fails
+    BoardVia(id: UUID(), netName: "N", center: FPPoint(x: 60, y: 50),
+             diameter: 0.8, drill: 0.3),   // ring 0.25 mm = 9.8 mil: passes
+]
+let mfgReport52 = BoardManufacturing.check(
+    model: mfgModel52, copperCount: 4,
+    settings: ManufacturingSettings(),
+    connectivity: BoardConnectivity.analyze(model: mfgModel52, copperCount: 4))
+check(mfgReport52.rules.count == 10,
+      "5.2 manufacturing: the report now runs 10 rules (got \(mfgReport52.rules.count))")
+check(mfgReport52.rules[7].name == "Every component has a footprint"
+      && mfgReport52.rules[0].name.hasPrefix("Clearance"),
+      "5.2 manufacturing: rules 1-8 keep their names and order")
+check(mfgReport52.rules[8].name.hasPrefix("Via annular ring")
+      && !mfgReport52.rules[8].passed
+      && mfgReport52.rules[8].violations.count == 1,
+      "5.2 manufacturing: the 3.9 mil ring fails rule 9, the 9.8 mil ring passes")
+check(mfgReport52.rules[9].passed,
+      "5.2 manufacturing: no courtyards in the base model, rule 10 passes")
+
+func courtyardComponent52(_ reference: String, origin: FPPoint) -> BoardComponent {
+    var component = synth52Component(
+        reference, origin: origin, pads: [synth52Pad("1", 0, 0)], nets: ["1": "N"])
+    component.footprint = KiCadFootprint(
+        name: "F", description: "", tags: [], attributes: [], properties: [:],
+        pads: [synth52Pad("1", 0, 0)],
+        graphics: [.rect(start: FPPoint(x: -5, y: -5), end: FPPoint(x: 5, y: 5),
+                         layer: "F.CrtYd", strokeWidth: 0.05,
+                         strokeType: "default", fill: "none")],
+        skippedNodeCounts: [:])
+    return component
+}
+var courtModel52 = mfgBase52
+courtModel52.components = [
+    courtyardComponent52("K1", origin: FPPoint(x: 0, y: 0)),
+    courtyardComponent52("K2", origin: FPPoint(x: 8, y: 0)),   // overlaps K1
+    courtyardComponent52("K3", origin: FPPoint(x: 40, y: 0)),  // clear
+]
+courtModel52.vias = []
+let courtReport52 = BoardManufacturing.check(
+    model: courtModel52, copperCount: 4,
+    settings: ManufacturingSettings(),
+    connectivity: BoardConnectivity.analyze(model: courtModel52, copperCount: 4))
+check(!courtReport52.rules[9].passed
+      && courtReport52.rules[9].violations.count == 1
+      && courtReport52.rules[9].violations[0].contains("K1")
+      && courtReport52.rules[9].violations[0].contains("K2"),
+      "5.2 manufacturing: overlapping courtyards fail rule 10 naming both parts")
+
+// -- Align / distribute / duplicate / lock / measure --
+
+func alignComponent52(_ reference: String, _ x: Double, _ y: Double) -> BoardComponent {
+    synth52Component(reference, origin: FPPoint(x: x, y: y),
+                     pads: [synth52Pad("1", 0, 0, w: 2, h: 2)], nets: ["1": "N"])
+}
+let alignBoard52 = BoardModel(
+    tableTitle: "Align", sourceFileName: "a.json",
+    components: [alignComponent52("A1", 10, 10), alignComponent52("A2", 20, 14),
+                 alignComponent52("A3", 30, 18), alignComponent52("A4", 40, 22)],
+    globalAnomalies: [], excludedPowerReferences: [], netCount: 1,
+    netNames: ["N"])
+let alignLeft52 = BoardPlacementTools.alignedOrigins(
+    alignBoard52, references: ["A1", "A2", "A3"], mode: .left,
+    lockedReferences: [])
+check(alignLeft52 == ["A2": FPPoint(x: 10, y: 14), "A3": FPPoint(x: 10, y: 18)],
+      "5.2 align: left-align moves A2/A3 to A1's edge, A1 (already there) is untouched")
+let alignCentre52 = BoardPlacementTools.alignedOrigins(
+    alignBoard52, references: ["A2", "A1"], mode: .centreX,
+    lockedReferences: [])
+check(alignCentre52 == ["A1": FPPoint(x: 20, y: 10)],
+      "5.2 align: centre-align anchors on the FIRST listed reference (A2)")
+let alignLocked52 = BoardPlacementTools.alignedOrigins(
+    alignBoard52, references: ["A1", "A2", "A3"], mode: .left,
+    lockedReferences: ["A3"])
+check(alignLocked52 == ["A2": FPPoint(x: 10, y: 14)],
+      "5.2 align: a locked component never moves")
+let distributed52 = BoardPlacementTools.distributedOrigins(
+    alignBoard52, references: ["A1", "A2", "A3", "A4"], horizontal: true,
+    lockedReferences: [])
+check(distributed52.isEmpty,
+      "5.2 distribute: already-even centres stay (extremes fixed, middles already spaced)")
+let unevenBoard52 = BoardModel(
+    tableTitle: "Dist", sourceFileName: "d.json",
+    components: [alignComponent52("B1", 0, 0), alignComponent52("B2", 10, 0),
+                 alignComponent52("B3", 15, 0), alignComponent52("B4", 40, 0)],
+    globalAnomalies: [], excludedPowerReferences: [], netCount: 1,
+    netNames: ["N"])
+let redistributed52 = BoardPlacementTools.distributedOrigins(
+    unevenBoard52, references: ["B1", "B2", "B3", "B4"], horizontal: true,
+    lockedReferences: [])
+check(redistributed52.count == 2
+      && approx(redistributed52["B2"]!.x, 40.0 / 3)
+      && approx(redistributed52["B3"]!.x, 80.0 / 3),
+      "5.2 distribute: middles move to even thirds between the fixed extremes")
+
+var dupState52 = BoardState()
+let dupTraceID52 = UUID(), dupViaID52 = UUID(), dupZoneID52 = UUID(), dupGraphicID52 = UUID()
+dupState52.traces = [BoardTrace(id: dupTraceID52, netName: "N", layer: "F.Cu",
+                                width: 0.3, points: [FPPoint(x: 0, y: 0), FPPoint(x: 5, y: 0)])]
+dupState52.vias = [BoardVia(id: dupViaID52, netName: "N",
+                            center: FPPoint(x: 2, y: 2), diameter: 0.6, drill: 0.3)]
+dupState52.zones = [BoardZone(id: dupZoneID52, netName: "N", layer: "F.Cu",
+                              points: [FPPoint(x: 0, y: 0), FPPoint(x: 4, y: 0), FPPoint(x: 4, y: 4)])]
+dupState52.graphics = [BoardGraphicItem(id: dupGraphicID52, kind: .line,
+                                        layer: "Dwgs.User",
+                                        points: [FPPoint(x: 1, y: 1), FPPoint(x: 6, y: 1)])]
+let dup52 = dupState52.duplicatedItems(
+    traceIDs: [dupTraceID52], viaIDs: [dupViaID52], zoneIDs: [dupZoneID52],
+    graphicIDs: [dupGraphicID52], offset: FPPoint(x: 1.27, y: 1.27))
+check(dup52.traces.count == 1 && dup52.traces[0].id != dupTraceID52
+      && dup52.traces[0].points[0] == FPPoint(x: 1.27, y: 1.27)
+      && dup52.traces[0].netName == "N" && dup52.traces[0].width == 0.3
+      && dup52.vias.count == 1 && dup52.vias[0].center == FPPoint(x: 3.27, y: 3.27)
+      && dup52.zones.count == 1 && dup52.zones[0].points[2] == FPPoint(x: 5.27, y: 5.27)
+      && dup52.graphics.count == 1 && dup52.graphics[0].id != dupGraphicID52,
+      "5.2 duplicate: copies get fresh ids, the offset, and keep net/width/layer")
+
+var lockState52 = dupState52
+lockState52.setLocked(dupTraceID52, true)
+lockState52.setLocked(reference: "A1", true)
+check(lockState52.isLocked(dupTraceID52) && lockState52.isLocked(reference: "A1")
+      && !lockState52.isLocked(dupViaID52),
+      "5.2 lock: item and component locks record independently")
+let lockRoundTrip52 = try! JSONDecoder().decode(
+    BoardState.self, from: JSONEncoder().encode(lockState52))
+check(lockRoundTrip52 == lockState52,
+      "5.2 lock: locks survive the BoardState round-trip")
+let preLockJSON52 = """
+{"formatVersion":1,"placements":{},"excludedReferences":[],"traces":[],
+ "graphics":[],"knownReferences":[],"vias":[],"zones":[],"sides":{},
+ "copperLayerCount":4,"gridMil":25,"clearanceMil":8}
+"""
+let preLockState52 = try! JSONDecoder().decode(
+    BoardState.self, from: Data(preLockJSON52.utf8))
+check(preLockState52.lockedItemIDs.isEmpty && preLockState52.lockedReferences.isEmpty,
+      "5.2 lock: a pre-5.2 board file (no lock keys) decodes with no locks")
+
+var measure52 = BoardMeasure()
+measure52.tap(FPPoint(x: 0, y: 0))
+check(measure52.distance == nil, "5.2 measure: one tap is not a measurement")
+measure52.tap(FPPoint(x: 3, y: 4))
+check(measure52.distance == 5 && measure52.delta == FPPoint(x: 3, y: 4),
+      "5.2 measure: two taps give distance and deltas")
+measure52.tap(FPPoint(x: 10, y: 10))
+check(measure52.distance == nil && measure52.a == FPPoint(x: 10, y: 10),
+      "5.2 measure: a third tap starts a new measurement")
+
+// -- ERC + annotation + the properties-card undo fix --
+
+func ercPin52(_ number: String, _ type: KiCadPinType,
+              _ x: Double, _ y: Double) -> KiCadPin {
+    KiCadPin(number: number, name: "P\(number)", type: type, shape: .line,
+             x: x, y: y, rotation: 0, length: 2.54, hidden: false,
+             nameSize: 1.27, numberSize: 1.27)
+}
+func ercDef52(_ name: String, pins: [KiCadPin]) -> KiCadSymbolDef {
+    KiCadSymbolDef(
+        name: name, library: "Fixture", properties: [],
+        units: [1: KiCadUnitDef(graphics: [], pins: pins)],
+        unitCount: 1, extendsName: nil, pinNameOffset: 0.508,
+        pinNamesHidden: false, pinNumbersHidden: false, isPowerSymbol: false)
+}
+let icDef52 = ercDef52("IC", pins: [
+    ercPin52("1", .input, -5.08, 0), ercPin52("2", .output, 5.08, 0),
+    ercPin52("3", .powerIn, 0, 5.08), ercPin52("4", .noConnect, 0, -5.08),
+])
+let rDef52 = ercDef52("R", pins: [
+    ercPin52("1", .passive, -5.08, 0), ercPin52("2", .passive, 5.08, 0),
+])
+let ercDefs52: [String: KiCadSymbolDef] = ["IC": icDef52, "R": rDef52]
+func ercPlaced52(_ reference: String, _ symbol: String,
+                 _ x: Double, _ y: Double) -> PlacedSymbol {
+    PlacedSymbol(id: UUID(), library: "Fixture", symbolName: symbol, unit: 1,
+                 x: x, y: y, rotation: 0, mirrorX: false, mirrorY: false,
+                 reference: reference, value: symbol)
+}
+var ercState52 = SchematicState(symbols: [], wires: [], junctions: [],
+                                labels: [], title: "ERC")
+let eu1 = ercPlaced52("U1", "IC", 0, 0)
+let eu2 = ercPlaced52("U2", "IC", 30, 0)
+let er1 = ercPlaced52("R1", "R", 15, 20)
+let ex1a = ercPlaced52("X1", "R", 60, 40)
+let ex1b = ercPlaced52("X1", "R", 70, 40)
+let eq = ercPlaced52("Q?", "R", 60, 60)
+ercState52.symbols = [eu1, eu2, er1, ex1a, ex1b, eq]
+func pinPoint52(_ placed: PlacedSymbol, _ number: String) -> DPoint {
+    let def = ercDefs52[placed.symbolName]!
+    return SymbolDrawList.pinWorldPoints(def: def, placed: placed)
+        .first { $0.pin.number == number }!.point
+}
+func wire52(_ a: DPoint, _ b: DPoint) {
+    ercState52.wires.append(WireItem(id: UUID(), points: [a, b]))
+}
+// Output net: U1.2 -- R1.1, with U2.2 also on it (conflict).
+wire52(pinPoint52(eu1, "2"), pinPoint52(er1, "1"))
+wire52(pinPoint52(eu2, "2"), pinPoint52(er1, "1"))
+// U2.1 input tied to the same net (legal listener).
+wire52(pinPoint52(eu2, "1"), pinPoint52(er1, "1"))
+// Power net: U1.3 + U2.3 + R1.2 — power_in pins, no driver.
+wire52(pinPoint52(eu1, "3"), pinPoint52(er1, "2"))
+wire52(pinPoint52(eu2, "3"), pinPoint52(er1, "2"))
+// U1.1 input on a lone stub wire (connected only to itself).
+let stubStart52 = pinPoint52(eu1, "1")
+wire52(stubStart52, DPoint(x: stubStart52.x - 2.54, y: stubStart52.y))
+// The remaining symbols get harmless self-nets so the ONLY
+// unconnected pin in the fixture is U1 pin 1.
+wire52(pinPoint52(ex1a, "1"), pinPoint52(ex1a, "2"))
+wire52(pinPoint52(ex1b, "1"), pinPoint52(ex1b, "2"))
+wire52(pinPoint52(eq, "1"), pinPoint52(eq, "2"))
+ercState52.labels = [LabelItem(id: UUID(), at: DPoint(x: 200, y: 200), text: "FLOAT")]
+let ercFindings52 = SchematicERC.check(state: ercState52) { ercDefs52[$0.symbolName] }
+func ercCount52(_ kind: ERCFinding.Kind) -> Int {
+    ercFindings52.filter { $0.kind == kind }.count
+}
+check(ercCount52(.pinNotConnected) == 1
+      && ercFindings52.first { $0.kind == .pinNotConnected }?.message
+        .contains("U1 pin 1") == true,
+      "5.2 ERC: only U1's stub-wired input is 'not connected' (no_connect pin exempt)")
+check(ercCount52(.powerPinNotDriven) == 1,
+      "5.2 ERC: the undriven power net is flagged once")
+check(ercCount52(.outputConflict) == 1,
+      "5.2 ERC: two outputs on one net conflict")
+check(ercCount52(.duplicateReference) == 1,
+      "5.2 ERC: X1 placed twice on unit 1 is a duplicate")
+check(ercCount52(.unannotated) == 1,
+      "5.2 ERC: Q? is unannotated")
+check(ercCount52(.labelNotConnected) == 1,
+      "5.2 ERC: the floating label is flagged")
+check(ercCount52(.unresolvedSymbol) == 0 && ercFindings52.count == 6,
+      "5.2 ERC: exactly the six expected findings (got \(ercFindings52.count): \(ercFindings52.map(\.message)))")
+
+// Annotation: keep R1/R3, fill first-free for R? parts, reassign
+// the duplicate R1.
+let annDoc52 = SchematicDocument()
+var annState52 = SchematicState(symbols: [], wires: [], junctions: [],
+                                labels: [], title: "Ann")
+annState52.symbols = [
+    ercPlaced52("R1", "R", 0, 30), ercPlaced52("R3", "R", 0, 20),
+    ercPlaced52("R?", "R", 0, 10), ercPlaced52("R?", "R", 0, 0),
+    ercPlaced52("R1", "R", 10, 30),
+]
+annDoc52.replaceState(annState52)
+let annChanged52 = annDoc52.annotateReferences()
+let annRefs52 = annDoc52.state.symbols.map(\.reference)
+check(annChanged52 == 3 && Set(annRefs52) == ["R1", "R2", "R3", "R4", "R5"]
+      && annDoc52.state.symbols[0].reference == "R1"
+      && annDoc52.state.symbols[1].reference == "R3",
+      "5.2 annotate: kept refs stay, ? parts fill first-free, the duplicate is reassigned (got \(annRefs52))")
+check(annDoc52.canUndo, "5.2 annotate: the whole run is one undo step")
+annDoc52.undo()
+check(annDoc52.state.symbols.map(\.reference)
+      == ["R1", "R3", "R?", "R?", "R1"],
+      "5.2 annotate: one undo restores every original reference")
+
+// editSymbol: the properties card's path records exactly one
+// step per real change, none for a no-op.
+let editDoc52 = SchematicDocument()
+var editState52 = SchematicState(symbols: [], wires: [], junctions: [],
+                                 labels: [], title: "Edit")
+let editPlaced52 = ercPlaced52("R1", "R", 0, 0)
+editState52.symbols = [editPlaced52]
+editDoc52.replaceState(editState52)
+editDoc52.editSymbol(id: editPlaced52.id) { $0.value = "10k" }
+check(editDoc52.state.symbols[0].value == "10k" && editDoc52.canUndo,
+      "5.2 card fix: an editSymbol change applies and records one undo step")
+editDoc52.editSymbol(id: editPlaced52.id) { $0.value = "10k" }
+editDoc52.undo()
+check(editDoc52.state.symbols[0].value == "R" && !editDoc52.canUndo,
+      "5.2 card fix: a no-op edit records nothing (one undo reaches the start)")
+
+// -- De Morgan alternate bodies --
+
+let dmText52 = fixtureText("DeMorganSym.kicad_sym")
+let dmLibrary52 = try! KiCadLibrary.parse(name: "FixtureDM", text: dmText52)
+let dmDef52 = dmLibrary52.symbols["GateDM"]!
+check(dmDef52.hasAlternateBody,
+      "5.2 De Morgan: a style-2 sub-symbol marks the alternate body")
+check(dmDef52.units[1]?.graphics.count == 1 && dmDef52.altUnits[1]?.graphics.count == 1,
+      "5.2 De Morgan: standard and alternate bodies each carry one graphic")
+let dmDraw1_52 = SymbolDrawList.build(def: dmDef52, unit: 1,
+                                      pinNameOffset: dmDef52.pinNameOffset)
+let dmDraw2_52 = SymbolDrawList.build(def: dmDef52, unit: 1,
+                                      pinNameOffset: dmDef52.pinNameOffset,
+                                      bodyStyle: 2)
+func graphicKind52(_ g: SymbolDrawList.GraphicGeom) -> String {
+    switch g {
+    case .rectangle: return "rect"
+    case .circle: return "circle"
+    default: return "other"
+    }
+}
+check(dmDraw1_52.graphics.count == 1 && dmDraw2_52.graphics.count == 1
+      && graphicKind52(dmDraw1_52.graphics[0]) == "rect"
+      && graphicKind52(dmDraw2_52.graphics[0]) == "circle",
+      "5.2 De Morgan: the two body styles draw different bodies")
+check(dmDraw1_52.pins.map(\.pin.number) == dmDraw2_52.pins.map(\.pin.number)
+      && dmDraw2_52.pins.map(\.pin.number) == ["1", "2"],
+      "5.2 De Morgan: style-0 pins are common to both bodies")
+var dmPlaced52 = ercPlaced52("U1", "GateDM", 10, 10)
+let dmPoints1_52 = SymbolDrawList.pinWorldPoints(def: dmDef52, placed: dmPlaced52)
+dmPlaced52.bodyStyle = 2
+let dmPoints2_52 = SymbolDrawList.pinWorldPoints(def: dmDef52, placed: dmPlaced52)
+check(dmPoints1_52.map(\.point) == dmPoints2_52.map(\.point),
+      "5.2 De Morgan: pin world points are identical across body styles")
+let dmStateJSON52 = try! JSONEncoder().encode(
+    SchematicState(symbols: [dmPlaced52], wires: [], junctions: [],
+                   labels: [], title: "DM"))
+let dmStateBack52 = try! JSONDecoder().decode(SchematicState.self,
+                                              from: dmStateJSON52)
+check(dmStateBack52.symbols[0].effectiveBodyStyle == 2,
+      "5.2 De Morgan: the body style persists through save/load")
+let dmOldJSON52 = """
+{"symbols":[{"id":"\(dmPlaced52.id.uuidString)","library":"Fixture",
+ "symbolName":"GateDM","unit":1,"x":10,"y":10,"rotation":0,
+ "mirrorX":false,"mirrorY":false,"reference":"U1","value":"GateDM"}],
+ "wires":[],"junctions":[],"labels":[],"title":"Old"}
+"""
+let dmOldState52 = try! JSONDecoder().decode(
+    SchematicState.self, from: Data(dmOldJSON52.utf8))
+check(dmOldState52.symbols[0].effectiveBodyStyle == 1,
+      "5.2 De Morgan: pre-5.2 schematic JSON (no bodyStyle key) loads as style 1")
+
 // MARK: - Result
 
 print("BoardFixture: \(passCount) passed, \(failCount) failed")

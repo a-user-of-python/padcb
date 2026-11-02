@@ -170,7 +170,50 @@ struct BoardState: Equatable {
     /// 8 mil is a common fab minimum.
     var clearanceMil: Double = 8
 
+    // -- Part 5.2 additions (decode as defaults when absent) --
+
+    /// Locked board items (traces, vias, zones, graphics) by id
+    /// string: a locked item can be selected and inspected but
+    /// not moved, reshaped or deleted until unlocked (KiCad's
+    /// lock semantics, pcbnew BOARD_ITEM::IsLocked). Kept as id
+    /// strings in the STATE — not as flags on the items — so the
+    /// items' own Codable shapes never change.
+    var lockedItemIDs: [String] = []
+    /// Locked components by reference: a locked component cannot
+    /// be moved, flipped or board-deleted.
+    var lockedReferences: [String] = []
+
     static let empty = BoardState()
+
+    /// Is this board item locked? (traces/vias/zones/graphics)
+    func isLocked(_ id: UUID) -> Bool {
+        lockedItemIDs.contains(id.uuidString)
+    }
+
+    /// Lock or unlock one board item.
+    mutating func setLocked(_ id: UUID, _ locked: Bool) {
+        if locked {
+            if !isLocked(id) { lockedItemIDs.append(id.uuidString) }
+        } else {
+            lockedItemIDs.removeAll { $0 == id.uuidString }
+        }
+    }
+
+    /// Is this component locked?
+    func isLocked(reference: String) -> Bool {
+        lockedReferences.contains(reference)
+    }
+
+    /// Lock or unlock one component.
+    mutating func setLocked(reference: String, _ locked: Bool) {
+        if locked {
+            if !lockedReferences.contains(reference) {
+                lockedReferences.append(reference)
+            }
+        } else {
+            lockedReferences.removeAll { $0 == reference }
+        }
+    }
 }
 
 // Codable is hand-rolled on the decode side: EVERY field goes
@@ -183,7 +226,8 @@ extension BoardState: Codable {
     private enum CodingKeys: String, CodingKey {
         case formatVersion, placements, excludedReferences, traces,
              graphics, knownReferences, vias, zones, sides,
-             copperLayerCount, gridMil, clearanceMil
+             copperLayerCount, gridMil, clearanceMil,
+             lockedItemIDs, lockedReferences
     }
 
     init(from decoder: Decoder) throws {
@@ -200,6 +244,8 @@ extension BoardState: Codable {
         copperLayerCount = try box.decodeIfPresent(Int.self, forKey: .copperLayerCount) ?? 4
         gridMil = try box.decodeIfPresent(Double.self, forKey: .gridMil) ?? 25
         clearanceMil = try box.decodeIfPresent(Double.self, forKey: .clearanceMil) ?? 8
+        lockedItemIDs = try box.decodeIfPresent([String].self, forKey: .lockedItemIDs) ?? []
+        lockedReferences = try box.decodeIfPresent([String].self, forKey: .lockedReferences) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -216,6 +262,8 @@ extension BoardState: Codable {
         try box.encode(copperLayerCount, forKey: .copperLayerCount)
         try box.encode(gridMil, forKey: .gridMil)
         try box.encode(clearanceMil, forKey: .clearanceMil)
+        try box.encode(lockedItemIDs, forKey: .lockedItemIDs)
+        try box.encode(lockedReferences, forKey: .lockedReferences)
     }
 }
 
@@ -446,6 +494,18 @@ enum PCBBoardMerger {
         canonical.copperLayerCount = state.copperLayerCount
         canonical.gridMil = state.gridMil
         canonical.clearanceMil = state.clearanceMil
+        // Locks survive the merge for items/references that do;
+        // locks naming vanished items are pruned like placements.
+        let liveItemIDs = Set(traces.map(\.id.uuidString))
+            .union(vias.map(\.id.uuidString))
+            .union(zones.map(\.id.uuidString))
+            .union(state.graphics.map(\.id.uuidString))
+        canonical.lockedItemIDs = state.lockedItemIDs.filter {
+            liveItemIDs.contains($0)
+        }
+        canonical.lockedReferences = state.lockedReferences.filter {
+            baseReferenceSet.contains($0)
+        }
         return (model, report, canonical)
     }
 
@@ -473,6 +533,8 @@ struct BoardVisibility: Equatable {
     var showDrawings = true
     var showText = true
     var showDimensions = true
+    /// Ratsnest lines for unrouted connections (part 5.2).
+    var showRatsnest = true
 
     /// The board's copper layer count (part 5): the copper stack —
     /// and therefore the "*.Cu" wildcard and orphan-layer hiding —
@@ -1022,25 +1084,77 @@ enum BoardPointerEvent: Equatable {
 }
 
 /// The canvas's single pointer state (see BoardPointerEvent).
+///
+/// Part 5.2 — PER-CHANNEL HOVER SLOTS. Sean's v5.1 device report
+/// (2026-11-02 08:44): "whenever I use hover the ui shakes back
+/// and forth" — the failure mode had changed from v5.0's silence
+/// to OSCILLATION, because on his hardware BOTH delivery channels
+/// are live at once and the v5.0.1–5.1 state kept ONE shared
+/// hover point: an `.hoverEnded` from EITHER channel nilled it,
+/// even while the other channel was mid-stream and about to
+/// re-deliver the same physical hover. SwiftUI's
+/// `.onContinuousHover` restarts its phase whenever its hosting
+/// view re-evaluates — which every hover event caused — so its
+/// end/active churn repeatedly cleared and restored the point
+/// the interaction channel was steadily delivering: the preview,
+/// the hover highlight and the cursor readout blinked at several
+/// Hz. The state now keeps ONE SLOT PER CHANNEL: a move writes
+/// its own channel's slot, an end clears ONLY its own channel's
+/// slot, and the live hover point is the FRESHEST live slot.
+/// `BoardHoverDiagnostics` (the counters) is unchanged — Sean's
+/// acceptance spec keeps the channel counters visible.
 struct BoardPointerState: Equatable {
-    /// Last hover position (pencil or pointer), nil when the
-    /// pointer is not over the canvas.
-    private(set) var hoverPoint: FPPoint? = nil
+    /// Live hover point per channel (a channel absent here has
+    /// ended or never delivered).
+    private(set) var hoverSlots: [BoardHoverChannel: FPPoint] = [:]
+    /// Freshness clock value of each live channel's latest move.
+    private(set) var hoverFreshness: [BoardHoverChannel: UInt64] = [:]
+    /// Monotonic clock stamping hover moves (ordering only).
+    private var hoverClock: UInt64 = 0
     /// Last touch position while a touch is down.
     private(set) var touchPoint: FPPoint? = nil
     /// True between a touch's first move and its end.
     private(set) var touchActive = false
 
+    /// The live hover point: the freshest live channel's slot,
+    /// or nil when every channel has ended.
+    var hoverPoint: FPPoint? {
+        guard let freshest = hoverFreshness.max(by: { $0.value < $1.value })?.key
+        else { return nil }
+        return hoverSlots[freshest]
+    }
+
     /// The point previews follow: the touch point while a touch
     /// is down, else the hover point.
     var currentPoint: FPPoint? { touchActive ? touchPoint : hoverPoint }
 
+    /// Record a hover move ON ITS OWN CHANNEL: the other
+    /// channel's slot is untouched, so an interleaved stream can
+    /// never erase this channel's point.
+    mutating func applyHoverMoved(_ point: FPPoint,
+                                  channel: BoardHoverChannel) {
+        hoverClock &+= 1
+        hoverSlots[channel] = point
+        hoverFreshness[channel] = hoverClock
+    }
+
+    /// Record a hover end ON ITS OWN CHANNEL: only that channel's
+    /// slot clears. The other channel, if live, keeps supplying
+    /// the hover point — an end can no longer blink the stream.
+    mutating func applyHoverEnded(channel: BoardHoverChannel) {
+        hoverSlots[channel] = nil
+        hoverFreshness[channel] = nil
+    }
+
+    /// The untagged stream (kept for the touch events and for
+    /// callers that predate channels): an untagged hover event
+    /// belongs to the interaction channel, the primary feed.
     mutating func apply(_ event: BoardPointerEvent) {
         switch event {
         case .hoverMoved(let point):
-            hoverPoint = point
+            applyHoverMoved(point, channel: .interaction)
         case .hoverEnded:
-            hoverPoint = nil
+            applyHoverEnded(channel: .interaction)
         case .touchMoved(let point):
             touchPoint = point
             touchActive = true
@@ -1269,6 +1383,214 @@ extension BoardGeometry {
     }
 }
 
+// MARK: - Stateful route head + pointer coalescing (part 5.2)
+//
+// Sean's v5.1 device report (2026-11-02 08:44): "whenever I use
+// hover the ui shakes back and forth". The pure resolution above
+// (routePreview / routeTap) re-derives EVERYTHING from the
+// instantaneous pointer, so three boundary effects oscillate at
+// hover-event rates:
+//
+// - SNAP BOUNDARY: a hovering pencil's position noise straddles
+//   a grid cell edge; the snapped endpoint alternates between
+//   two grid points per event, and the 45° corner (a pure
+//   function of from + endpoint) jitters with it — at high zoom
+//   one grid step is ~95 pt on screen.
+// - PAD RIM: at a pad's tolerance rim the endpoint alternates
+//   between the pad centre and the snapped free point — jumps
+//   of up to a full tolerance.
+// - DIAGONAL: near |dx| = |dy| the short axis remainder flips
+//   vertical ↔ horizontal and the corner appears/vanishes as
+//   the endpoint dithers across the diagonal through `from`.
+//
+// KiCad's placer has none of this because its head is STATEFUL:
+// pns_line_placer.cpp's buildInitialLine constructs the head
+// from the placer's CARRIED direction (m_direction.
+// BuildInitialTrace(...)), and Move() re-routes a persistent
+// head/tail pair — the corner posture is routing history, not
+// a fresh derivation per motion event. BoardRouteHead is the
+// same idea at PadCB's scale: it carries the last resolved
+// endpoint, anchored pad and corner, and applies hysteresis —
+//   R1 PAD STICKINESS: a carried anchor survives until the
+//      pointer leaves a widened tolerance around that pad (a
+//      DIFFERENT pad freshly targeted always wins).
+//   R2 SNAP STICKINESS: a carried snapped endpoint survives
+//      while the pointer stays inside its grid cell widened by
+//      `snapHysteresis` of a step on every side.
+//   R3 CORNER CARRY: a carried corner that is still a legal
+//      45° corner for the new endpoint is kept verbatim, so
+//      the long first segment does not move at all.
+// A tap resolves through the same head (tapResolution), so the
+// preview Sean sees is still exactly what a tap commits —
+// KiCad's FixRoute commits the head as shown. With no carried
+// state (fresh head, or a tap with no preceding hover) the
+// resolution is EXACTLY the pure functions above.
+
+extension BoardPadTarget {
+    /// Stable identity for stickiness comparisons.
+    var key: String { "\(reference)\u{1}\(padNumber)" }
+}
+
+struct BoardRouteHead: Equatable {
+    /// The last resolved endpoint (pad centre or snapped point).
+    private(set) var endPoint: FPPoint? = nil
+    /// The last resolved pad anchor's key, if anchored.
+    private(set) var targetKey: String? = nil
+    /// The last resolved corner, if the head had one.
+    private(set) var cornerPoint: FPPoint? = nil
+
+    /// R1: the anchor tolerance multiplier for stickiness.
+    static let padHysteresisFactor = 1.6
+    /// R2: how far past a snap cell's edge (fraction of one grid
+    /// step) the pointer may wander before the endpoint moves.
+    static let snapHysteresis = 0.30
+
+    /// Forget all carried state (route start/finish, tool
+    /// change, board change).
+    mutating func reset() {
+        endPoint = nil
+        targetKey = nil
+        cornerPoint = nil
+    }
+
+    /// Is `corner` a legal 45° corner between `from` and `to`
+    /// (both segments axis-aligned or exactly diagonal)?
+    static func isLegalCorner(_ corner: FPPoint, from: FPPoint,
+                              to: FPPoint) -> Bool {
+        func legal(_ a: FPPoint, _ b: FPPoint) -> Bool {
+            let dx = abs(b.x - a.x), dy = abs(b.y - a.y)
+            return dx < 1e-9 || dy < 1e-9 || abs(dx - dy) < 1e-9
+        }
+        return legal(from, corner) && legal(corner, to)
+    }
+
+    /// Resolve the preview for `pointer`, applying the carried
+    /// hysteresis. `from` is the last anchored route point.
+    mutating func resolve(_ model: BoardModel, from: FPPoint,
+                          pointer: FPPoint, routeNet: String?,
+                          snapEnabled: Bool, gridMil: Double,
+                          tolerance: Double) -> BoardRoutePreview {
+        var resolved = BoardGeometry.routePreview(
+            model, from: from, pointer: pointer, routeNet: routeNet,
+            snapEnabled: snapEnabled, gridMil: gridMil,
+            tolerance: tolerance)
+
+        // R1 — pad stickiness.
+        if let carriedKey = targetKey, resolved.target?.key != carriedKey,
+           resolved.target == nil {
+            if let sticky = BoardGeometry.padTarget(
+                model, point: pointer,
+                tolerance: tolerance * Self.padHysteresisFactor),
+               sticky.key == carriedKey {
+                let refused = routeNet != nil && sticky.netName != nil
+                    && sticky.netName != routeNet
+                resolved = BoardRoutePreview(
+                    endPoint: sticky.center, corner: nil,
+                    target: sticky, joinRefused: refused)
+            }
+        }
+
+        // R2 — snap stickiness (free endpoints only: an anchored
+        // carried endpoint is R1's business, never frozen here).
+        let gridMM = BoardUnits.mm(fromMil: gridMil)
+        if resolved.target == nil, targetKey == nil, snapEnabled,
+           gridMM > 0, let carried = endPoint {
+            let reach = gridMM * (0.5 + Self.snapHysteresis)
+            if abs(pointer.x - carried.x) <= reach
+                && abs(pointer.y - carried.y) <= reach {
+                resolved = BoardRoutePreview(
+                    endPoint: carried, corner: nil,
+                    target: nil, joinRefused: false)
+            }
+        }
+
+        // R3 — corner carry, else the pure corner.
+        if let carriedCorner = cornerPoint,
+           Self.isLegalCorner(carriedCorner, from: from, to: resolved.endPoint) {
+            resolved.corner = carriedCorner
+        } else {
+            resolved.corner = BoardGeometry.routeCorner(
+                from: from, to: resolved.endPoint)
+        }
+
+        endPoint = resolved.endPoint
+        targetKey = resolved.target?.key
+        cornerPoint = resolved.corner
+        return resolved
+    }
+
+    /// Resolve a Route Tracks tap THROUGH this head: while
+    /// routing, the tap commits the head exactly as previewed
+    /// (same endpoint, same refusal rule). Before routing, the
+    /// tap is the pure routeTap answer verbatim (a start must
+    /// land on the pad actually tapped, no stickiness).
+    mutating func tapResolution(_ model: BoardModel, from: FPPoint?,
+                                point: FPPoint, routingActive: Bool,
+                                routeNet: String?, snapEnabled: Bool,
+                                gridMil: Double, tolerance: Double)
+        -> BoardRouteTap {
+        guard routingActive, let from else {
+            return BoardGeometry.routeTap(
+                model, point: point, routingActive: routingActive,
+                routeNet: routeNet, snapEnabled: snapEnabled,
+                gridMil: gridMil, tolerance: tolerance)
+        }
+        let preview = resolve(model, from: from, pointer: point,
+                              routeNet: routeNet, snapEnabled: snapEnabled,
+                              gridMil: gridMil, tolerance: tolerance)
+        if let target = preview.target {
+            if preview.joinRefused, let padNet = target.netName {
+                return .refusedForeignNet(padNet)
+            }
+            return .finishAtPad(target)
+        }
+        return .appendPoint(preview.endPoint)
+    }
+}
+
+/// Pointer-update coalescing (part 5.2): hover recognizers can
+/// deliver faster than the display refreshes; without coalescing
+/// every event re-renders the board. The throttle admits at most
+/// one point per `interval`; offers inside the window collapse
+/// into `pending` (latest wins), which the view flushes on its
+/// display cadence. Pure and clock-injected so the fixture can
+/// drive it deterministically; the view supplies CACurrentMediaTime.
+struct BoardPointerThrottle: Equatable {
+    /// Minimum seconds between admitted points (default 60 Hz —
+    /// the iPad Air M3 panel rate; ProMotion devices simply get
+    /// the same stable cadence).
+    var interval: Double = 1.0 / 60.0
+    private(set) var lastFlushTime: Double = -Double.infinity
+    private(set) var pending: FPPoint? = nil
+
+    var hasPending: Bool { pending != nil }
+
+    /// Offer a point at `time`: returns it when the window has
+    /// elapsed (admit now), else stores it as pending (nil).
+    mutating func offer(_ point: FPPoint, at time: Double) -> FPPoint? {
+        if time - lastFlushTime >= interval {
+            lastFlushTime = time
+            pending = nil
+            return point
+        }
+        pending = point
+        return nil
+    }
+
+    /// Release the pending point when the window has elapsed
+    /// (the view calls this once per display tick).
+    mutating func flush(at time: Double) -> FPPoint? {
+        guard let pending, time - lastFlushTime >= interval
+        else { return nil }
+        self.pending = nil
+        lastFlushTime = time
+        return pending
+    }
+
+    /// The stream ended: no trailing point is owed.
+    mutating func end() { pending = nil }
+}
+
 // MARK: - Trace segment editing (part 5.1)
 //
 // Sean (2026-11-01 21:39): "when you click on a trace, it selects
@@ -1470,5 +1792,540 @@ extension BoardGeometry {
         }
         closeRun(upToSegment: count - 1)
         return pieces
+    }
+}
+
+// MARK: - Placement tools: align / distribute / duplicate / measure (part 5.2)
+//
+// From KiCad's pcbnew placement tools (placement_tool.cpp:
+// Align / Distribute / Duplicate). All pure algebra over the
+// merged model + placements, so the fixture proves the exact
+// functions the editor's buttons call; the editor folds the
+// results into ONE mutateBoard step.
+
+enum BoardAlignMode {
+    case left, right, top, bottom, centreX, centreY
+}
+
+enum BoardPlacementTools {
+
+    /// A component's practical extent: the bbox of its pads'
+    /// outlines (rotation/side true). Components without pads
+    /// fall back to the footprint-bounds box.
+    static func extent(_ component: BoardComponent)
+        -> (minX: Double, minY: Double, maxX: Double, maxY: Double) {
+        guard let footprint = component.footprint, !footprint.pads.isEmpty
+        else { return BoardGeometry.componentBounds(component) }
+        var minX = Double.greatestFiniteMagnitude, minY = minX
+        var maxX = -minX, maxY = -minX
+        for pad in footprint.pads {
+            for p in BoardGeometry.padOutline(component, pad) {
+                minX = min(minX, p.x); minY = min(minY, p.y)
+                maxX = max(maxX, p.x); maxY = max(maxY, p.y)
+            }
+        }
+        return (minX, minY, maxX, maxY)
+    }
+
+    /// New origins aligning the given components (looked up in
+    /// `model` by reference). Edge modes align to the selection's
+    /// extreme edge; centre modes align to the FIRST listed
+    /// reference's centre (the anchor — KiCad aligns to a
+    /// reference item). Only references that actually move are
+    /// returned. Locked references never move (the editor also
+    /// refuses, this is the model-level guarantee).
+    static func alignedOrigins(_ model: BoardModel, references: [String],
+                               mode: BoardAlignMode,
+                               lockedReferences: Set<String>)
+        -> [String: FPPoint] {
+        let components = references.compactMap { ref in
+            model.components.first { $0.reference == ref }
+        }
+        guard components.count > 1 else { return [:] }
+        let extents = components.map { extent($0) }
+        var result: [String: FPPoint] = [:]
+        func move(_ component: BoardComponent, dx: Double, dy: Double) {
+            guard !lockedReferences.contains(component.reference)
+            else { return }
+            let newOrigin = FPPoint(x: component.origin.x + dx,
+                                    y: component.origin.y + dy)
+            if newOrigin != component.origin {
+                result[component.reference] = newOrigin
+            }
+        }
+        switch mode {
+        case .left:
+            let target = extents.map(\.minX).min()!
+            for (c, e) in zip(components, extents) { move(c, dx: target - e.minX, dy: 0) }
+        case .right:
+            let target = extents.map(\.maxX).max()!
+            for (c, e) in zip(components, extents) { move(c, dx: target - e.maxX, dy: 0) }
+        case .top:
+            let target = extents.map(\.minY).min()!
+            for (c, e) in zip(components, extents) { move(c, dx: 0, dy: target - e.minY) }
+        case .bottom:
+            let target = extents.map(\.maxY).max()!
+            for (c, e) in zip(components, extents) { move(c, dx: 0, dy: target - e.maxY) }
+        case .centreX:
+            let anchor = (extents[0].minX + extents[0].maxX) / 2
+            for (c, e) in zip(components, extents) {
+                move(c, dx: anchor - (e.minX + e.maxX) / 2, dy: 0)
+            }
+        case .centreY:
+            let anchor = (extents[0].minY + extents[0].maxY) / 2
+            for (c, e) in zip(components, extents) {
+                move(c, dx: 0, dy: anchor - (e.minY + e.maxY) / 2)
+            }
+        }
+        return result
+    }
+
+    /// New origins distributing the given components' CENTRES
+    /// evenly along one axis between the two extreme components
+    /// (which stay put — KiCad's distribute). Needs 3+ references;
+    /// locked components keep their origin but still occupy
+    /// their slot in the spacing (they are physical parts).
+    static func distributedOrigins(_ model: BoardModel, references: [String],
+                                   horizontal: Bool,
+                                   lockedReferences: Set<String>)
+        -> [String: FPPoint] {
+        let components = references.compactMap { ref in
+            model.components.first { $0.reference == ref }
+        }
+        guard components.count > 2 else { return [:] }
+        let centres: [(component: BoardComponent, centre: Double, origin: FPPoint)] =
+            components.map { c in
+                let e = extent(c)
+                return (c, horizontal ? (e.minX + e.maxX) / 2 : (e.minY + e.maxY) / 2,
+                        c.origin)
+            }
+        let sorted = centres.sorted { $0.centre < $1.centre }
+        let first = sorted.first!.centre, last = sorted.last!.centre
+        guard last > first else { return [:] }
+        let step = (last - first) / Double(sorted.count - 1)
+        var result: [String: FPPoint] = [:]
+        for (index, entry) in sorted.enumerated() {
+            let target = first + step * Double(index)
+            let delta = target - entry.centre
+            if abs(delta) < 1e-9 { continue }
+            guard !lockedReferences.contains(entry.component.reference)
+            else { continue }
+            result[entry.component.reference] = horizontal
+                ? FPPoint(x: entry.origin.x + delta, y: entry.origin.y)
+                : FPPoint(x: entry.origin.x, y: entry.origin.y + delta)
+        }
+        return result
+    }
+}
+
+extension BoardState {
+    /// Offset copies of the named board items with FRESH ids
+    /// (KiCad duplicate: the copy is a new item, offset so it
+    /// doesn't sit exactly on the original). Nets, layers,
+    /// widths and zone/via parameters carry over verbatim;
+    /// remembered-net state (disconnectedNetName) carries too —
+    /// the copies are the same electrical intent, displaced.
+    func duplicatedItems(traceIDs: Set<UUID>, viaIDs: Set<UUID>,
+                         zoneIDs: Set<UUID>, graphicIDs: Set<UUID>,
+                         offset: FPPoint)
+        -> (traces: [BoardTrace], vias: [BoardVia],
+            zones: [BoardZone], graphics: [BoardGraphicItem]) {
+        func shifted(_ points: [FPPoint]) -> [FPPoint] {
+            points.map { FPPoint(x: $0.x + offset.x, y: $0.y + offset.y) }
+        }
+        var newTraces: [BoardTrace] = []
+        for trace in traces where traceIDs.contains(trace.id) {
+            var copy = trace
+            copy.id = UUID()
+            copy.points = shifted(trace.points)
+            newTraces.append(copy)
+        }
+        var newVias: [BoardVia] = []
+        for via in vias where viaIDs.contains(via.id) {
+            var copy = via
+            copy.id = UUID()
+            copy.center = FPPoint(x: via.center.x + offset.x,
+                                  y: via.center.y + offset.y)
+            newVias.append(copy)
+        }
+        var newZones: [BoardZone] = []
+        for zone in zones where zoneIDs.contains(zone.id) {
+            var copy = zone
+            copy.id = UUID()
+            copy.points = shifted(zone.points)
+            newZones.append(copy)
+        }
+        var newGraphics: [BoardGraphicItem] = []
+        for item in graphics where graphicIDs.contains(item.id) {
+            var copy = item
+            copy.id = UUID()
+            copy.points = shifted(item.points)
+            newGraphics.append(copy)
+        }
+        return (newTraces, newVias, newZones, newGraphics)
+    }
+}
+
+/// The measuring tool's state (KiCad's measure / "Tape Measure"):
+/// two tapped points; a third tap starts a new measurement.
+struct BoardMeasure: Equatable {
+    private(set) var a: FPPoint? = nil
+    private(set) var b: FPPoint? = nil
+
+    mutating func tap(_ point: FPPoint) {
+        if a == nil || b != nil {
+            a = point
+            b = nil
+        } else {
+            b = point
+        }
+    }
+
+    mutating func clear() { a = nil; b = nil }
+
+    /// The measured distance, once both points exist.
+    var distance: Double? {
+        guard let a, let b else { return nil }
+        return a.distance(to: b)
+    }
+
+    /// Axis deltas (b − a), once both points exist.
+    var delta: FPPoint? {
+        guard let a, let b else { return nil }
+        return FPPoint(x: b.x - a.x, y: b.y - a.y)
+    }
+}
+
+// MARK: - Spatial index for hit-testing (part 5.2)
+//
+// Part B of the v5.2 pass (KiCad-inspired: pcbnew hit-testing
+// runs over an R-tree of board items, never a whole-board scan).
+// Every hover redraw in v5.1 re-ran padAt / traceAt / segmentAt
+// as LINEAR scans over the whole board — at Pencil hover rates
+// that put the full pad/segment algebra on the pointer path.
+// BoardSpatialIndex is a uniform-grid index (2 mm cells) over
+// the merged model: each query gathers only the items whose
+// cells the query region touches, then applies the EXACT
+// BoardGeometry tests and winner rules to those candidates, so
+// results are identical to the linear scans by construction
+// (the BoardFixture harness proves set- and winner-equality
+// against the linear functions over synthetic boards at several
+// tolerances, and prints the timing ratio).
+//
+// Correctness invariant (per item kind): an item is inserted
+// into every cell its HIT REGION's axis-aligned bounds touch,
+// where the hit region already includes the item's own reach
+// (trace width/2, via radius, circle radius, text size). A query
+// visits every cell intersecting the square of half-side
+// `tolerance * padReachFactor` (pads) or `tolerance` (others)
+// around the point; any item the linear test would pass has its
+// hit region intersecting that square (a passed test puts the
+// point inside the region grown by at most tolerance — √2 ·
+// tolerance for the rotated pad test), so its cells are visited
+// and the exact test runs. Candidate iteration always follows
+// the linear functions' order/tie rules.
+
+struct BoardSpatialIndex {
+    /// Grid cell size in mm.
+    static let cellSize = 2.0
+    /// Pad queries widen the visited square by this factor:
+    /// the pad test runs in the pad's ROTATED frame, so a
+    /// passing point can sit up to √2 · tolerance outside the
+    /// outline bounds on a world axis; 1.5 covers it.
+    static let padReachFactor = 1.5
+
+    private struct Cell: Hashable { var x: Int; var y: Int }
+    private struct PadRef: Hashable { var component: Int; var pad: Int }
+    private struct SegmentRef: Hashable { var trace: Int; var segment: Int }
+
+    private var padCells: [Cell: [PadRef]] = [:]
+    private var segmentCells: [Cell: [SegmentRef]] = [:]
+    private var traceCells: [Cell: [Int]] = [:]
+    private var viaCells: [Cell: [Int]] = [:]
+    private var componentCells: [Cell: [Int]] = [:]
+    private var zoneCells: [Cell: [Int]] = [:]
+    private var graphicCells: [Cell: [Int]] = [:]
+
+    private static func cell(of value: Double) -> Int {
+        Int(floor(value / cellSize))
+    }
+
+    private static func cells(minX: Double, minY: Double,
+                              maxX: Double, maxY: Double) -> [Cell] {
+        var result: [Cell] = []
+        for cx in cell(of: minX)...cell(of: maxX) {
+            for cy in cell(of: minY)...cell(of: maxY) {
+                result.append(Cell(x: cx, y: cy))
+            }
+        }
+        return result
+    }
+
+    private func queryCells(point: FPPoint, halfSide: Double) -> [Cell] {
+        Self.cells(minX: point.x - halfSide, minY: point.y - halfSide,
+                   maxX: point.x + halfSide, maxY: point.y + halfSide)
+    }
+
+    /// Build the index over a merged model. O(items); the editor
+    /// rebuilds it wherever it recomputes the checks (mutation
+    /// points only — never on the pointer path).
+    static func build(_ model: BoardModel) -> BoardSpatialIndex {
+        var index = BoardSpatialIndex()
+        for (ci, component) in model.components.enumerated() {
+            let b = BoardGeometry.componentBounds(component)
+            for cell in cells(minX: b.minX, minY: b.minY,
+                              maxX: b.maxX, maxY: b.maxY) {
+                index.componentCells[cell, default: []].append(ci)
+            }
+            guard let footprint = component.footprint else { continue }
+            for (pi, pad) in footprint.pads.enumerated() {
+                let outline = BoardGeometry.padOutline(component, pad)
+                guard let first = outline.first else { continue }
+                var minX = first.x, minY = first.y, maxX = first.x, maxY = first.y
+                for p in outline {
+                    minX = min(minX, p.x); minY = min(minY, p.y)
+                    maxX = max(maxX, p.x); maxY = max(maxY, p.y)
+                }
+                for cell in cells(minX: minX, minY: minY, maxX: maxX, maxY: maxY) {
+                    index.padCells[cell, default: []].append(
+                        PadRef(component: ci, pad: pi))
+                }
+            }
+        }
+        for (ti, trace) in model.traces.enumerated() {
+            guard trace.points.count > 1 else { continue }
+            let reach = trace.width / 2
+            var traceMinX = Double.greatestFiniteMagnitude
+            var traceMinY = traceMinX, traceMaxX = -traceMinX, traceMaxY = -traceMinX
+            for segment in 0..<trace.segmentCount {
+                let a = trace.points[segment], b = trace.points[segment + 1]
+                let minX = min(a.x, b.x) - reach, minY = min(a.y, b.y) - reach
+                let maxX = max(a.x, b.x) + reach, maxY = max(a.y, b.y) + reach
+                traceMinX = min(traceMinX, minX); traceMinY = min(traceMinY, minY)
+                traceMaxX = max(traceMaxX, maxX); traceMaxY = max(traceMaxY, maxY)
+                for cell in cells(minX: minX, minY: minY, maxX: maxX, maxY: maxY) {
+                    index.segmentCells[cell, default: []].append(
+                        SegmentRef(trace: ti, segment: segment))
+                }
+            }
+            for cell in cells(minX: traceMinX, minY: traceMinY,
+                              maxX: traceMaxX, maxY: traceMaxY) {
+                index.traceCells[cell, default: []].append(ti)
+            }
+        }
+        for (vi, via) in model.vias.enumerated() {
+            let r = via.diameter / 2
+            for cell in cells(minX: via.center.x - r, minY: via.center.y - r,
+                              maxX: via.center.x + r, maxY: via.center.y + r) {
+                index.viaCells[cell, default: []].append(vi)
+            }
+        }
+        for (zi, zone) in model.zones.enumerated() {
+            guard let first = zone.points.first else { continue }
+            var minX = first.x, minY = first.y, maxX = first.x, maxY = first.y
+            for p in zone.points {
+                minX = min(minX, p.x); minY = min(minY, p.y)
+                maxX = max(maxX, p.x); maxY = max(maxY, p.y)
+            }
+            for cell in cells(minX: minX, minY: minY, maxX: maxX, maxY: maxY) {
+                index.zoneCells[cell, default: []].append(zi)
+            }
+        }
+        for (gi, item) in model.graphics.enumerated() {
+            // The item's hit region bounds (see the type comment):
+            // circle → centre ± radius; text → anchor ± text size;
+            // line/arc → the points' bounds.
+            var minX = Double.greatestFiniteMagnitude
+            var minY = minX, maxX = -minX, maxY = -minX
+            func include(_ p: FPPoint, pad: Double = 0) {
+                minX = min(minX, p.x - pad); minY = min(minY, p.y - pad)
+                maxX = max(maxX, p.x + pad); maxY = max(maxY, p.y + pad)
+            }
+            switch item.kind {
+            case .circle:
+                if let centre = item.points.first {
+                    include(centre, pad: item.radius)
+                }
+            case .text:
+                if let anchor = item.points.first {
+                    include(anchor, pad: item.textSize)
+                }
+            case .line, .arc:
+                for p in item.points { include(p) }
+            }
+            guard minX <= maxX else { continue }
+            for cell in cells(minX: minX, minY: minY, maxX: maxX, maxY: maxY) {
+                index.graphicCells[cell, default: []].append(gi)
+            }
+        }
+        return index
+    }
+
+    // MARK: Queries (BoardGeometry-identical results)
+
+    func padAt(_ model: BoardModel, point: FPPoint, tolerance: Double)
+        -> (component: BoardComponent, pad: KiCadFootprintPad, netName: String?)? {
+        var candidates = Set<PadRef>()
+        for cell in queryCells(point: point,
+                               halfSide: tolerance * Self.padReachFactor) {
+            for ref in padCells[cell] ?? [] { candidates.insert(ref) }
+        }
+        var best: (component: BoardComponent, pad: KiCadFootprintPad,
+                   netName: String?, distance: Double)? = nil
+        var bestRef: PadRef? = nil
+        for ref in candidates {
+            let component = model.components[ref.component]
+            guard let footprint = component.footprint else { continue }
+            let pad = footprint.pads[ref.pad]
+            let effective = BoardGeometry.boardPad(component, pad)
+            let centre = BoardGeometry.padCenter(component, pad)
+            let halfW = effective.width / 2 + tolerance
+            let halfH = effective.height / 2 + tolerance
+            let local = FPPoint(x: point.x - centre.x, y: point.y - centre.y)
+                .rotated(degrees: -effective.rotation)
+            guard abs(local.x) <= halfW, abs(local.y) <= halfH else { continue }
+            let distance = centre.distance(to: point)
+            // The linear scan's winner on an exact distance tie is
+            // the FIRST pad in model order (its comparison is a
+            // strict <); replicate that over the unordered
+            // candidate set.
+            let winsTie = bestRef != nil && distance == best!.distance
+                && (ref.component, ref.pad) < (bestRef!.component, bestRef!.pad)
+            if best == nil || distance < best!.distance || winsTie {
+                best = (component, pad, BoardGeometry.netName(component, pad),
+                        distance)
+                bestRef = ref
+            }
+        }
+        guard let found = best else { return nil }
+        return (found.component, found.pad, found.netName)
+    }
+
+    func padTarget(_ model: BoardModel, point: FPPoint,
+                   tolerance: Double) -> BoardPadTarget? {
+        guard let hit = padAt(model, point: point, tolerance: tolerance)
+        else { return nil }
+        let effective = BoardGeometry.boardPad(hit.component, hit.pad)
+        return BoardPadTarget(
+            reference: hit.component.reference,
+            padNumber: hit.pad.number,
+            netName: hit.netName,
+            center: BoardGeometry.padCenter(hit.component, hit.pad),
+            width: effective.width, height: effective.height)
+    }
+
+    func traceAt(_ model: BoardModel, point: FPPoint,
+                 tolerance: Double) -> BoardTrace? {
+        var candidates = Set<Int>()
+        for cell in queryCells(point: point, halfSide: tolerance) {
+            for ti in traceCells[cell] ?? [] { candidates.insert(ti) }
+        }
+        for ti in candidates.sorted(by: >) {
+            let trace = model.traces[ti]
+            if BoardGeometry.traceHit(trace, point: point, tolerance: tolerance) {
+                return trace
+            }
+        }
+        return nil
+    }
+
+    func hoverTarget(_ model: BoardModel, point: FPPoint,
+                     tolerance: Double) -> BoardHoverTarget? {
+        if let target = padTarget(model, point: point, tolerance: tolerance) {
+            return .pad(target)
+        }
+        if let trace = traceAt(model, point: point, tolerance: tolerance) {
+            return .trace(trace.id)
+        }
+        return nil
+    }
+
+    /// Indexed twin of BoardGeometry.segmentAt over the model's
+    /// traces, optionally restricted to a set of trace ids (the
+    /// editor passes its VISIBLE traces). Same winner rules:
+    /// per-trace nearest segment, smallest distance wins, ties
+    /// go to the trace later in model order.
+    func segmentAt(_ model: BoardModel, point: FPPoint, tolerance: Double,
+                   allowedTraceIDs: Set<UUID>? = nil)
+        -> (trace: BoardTrace, index: Int, distance: Double)? {
+        var candidates = Set<Int>()
+        for cell in queryCells(point: point, halfSide: tolerance) {
+            for ref in segmentCells[cell] ?? [] { candidates.insert(ref.trace) }
+        }
+        var best: (trace: BoardTrace, index: Int, distance: Double)? = nil
+        for ti in candidates.sorted() {
+            let trace = model.traces[ti]
+            if let allowedTraceIDs, !allowedTraceIDs.contains(trace.id) {
+                continue
+            }
+            guard let hit = BoardGeometry.segmentHit(
+                trace, point: point, tolerance: tolerance) else { continue }
+            if best == nil || hit.distance <= best!.distance + 1e-12 {
+                best = (trace, hit.index, hit.distance)
+            }
+        }
+        return best
+    }
+
+    func componentAt(_ model: BoardModel, point: FPPoint,
+                     tolerance: Double = 0.5) -> BoardComponent? {
+        var candidates = Set<Int>()
+        for cell in queryCells(point: point, halfSide: tolerance) {
+            for ci in componentCells[cell] ?? [] { candidates.insert(ci) }
+        }
+        for ci in candidates.sorted(by: >) {
+            let component = model.components[ci]
+            let b = BoardGeometry.componentBounds(component)
+            if point.x >= b.minX - tolerance, point.x <= b.maxX + tolerance,
+               point.y >= b.minY - tolerance, point.y <= b.maxY + tolerance {
+                return component
+            }
+        }
+        return nil
+    }
+
+    func viaAt(_ model: BoardModel, point: FPPoint,
+               tolerance: Double) -> BoardVia? {
+        var candidates = Set<Int>()
+        for cell in queryCells(point: point, halfSide: tolerance) {
+            for vi in viaCells[cell] ?? [] { candidates.insert(vi) }
+        }
+        for vi in candidates.sorted(by: >) {
+            let via = model.vias[vi]
+            if BoardGeometry.viaHit(via, point: point, tolerance: tolerance) {
+                return via
+            }
+        }
+        return nil
+    }
+
+    func zoneAt(_ model: BoardModel, point: FPPoint,
+                tolerance: Double) -> BoardZone? {
+        var candidates = Set<Int>()
+        for cell in queryCells(point: point, halfSide: tolerance) {
+            for zi in zoneCells[cell] ?? [] { candidates.insert(zi) }
+        }
+        for zi in candidates.sorted(by: >) {
+            let zone = model.zones[zi]
+            if BoardGeometry.zoneHit(zone, point: point, tolerance: tolerance) {
+                return zone
+            }
+        }
+        return nil
+    }
+
+    func graphicAt(_ model: BoardModel, point: FPPoint,
+                   tolerance: Double) -> BoardGraphicItem? {
+        var candidates = Set<Int>()
+        for cell in queryCells(point: point, halfSide: tolerance) {
+            for gi in graphicCells[cell] ?? [] { candidates.insert(gi) }
+        }
+        for gi in candidates.sorted(by: >) {
+            let item = model.graphics[gi]
+            if BoardGeometry.graphicHit(item, point: point, tolerance: tolerance) {
+                return item
+            }
+        }
+        return nil
     }
 }

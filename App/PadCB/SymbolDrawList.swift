@@ -137,11 +137,12 @@ enum SymbolDrawList {
     /// `pinNameOffset` is passed explicitly (callers use
     /// def.pinNameOffset) so the geometry under test is a pure
     /// function of its inputs.
-    static func build(def: KiCadSymbolDef, unit: Int, pinNameOffset: Double) -> DrawList {
+    static func build(def: KiCadSymbolDef, unit: Int, pinNameOffset: Double,
+                      bodyStyle: Int = 1) -> DrawList {
         // KiCad's outside pin-name layout (pinNameOffset == 0) stacks
         // every name at a shared height: the tallest name half-height
         // across the drawn pins (PIN_LAYOUT_CACHE::GetPinNameInfo).
-        let merged = mergedUnits(def: def, unit: unit)
+        let merged = mergedUnits(def: def, unit: unit, bodyStyle: bodyStyle)
         let maxNameHalf = merged.flatMap { $0.pins }.map { $0.nameSize / 2 }.max() ?? 0
         var pins: [PinGeom] = []
         for u in merged {
@@ -153,7 +154,7 @@ enum SymbolDrawList {
             }
         }
         var graphics: [GraphicGeom] = []
-        for u in mergedUnits(def: def, unit: unit) {
+        for u in mergedUnits(def: def, unit: unit, bodyStyle: bodyStyle) {
             for g in u.graphics {
                 graphics.append(graphicGeom(g))
             }
@@ -403,11 +404,29 @@ enum SymbolDrawList {
         return out
     }
 
+    /// The merged units for a body style (part 5.2): style 2
+    /// reads the alternate-body table (whose unit 0 already
+    /// carries the common style-0 items), falling back per slot
+    /// to the standard body when a slot has no alternate.
+    static func mergedUnits(def: KiCadSymbolDef, unit: Int,
+                            bodyStyle: Int) -> [KiCadUnitDef] {
+        guard bodyStyle == 2, def.hasAlternateBody else {
+            return mergedUnits(def: def, unit: unit)
+        }
+        var out: [KiCadUnitDef] = []
+        if let common = def.altUnits[0] ?? def.units[0] { out.append(common) }
+        if unit != 0, let u = def.unitDef(unit: unit, bodyStyle: 2) {
+            out.append(u)
+        }
+        return out
+    }
+
     // MARK: - Pins
 
-    static func pinLocalPoints(def: KiCadSymbolDef, unit: Int) -> [(pin: KiCadPin, point: CGPoint)] {
+    static func pinLocalPoints(def: KiCadSymbolDef, unit: Int,
+                               bodyStyle: Int = 1) -> [(pin: KiCadPin, point: CGPoint)] {
         var out: [(pin: KiCadPin, point: CGPoint)] = []
-        for u in mergedUnits(def: def, unit: unit) {
+        for u in mergedUnits(def: def, unit: unit, bodyStyle: bodyStyle) {
             for pin in u.pins {
                 out.append((pin: pin, point: CGPoint(x: CGFloat(pin.x), y: CGFloat(pin.y))))
             }
@@ -416,7 +435,8 @@ enum SymbolDrawList {
     }
 
     static func pinWorldPoints(def: KiCadSymbolDef, placed: PlacedSymbol) -> [(pin: KiCadPin, point: DPoint)] {
-        pinLocalPoints(def: def, unit: placed.unit).map { entry in
+        pinLocalPoints(def: def, unit: placed.unit,
+                       bodyStyle: placed.effectiveBodyStyle).map { entry in
             (pin: entry.pin,
              point: transformPoint(DPoint(x: Double(entry.point.x), y: Double(entry.point.y)), placed: placed))
         }
@@ -429,7 +449,8 @@ enum SymbolDrawList {
     /// estimate; arc extents come from the sampled sweep. If the
     /// symbol has no graphics at all, falls back to the bounds of its
     /// pin points.
-    static func graphicsBounds(def: KiCadSymbolDef, unit: Int) -> CGRect {
+    static func graphicsBounds(def: KiCadSymbolDef, unit: Int,
+                               bodyStyle: Int = 1) -> CGRect {
         var rect: CGRect?
         func include(_ r: CGRect) { rect = rect.map { $0.union(r) } ?? r }
         func includePt(_ x: Double, _ y: Double) {
@@ -446,7 +467,7 @@ enum SymbolDrawList {
                            width: CGFloat(maxX - minX), height: CGFloat(maxY - minY)))
         }
 
-        for u in mergedUnits(def: def, unit: unit) {
+        for u in mergedUnits(def: def, unit: unit, bodyStyle: bodyStyle) {
             for g in u.graphics {
                 switch g {
                 case .rectangle(let x1, let y1, let x2, let y2, _, _, _):
@@ -497,7 +518,8 @@ enum SymbolDrawList {
 
     /// World-space bounds of a placed symbol's body graphics.
     static func placedBounds(def: KiCadSymbolDef, placed: PlacedSymbol) -> CGRect {
-        let b = graphicsBounds(def: def, unit: placed.unit)
+        let b = graphicsBounds(def: def, unit: placed.unit,
+                               bodyStyle: placed.effectiveBodyStyle)
         let corners = [
             DPoint(x: Double(b.minX), y: Double(b.minY)),
             DPoint(x: Double(b.maxX), y: Double(b.minY)),

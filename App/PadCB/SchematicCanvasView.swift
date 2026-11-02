@@ -866,7 +866,8 @@ extension SchematicCanvasView {
         SymbolRenderer.draw(def: def, unit: placed.unit, in: ctx, map: map,
                             scale: canvasState.scale,
                             showPinNumbers: !def.pinNumbersHidden,
-                            showPinNames: !def.pinNamesHidden)
+                            showPinNames: !def.pinNamesHidden,
+                            bodyStyle: placed.effectiveBodyStyle)
     }
 
     /// Reference / Value texts at their def property positions (transformed by

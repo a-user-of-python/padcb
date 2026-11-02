@@ -37,8 +37,9 @@ enum SymbolRenderer {
         SymbolDrawList.pinWorldPoints(def: def, placed: placed)
     }
 
-    static func graphicsBounds(def: KiCadSymbolDef, unit: Int) -> CGRect {
-        SymbolDrawList.graphicsBounds(def: def, unit: unit)
+    static func graphicsBounds(def: KiCadSymbolDef, unit: Int,
+                               bodyStyle: Int = 1) -> CGRect {
+        SymbolDrawList.graphicsBounds(def: def, unit: unit, bodyStyle: bodyStyle)
     }
 
     static func placedBounds(def: KiCadSymbolDef, placed: PlacedSymbol) -> CGRect {
@@ -49,7 +50,8 @@ enum SymbolRenderer {
 
     static func draw(def: KiCadSymbolDef, unit: Int, in ctx: GraphicsContext,
                      map: (CGPoint) -> CGPoint, scale: CGFloat,
-                     showPinNumbers: Bool, showPinNames: Bool) {
+                     showPinNumbers: Bool, showPinNames: Bool,
+                     bodyStyle: Int = 1) {
         var ctx = ctx
 
         // Linear part of `map`, recovered by probing — used to orient text
@@ -68,7 +70,8 @@ enum SymbolRenderer {
         // The canonical local draw list: every coordinate painted below
         // comes from it (graphics primitives, pin stubs, glyph points
         // and text anchors).
-        let drawList = SymbolDrawList.build(def: def, unit: unit, pinNameOffset: def.pinNameOffset)
+        let drawList = SymbolDrawList.build(def: def, unit: unit, pinNameOffset: def.pinNameOffset,
+                                            bodyStyle: bodyStyle)
 
         // --- Graphics (units 0 + unit) ---
         for g in drawList.graphics {

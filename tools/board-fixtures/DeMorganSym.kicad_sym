@@ -1,0 +1,25 @@
+(kicad_symbol_lib
+	(version 20231120)
+	(generator "padcb-board-fixtures")
+	(generator_version "10.0")
+	(symbol "GateDM"
+		(property "Reference" "U" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(property "Value" "GateDM" (at 0 0 0) (effects (font (size 1.27 1.27))))
+		(symbol "GateDM_1_0"
+			(pin input line (at -5.08 2.54 0) (length 2.54)
+				(name "A" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+			(pin output line (at 5.08 0 180) (length 2.54)
+				(name "Y" (effects (font (size 1.27 1.27))))
+				(number "2" (effects (font (size 1.27 1.27))))
+			)
+		)
+		(symbol "GateDM_1_1"
+			(rectangle (start -2.54 2.54) (end 2.54 -2.54) (stroke (width 0.254) (type default)) (fill (type background)))
+		)
+		(symbol "GateDM_1_2"
+			(circle (center 0 0) (radius 2.54) (stroke (width 0.254) (type default)) (fill (type background)))
+		)
+	)
+)

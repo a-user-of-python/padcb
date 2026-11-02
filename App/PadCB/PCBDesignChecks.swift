@@ -475,6 +475,134 @@ enum BoardConnectivity {
     }
 }
 
+// MARK: - Ratsnest (part 5.2)
+
+/// One ratsnest line: an unrouted connection between two pads
+/// of the same net that no copper path joins yet.
+struct RatsnestSegment: Equatable {
+    var from: FPPoint
+    var to: FPPoint
+    var netName: String
+}
+
+/// The ratsnest (KiCad's connectivity/ratsnest display): for
+/// every net, group its pads by the copper that actually joins
+/// them (the same union-find over BoardCopper shapes the
+/// connectivity analysis runs — same touch tolerance, same
+/// layer rule, duplicate pad numbers unioned), then connect
+/// the groups with a minimum spanning tree over inter-group
+/// nearest-pad distances. A fully routed net contributes no
+/// lines; a net with one pad contributes none. Deterministic
+/// ordering: nets in the model's order, groups by first pad
+/// label, Prim's algorithm with lowest-index tie-breaks.
+enum BoardRatsnest {
+    static func segments(model: BoardModel, copperCount: Int)
+        -> [RatsnestSegment] {
+        let shapes = BoardCopper.shapes(model: model, copperCount: copperCount)
+        // Pad nodes exactly as BoardConnectivity builds them.
+        var padNodeByKey: [String: Int] = [:]
+        var nodeShapeIndex: [Int] = []
+        var nodeIsPad: [Bool] = []
+        var nodeNet: [String] = []
+        var padCentreByNode: [Int: FPPoint] = [:]
+        var padKeyByNode: [Int: String] = [:]
+        var duplicatePadNodes: [(Int, Int)] = []
+        for (index, shape) in shapes.enumerated() {
+            guard let net = shape.netName else { continue }
+            if shape.kind == .pad, let existing = padNodeByKey[shape.label] {
+                duplicatePadNodes.append((existing, nodeShapeIndex.count))
+            } else if shape.kind == .pad {
+                padNodeByKey[shape.label] = nodeShapeIndex.count
+            }
+            if shape.kind == .pad {
+                padKeyByNode[nodeShapeIndex.count] = shape.label
+                // shapes() appends the pad centre as the LAST
+                // test point of a pad shape.
+                if let centre = shape.testPoints.last {
+                    padCentreByNode[nodeShapeIndex.count] = centre
+                }
+            }
+            nodeShapeIndex.append(index)
+            nodeIsPad.append(shape.kind == .pad)
+            nodeNet.append(net)
+        }
+        var unionFind = UnionFind(count: nodeShapeIndex.count)
+        for (a, b) in duplicatePadNodes { unionFind.union(a, b) }
+        for i in nodeShapeIndex.indices {
+            for j in nodeShapeIndex.indices where j > i {
+                guard nodeNet[i] == nodeNet[j] else { continue }
+                let a = shapes[nodeShapeIndex[i]]
+                let b = shapes[nodeShapeIndex[j]]
+                guard !a.layers.isDisjoint(with: b.layers) else { continue }
+                let ab = a.bounds, bb = b.bounds
+                if ab.maxX < bb.minX - BoardConnectivity.touchTolerance
+                    || bb.maxX < ab.minX - BoardConnectivity.touchTolerance
+                    || ab.maxY < bb.minY - BoardConnectivity.touchTolerance
+                    || bb.maxY < ab.minY - BoardConnectivity.touchTolerance {
+                    continue
+                }
+                if BoardCopper.distance(a, b) <= BoardConnectivity.touchTolerance {
+                    unionFind.union(i, j)
+                }
+            }
+        }
+
+        // Groups of pads per net, keyed by union-find root.
+        var groupsByNet: [String: [Int: [Int]]] = [:]  // net -> root -> pad nodes
+        for (_, node) in padNodeByKey {
+            let net = nodeNet[node]
+            let root = unionFind.find(node)
+            groupsByNet[net, default: [:]][root, default: []].append(node)
+        }
+
+        var result: [RatsnestSegment] = []
+        for net in model.netNames {
+            guard let byRoot = groupsByNet[net], byRoot.count > 1
+            else { continue }
+            // Deterministic group order: by first pad label.
+            let groups: [[Int]] = byRoot.values.map { nodes in
+                nodes.sorted {
+                    (padKeyByNode[$0] ?? "") < (padKeyByNode[$1] ?? "")
+                }
+            }.sorted {
+                (padKeyByNode[$0[0]] ?? "") < (padKeyByNode[$1[0]] ?? "")
+            }
+            // Nearest pad pair between two groups.
+            func link(_ g1: Int, _ g2: Int) -> (distance: Double, from: FPPoint, to: FPPoint) {
+                var best: (Double, FPPoint, FPPoint)? = nil
+                for n1 in groups[g1] {
+                    for n2 in groups[g2] {
+                        guard let c1 = padCentreByNode[n1],
+                              let c2 = padCentreByNode[n2] else { continue }
+                        let d = c1.distance(to: c2)
+                        if best == nil || d < best!.0 { best = (d, c1, c2) }
+                    }
+                }
+                return (best!.0, best!.1, best!.2)
+            }
+            // Prim over groups.
+            var inTree: Set<Int> = [0]
+            while inTree.count < groups.count {
+                var bestEdge: (distance: Double, from: FPPoint, to: FPPoint, group: Int)? = nil
+                for g in inTree {
+                    for h in groups.indices where !inTree.contains(h) {
+                        let candidate = link(g, h)
+                        if bestEdge == nil || candidate.distance < bestEdge!.distance {
+                            bestEdge = (candidate.distance, candidate.from,
+                                        candidate.to, h)
+                        }
+                    }
+                }
+                guard let edge = bestEdge else { break }
+                result.append(RatsnestSegment(from: edge.from, to: edge.to,
+                                              netName: net))
+                inTree.insert(edge.group)
+            }
+        }
+        return result
+    }
+}
+
 // MARK: - Pin connection status (Disconnected vs Unrouted)
 
 /// What the PCB editor says about one pin (part 5, item 13):
@@ -584,6 +712,10 @@ struct ManufacturingSettings: Equatable {
     var minViaDrillMil: Double = 12
     /// Minimum via outer diameter.
     var minViaDiameterMil: Double = 24
+    /// Minimum annular ring: the copper ring left around a via's
+    /// drill, (diameter − drill) / 2 (part 5.2; KiCad DRC's
+    /// minimum annular width). 5 mil ≈ 0.127 mm.
+    var minAnnularRingMil: Double = 5
 }
 
 struct ManufacturingRuleResult: Equatable {
@@ -702,7 +834,104 @@ enum BoardManufacturing {
                 "\($0.reference) has no resolved footprint"
             }))
 
+        // 9. Annular ring (part 5.2): the copper ring around each
+        // via's drill must be at least the minimum width, or the
+        // drill can break out of the pad.
+        let minRingMM = BoardUnits.mm(fromMil: settings.minAnnularRingMil)
+        let thinRings = model.vias.filter {
+            ($0.diameter - $0.drill) / 2 < minRingMM - 1e-9
+        }
+        rules.append(ManufacturingRuleResult(
+            name: "Via annular ring ≥ \(BoardUnits.formatMil(settings.minAnnularRingMil)) mil",
+            passed: thinRings.isEmpty,
+            violations: thinRings.map {
+                "The via at (\(BoardUnits.formatMM($0.center.x)), \(BoardUnits.formatMM($0.center.y))) "
+                + "has a \(BoardUnits.formatLength(mm: ($0.diameter - $0.drill) / 2)) annular ring"
+            }))
+
+        // 10. Courtyard overlap (part 5.2): two components'
+        // courtyards (the F.CrtYd / B.CrtYd keep-clear outlines
+        // in their footprints) must not overlap — parts placed
+        // inside each other's courtyards can't be assembled or
+        // reworked. Bounds-based: each courtyard is reduced to
+        // the bounding box of its outline points (exact for the
+        // rectangular courtyards nearly every footprint uses).
+        var courtyardLines: [String] = []
+        let courtyards: [(reference: String,
+                          bounds: (minX: Double, minY: Double,
+                                   maxX: Double, maxY: Double))] =
+            model.components.compactMap { component in
+                guard let bounds = BoardCourtyards.bounds(component)
+                else { return nil }
+                return (component.reference, bounds)
+            }
+        for i in courtyards.indices {
+            for j in courtyards.indices where j > i {
+                let a = courtyards[i].bounds, b = courtyards[j].bounds
+                let overlapX = min(a.maxX, b.maxX) - max(a.minX, b.minX)
+                let overlapY = min(a.maxY, b.maxY) - max(a.minY, b.minY)
+                if overlapX > 0.01 && overlapY > 0.01 {
+                    courtyardLines.append(
+                        "\(courtyards[i].reference) and \(courtyards[j].reference) "
+                        + "have overlapping courtyards")
+                }
+            }
+        }
+        rules.append(ManufacturingRuleResult(
+            name: "Component courtyards don't overlap",
+            passed: courtyardLines.isEmpty,
+            violations: courtyardLines))
+
         return ManufacturingReport(rules: rules)
+    }
+}
+
+/// Footprint courtyard extraction (part 5.2): the courtyard is
+/// the keep-clear outline a footprint draws on a *.CrtYd layer.
+/// PadCB reduces it to the bounding box of the outline's points
+/// (board-transformed through the same mirror the renderer
+/// uses), which is exact for rectangular courtyards.
+enum BoardCourtyards {
+    static func bounds(_ component: BoardComponent)
+        -> (minX: Double, minY: Double, maxX: Double, maxY: Double)? {
+        guard let footprint = component.footprint else { return nil }
+        var points: [FPPoint] = []
+        for raw in footprint.graphics {
+            let graphic = BoardGeometry.boardGraphic(component, raw)
+            switch graphic {
+            case .line(let a, let b, let layer, _, _, _),
+                 .rect(let a, let b, let layer, _, _, _):
+                guard layer.hasSuffix("CrtYd") else { continue }
+                points.append(a); points.append(b)
+            case .circle(let centre, let radius, let layer, _, _, _):
+                guard layer.hasSuffix("CrtYd") else { continue }
+                points.append(FPPoint(x: centre.x - radius, y: centre.y - radius))
+                points.append(FPPoint(x: centre.x + radius, y: centre.y + radius))
+            case .arc(let a, let m, let b, let layer, _, _, _):
+                guard layer.hasSuffix("CrtYd") else { continue }
+                points.append(a); points.append(m); points.append(b)
+            case .poly(let outline, let layer, _, _, _):
+                guard layer.hasSuffix("CrtYd") else { continue }
+                points.append(contentsOf: outline)
+            case .curve(let p1, let p2, let p3, let p4, let layer, _, _, _):
+                guard layer.hasSuffix("CrtYd") else { continue }
+                points.append(p1); points.append(p2)
+                points.append(p3); points.append(p4)
+            case .text:
+                continue
+            }
+        }
+        guard let first = points.first else { return nil }
+        var minX = first.x, minY = first.y, maxX = first.x, maxY = first.y
+        for p in points {
+            minX = min(minX, p.x); minY = min(minY, p.y)
+            maxX = max(maxX, p.x); maxY = max(maxY, p.y)
+        }
+        // Footprint-local → board: graphics ride the component's
+        // origin exactly like pads do (boardGraphic already
+        // applied the side mirror in local space).
+        return (component.origin.x + minX, component.origin.y + minY,
+                component.origin.x + maxX, component.origin.y + maxY)
     }
 }
 

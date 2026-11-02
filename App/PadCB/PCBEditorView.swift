@@ -47,6 +47,154 @@ import UIKit
 /// Board coordinates are KiCad PCB coordinates: millimetres, x
 /// right, y DOWN — the canvas maps them straight to the screen
 /// (NO y-flip; flipping would mirror every footprint).
+/// The pointer stream's owner (part 5.2): the single
+/// BoardPointerState + the per-channel diagnostics + the
+/// coalescing throttle, behind an ObservableObject so hover
+/// events invalidate ONLY the views that observe it (the canvas
+/// host and the status-bar readout) instead of the whole editor
+/// body. Diagnostics counts EVERY delivered event (the counters
+/// stay an honest delivery record); the STATE applies the
+/// throttled stream (at most one point per display interval,
+/// latest wins) — KiCad's effect (cheap queries per motion
+/// event) matched at PadCB's scale.
+final class BoardPointerModel: ObservableObject {
+    @Published private(set) var state = BoardPointerState()
+    @Published private(set) var diagnostics = BoardHoverDiagnostics()
+    private var throttle = BoardPointerThrottle()
+    private var pendingChannel: BoardHoverChannel = .interaction
+
+    func feedHoverMoved(_ point: FPPoint, channel: BoardHoverChannel) {
+        diagnostics.record(channel, point: point)
+        pendingChannel = channel
+        if let admitted = throttle.offer(
+            point, at: ProcessInfo.processInfo.systemUptime) {
+            state.applyHoverMoved(admitted, channel: channel)
+        }
+    }
+
+    func feedHoverEnded(channel: BoardHoverChannel) {
+        diagnostics.record(channel, point: nil)
+        throttle.end()
+        state.applyHoverEnded(channel: channel)
+    }
+
+    /// Release a coalesced point whose window has elapsed (the
+    /// canvas host calls this on a 60 Hz timer).
+    func flushPending() {
+        if let point = throttle.flush(
+            at: ProcessInfo.processInfo.systemUptime) {
+            state.applyHoverMoved(point, channel: pendingChannel)
+        }
+    }
+
+    func feedTouchMoved(_ point: FPPoint) {
+        state.apply(.touchMoved(point))
+    }
+
+    func feedTouchEnded() {
+        state.apply(.touchEnded)
+    }
+}
+
+/// Hosts the board canvas stack (part 5.2): observes the
+/// pointer model so POINTER changes re-evaluate this small
+/// subtree — and nothing else in the editor. The content
+/// closure is rebuilt whenever the editor itself re-evaluates
+/// (fresh inputs); between those passes the captured editor
+/// value still reads live @State storage, so draws and
+/// gestures always see current values.
+private struct BoardCanvasHost<Content: View>: View {
+    @ObservedObject var pointer: BoardPointerModel
+    var onFlush: () -> Void = {}
+    @ViewBuilder var content: (BoardPointerState) -> Content
+    @State private var flushTimer = Timer.publish(
+        every: 1.0 / 60.0, on: .main, in: .common).autoconnect()
+
+    var body: some View {
+        content(pointer.state)
+            .onReceive(flushTimer) { _ in
+                pointer.flushPending()
+                onFlush()
+            }
+    }
+}
+
+/// Everything the STATIC board layer draws from, as one
+/// Equatable token (part 5.2): the layer re-renders only when
+/// the token changes. Pointer state is deliberately absent —
+/// pointer-driven drawing lives on the preview layer above it.
+private struct StaticBoardToken: Equatable {
+    var renderVersion: Int
+    var boardState: BoardState
+    var visibility: BoardVisibility
+    var selections: Set<PCBEditorView.BoardSelection>
+    var primarySelection: PCBEditorView.BoardSelection?
+    var highlightedNet: String?
+    var activeLayer: String
+    var showGrid: Bool
+    var scale: Double
+    var offset: CGPoint
+    var movePreviewOrigins: [String: FPPoint]
+    var moveViaPreview: FPPoint?
+    var editDragTraceID: UUID?
+    var editDragPreviewPoints: [FPPoint]?
+    var ratsnestCount: Int
+}
+
+/// The static board layer (part 5.2, KiCad's VIEW/GAL layer
+/// separation): a Canvas whose redraw is gated by token
+/// equality, so Pencil hover — which changes none of these
+/// inputs — never re-renders the board beneath the preview.
+private struct StaticBoardLayer: View, Equatable {
+    let token: StaticBoardToken
+    let draw: (inout GraphicsContext, CGSize) -> Void
+
+    static func == (lhs: StaticBoardLayer, rhs: StaticBoardLayer) -> Bool {
+        lhs.token == rhs.token
+    }
+
+    var body: some View {
+        Canvas { ctx, size in
+            var c = ctx
+            draw(&c, size)
+        }
+    }
+}
+
+/// The status bar's pointer readout (part 5.2): the ONLY
+/// status-bar content that observes the pointer model, so the
+/// cursor position and the hover diagnostics update without
+/// re-evaluating the editor.
+private struct BoardPointerReadoutView: View {
+    @ObservedObject var pointer: BoardPointerModel
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Text(cursorText)
+                .font(.callout)
+                .foregroundStyle(.white.opacity(0.85))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            // Hover delivery diagnostics (parts 5.0.2–5.0.3):
+            // per-channel event counts + last hover point, live.
+            // Deliberate debug UI — a follow-up strips it once
+            // delivery is proven on Sean's hardware.
+            Text(pointer.diagnostics.summary)
+                .font(.footnote)
+                .foregroundStyle(.white.opacity(0.55))
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+        }
+    }
+
+    private var cursorText: String {
+        guard let point = pointer.state.currentPoint
+        else { return "X —  Y —" }
+        return "X \(String(format: "%.2f", point.x)) mm"
+            + "  Y \(String(format: "%.2f", point.y)) mm"
+    }
+}
+
 struct PCBEditorView: View {
     @EnvironmentObject private var libraryStore: LibraryStore
     @EnvironmentObject private var footprintStore: FootprintStore
@@ -64,6 +212,7 @@ struct PCBEditorView: View {
         case text = "Text"
         case placeVia = "Place Via"
         case fillZone = "Fill Zone"
+        case measure = "Measure"
 
         var icon: String {
             switch self {
@@ -77,6 +226,7 @@ struct PCBEditorView: View {
             case .text: return "textformat"
             case .placeVia: return "circle.circle"
             case .fillZone: return "hexagon"
+            case .measure: return "ruler"
             }
         }
     }
@@ -168,26 +318,39 @@ struct PCBEditorView: View {
     /// selected group moves. (Decided at drag end — see canvasDrag.)
     @State private var dragTapReference: String? = nil
     @State private var pinchStartScale: Double? = nil
-    /// The canvas's ONE pointer stream (part 5.0.1): hover (UIKit
-    /// recognizer) and touch (drag gesture) both feed
-    /// `BoardPointerState`; previews follow its `currentPoint` —
-    /// the touch point while a touch is down, else the hover
-    /// point. (v5.0 kept two optionals and preferred the touch one
-    /// forever once set, which froze the hover preview at the
-    /// first tap — see PCBBoardState.swift.)
-    @State private var pointerState = BoardPointerState()
-    /// Per-channel hover DELIVERY counters (parts 5.0.2–5.0.3):
-    /// v5.0.1's single delivery path delivered nothing on Sean's
-    /// hardware ("Hover still dead", 2026-11-01 20:10), and
-    /// v5.0.2's three worked-around channels still didn't reach
-    /// his Pencil Pro (21:37) — so v5.0.3 feeds the stream from
-    /// ONE frontmost UIKit interaction view over the canvas (its
-    /// own recognizer = channel 1) plus SwiftUI's hover feed as
-    /// the counted fallback (channel 2), and counts every event
-    /// per channel. The status bar shows the counts live —
-    /// Sean's screenshot of that line names the live channel on
-    /// his hardware.
-    @State private var hoverDiagnostics = BoardHoverDiagnostics()
+    /// The canvas's ONE pointer stream (part 5.0.1), owned by an
+    /// observable model since part 5.2: hover (UIKit recognizer)
+    /// and touch (drag gesture) both feed `BoardPointerState`;
+    /// previews follow its `currentPoint` — the touch point
+    /// while a touch is down, else the hover point. (v5.0 kept
+    /// two optionals and preferred the touch one forever once
+    /// set, which froze the hover preview at the first tap —
+    /// see PCBBoardState.swift.) The model also owns the
+    /// per-channel delivery diagnostics (parts 5.0.2–5.0.3) and
+    /// the coalescing throttle (part 5.2): as an ObservableObject
+    /// it publishes ONLY to the canvas host and the status-bar
+    /// readout, so a hover event no longer re-evaluates the
+    /// whole editor body — the v5.1 "ui shakes back and forth"
+    /// judder (Sean, 2026-11-02 08:44).
+    @StateObject private var pointerModel = BoardPointerModel()
+    /// The stateful route head (part 5.2): carries the preview's
+    /// endpoint / anchor / corner across hover events with
+    /// hysteresis, KiCad-placer style. Resolved on pointer
+    /// EVENTS (never during drawing) into `routePreviewCache`.
+    @State private var routeHead = BoardRouteHead()
+    @State private var routePreviewCache: BoardRoutePreview? = nil
+    /// Spatial index over the merged model (part 5.2), rebuilt
+    /// wherever the checks are recomputed — never per event.
+    @State private var spatialIndex: BoardSpatialIndex? = nil
+    /// Ratsnest segments for the current model (part 5.2),
+    /// recomputed with the checks.
+    @State private var ratsnestSegments: [RatsnestSegment] = []
+    /// Static-canvas invalidation counter (part 5.2): bumped by
+    /// refreshChecks, i.e. on every model/checks change, so the
+    /// equatable static layer redraws exactly then.
+    @State private var boardRenderVersion = 0
+    /// The measuring tool's two points (part 5.2).
+    @State private var measure = BoardMeasure()
     @State private var canvasSize: CGSize = .zero
     @State private var showGrid = true
     @State private var highlightActiveLayer = false
@@ -565,9 +728,15 @@ struct PCBEditorView: View {
     /// Called after every model change (load, sync, mutation) so
     /// pin status, Problems and Inspect always read fresh truth.
     private func refreshChecks() {
+        // Static-layer invalidation (part 5.2): every caller of
+        // refreshChecks has just changed the model or the
+        // checks, so the equatable static canvas redraws.
+        boardRenderVersion &+= 1
         guard let model else {
             connectivity = [:]
             clearanceViolations = []
+            spatialIndex = nil
+            ratsnestSegments = []
             return
         }
         connectivity = BoardConnectivity.analyze(
@@ -575,6 +744,12 @@ struct PCBEditorView: View {
         clearanceViolations = BoardClearance.violations(
             model: model, copperCount: boardState.copperLayerCount,
             clearanceMM: BoardUnits.mm(fromMil: boardState.clearanceMil))
+        // Part 5.2: the spatial index and the ratsnest rebuild
+        // with the checks — once per edit/commit, never per
+        // pointer event.
+        spatialIndex = BoardSpatialIndex(model: model)
+        ratsnestSegments = BoardRatsnest.segments(
+            model: model, copperCount: boardState.copperLayerCount)
     }
 
     private var manufacturingSettings: ManufacturingSettings {
@@ -995,6 +1170,8 @@ struct PCBEditorView: View {
     private func cancelInProgress() {
         routePoints = []
         routeNet = nil
+        routeHead.reset()
+        routePreviewCache = nil
         pendingPoints = []
         zonePoints = []
         textAnchor = nil
@@ -1438,6 +1615,7 @@ struct PCBEditorView: View {
                 Text("Layers").lineLimit(1).tag("Layers")
                 Text("Objects").lineLimit(1).tag("Objects")
                 Text("Components").lineLimit(1).tag("Components")
+                Text("Nets").lineLimit(1).tag("Nets")
             }
             .pickerStyle(.segmented)
             .padding(10)
@@ -1448,6 +1626,8 @@ struct PCBEditorView: View {
                         objectsPanel
                     } else if activePanelTab == "Components" {
                         componentsPanel(model: model)
+                    } else if activePanelTab == "Nets" {
+                        netsPanel(model: model)
                     } else {
                         layersPanel
                     }
@@ -1559,6 +1739,9 @@ struct PCBEditorView: View {
             checkRow("Zones", isOn: visibility.showZones) {
                 visibility.showZones.toggle()
             }
+            checkRow("Ratsnest", isOn: visibility.showRatsnest) {
+                visibility.showRatsnest.toggle()
+            }
             checkRow("Drawings", isOn: visibility.showDrawings) {
                 visibility.showDrawings.toggle()
             }
@@ -1569,6 +1752,66 @@ struct PCBEditorView: View {
                 visibility.showDimensions.toggle()
             }
             Text("These filter the canvas immediately. Vias and fills are placed with the Place Via and Fill Zone tools. (PadCB doesn't draw dimensions yet — that switch is ready for when it does.)")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(5)
+        }
+    }
+
+    /// The net inspector (part 5.2, pcbnew's net inspector):
+    /// every net from the connectivity walk — pads routed of
+    /// total, routed length, unrouted count. Tapping a row
+    /// highlights the net (tap again to clear).
+    private func netsPanel(model: BoardModel) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            panelHeader("Nets")
+            let nets = connectivity.values.sorted { $0.netName < $1.netName }
+            if nets.isEmpty {
+                Text("No nets on this board yet.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            ForEach(nets, id: \.netName) { net in
+                Button {
+                    highlightedNet = highlightedNet == net.netName
+                        ? nil : net.netName
+                } label: {
+                    HStack(spacing: 8) {
+                        Text(net.netName)
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.white)
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        Text("\(net.routedPadCount)/\(net.padCount) pads")
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        Text(BoardUnits.formatLength(mm: net.traceLength))
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.7))
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        if !net.unroutedPads.isEmpty {
+                            Text("\(net.unroutedPads.count) open")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.orange)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                        }
+                    }
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(highlightedNet == net.netName
+                                ? Color.accentColor.opacity(0.30)
+                                : Color.white.opacity(0.05),
+                                in: RoundedRectangle(cornerRadius: 7))
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+            }
+            Text("Tap a net to highlight it on the board; tap again to clear. \"Open\" counts pads that reach no other pad — the ratsnest lines show where they still need to go.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(5)
@@ -1769,6 +2012,10 @@ struct PCBEditorView: View {
     @ViewBuilder
     private var detailPanel: some View {
         VStack(alignment: .leading, spacing: 6) {
+            if measure.a != nil {
+                measureDetail
+                Divider()
+            }
             if selections.count > 1, let summary = selectionSummaryText {
                 Text(summary)
                     .font(.callout.weight(.bold))
@@ -1787,6 +2034,74 @@ struct PCBEditorView: View {
                             .lineLimit(1)
                     }
                     .buttonStyle(.bordered)
+                }
+                // Part 5.2: duplicate + align/distribute +
+                // mass edit for the whole selection.
+                Button { duplicateSelection() } label: {
+                    Label("Duplicate", systemImage: "plus.square.on.square")
+                        .lineLimit(1)
+                }
+                .buttonStyle(.bordered)
+                if selectedComponentReferencesOrdered.count >= 2 {
+                    Text("Align footprints")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineLimit(1)
+                        .padding(.top, 2)
+                    HStack(spacing: 6) {
+                        Button("Left") { applyAlignment(.left) }
+                        Button("Right") { applyAlignment(.right) }
+                        Button("Top") { applyAlignment(.top) }
+                        Button("Bottom") { applyAlignment(.bottom) }
+                    }
+                    .buttonStyle(.bordered)
+                    .font(.callout)
+                    HStack(spacing: 6) {
+                        Button("Centre ↔") { applyAlignment(.centerX) }
+                        Button("Centre ↕") { applyAlignment(.centerY) }
+                    }
+                    .buttonStyle(.bordered)
+                    .font(.callout)
+                    if selectedComponentReferencesOrdered.count >= 3 {
+                        HStack(spacing: 6) {
+                            Button("Space ↔ evenly") {
+                                applyDistribution(horizontal: true)
+                            }
+                            Button("Space ↕ evenly") {
+                                applyDistribution(horizontal: false)
+                            }
+                        }
+                        .buttonStyle(.bordered)
+                        .font(.callout)
+                    }
+                    Text("Alignment uses the footprints' pad outlines; Centre anchors on the first footprint listed. Locked footprints never move.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(3)
+                }
+                if selectedTraces.count > 1 {
+                    Text("All \(selectedTraces.count) selected tracks")
+                        .font(.callout.weight(.semibold))
+                        .foregroundStyle(.white.opacity(0.85))
+                        .lineLimit(1)
+                        .padding(.top, 2)
+                    HStack(spacing: 6) {
+                        TextField("Width (mm)", text: $widthDraft)
+                            .keyboardType(.decimalPad)
+                            .textFieldStyle(.roundedBorder)
+                        Button("Apply to All") {
+                            applyWidthToSelectedTraces()
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                    HStack(spacing: 6) {
+                        ForEach(BoardLayers.copperLayers(
+                            count: boardState.copperLayerCount), id: \.self) { layer in
+                            Button(layer) { applyLayerToSelectedTraces(layer) }
+                                .buttonStyle(.bordered)
+                                .font(.caption)
+                        }
+                    }
                 }
                 Divider()
             }
@@ -1814,6 +2129,33 @@ struct PCBEditorView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(5)
             }
+        }
+    }
+
+    /// The measure tool's readout card (part 5.2).
+    private var measureDetail: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Measure")
+                .font(.title3.weight(.bold))
+                .foregroundStyle(.white)
+                .lineLimit(1)
+            if let a = measure.a {
+                detailRow("From", "\(fmt(a.x)), \(fmt(a.y)) mm")
+            }
+            if let b = measure.b {
+                detailRow("To", "\(fmt(b.x)), \(fmt(b.y)) mm")
+            }
+            if let distance = measure.distance, let delta = measure.delta {
+                detailRow("Distance", BoardUnits.formatLength(mm: distance))
+                detailRow("Δx / Δy", "\(fmt(delta.x)) / \(fmt(delta.y)) mm")
+            } else {
+                Text("Tap the second point on the board.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Button("Clear Measurement") { measure.clear() }
+                .buttonStyle(.bordered)
         }
     }
 
@@ -1863,6 +2205,7 @@ struct PCBEditorView: View {
             }
             .buttonStyle(.bordered)
             .padding(.top, 2)
+            lockRow(.component(component.reference))
 
             Text("Pins → pads")
                 .font(.callout.weight(.semibold))
@@ -2002,6 +2345,10 @@ struct PCBEditorView: View {
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
             }
+            HStack(spacing: 8) {
+                lockRow(.trace(trace.id))
+                duplicateButtonRow()
+            }
             Text("Width (mm)")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.85))
@@ -2103,6 +2450,10 @@ struct PCBEditorView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(3)
+            HStack(spacing: 8) {
+                lockRow(.via(via.id))
+                duplicateButtonRow()
+            }
             deleteSelectionButton("Delete Via")
         }
     }
@@ -2122,6 +2473,10 @@ struct PCBEditorView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(4)
+            HStack(spacing: 8) {
+                lockRow(.zone(zone.id))
+                duplicateButtonRow()
+            }
             deleteSelectionButton("Delete Fill")
         }
     }
@@ -2139,6 +2494,10 @@ struct PCBEditorView: View {
             }
             if graphic.kind == .circle {
                 detailRow("Radius", "\(fmt(graphic.radius)) mm")
+            }
+            HStack(spacing: 8) {
+                lockRow(.graphic(graphic.id))
+                duplicateButtonRow()
             }
             deleteSelectionButton("Delete Graphic")
         }
@@ -2164,6 +2523,17 @@ struct PCBEditorView: View {
                 .buttonStyle(.bordered)
             }
         }
+    }
+
+    /// The Duplicate button shared by the item detail cards
+    /// (part 5.2).
+    private func duplicateButtonRow() -> some View {
+        Button { duplicateSelection() } label: {
+            Label("Duplicate", systemImage: "plus.square.on.square")
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+        }
+        .buttonStyle(.bordered)
     }
 
     private func deleteSelectionButton(_ title: String) -> some View {
@@ -2293,7 +2663,7 @@ struct PCBEditorView: View {
                     Text("Result")
                 }
                 Section {
-                    Text("Limits in force: clearance \(BoardUnits.formatMil(manufacturingSettings.clearanceMil)) mil · min track \(BoardUnits.formatMil(manufacturingSettings.minTraceWidthMil)) mil · min via drill \(BoardUnits.formatMil(manufacturingSettings.minViaDrillMil)) mil · min via diameter \(BoardUnits.formatMil(manufacturingSettings.minViaDiameterMil)) mil. Clearance is adjustable in Preferences.")
+                    Text("Limits in force: clearance \(BoardUnits.formatMil(manufacturingSettings.clearanceMil)) mil · min track \(BoardUnits.formatMil(manufacturingSettings.minTraceWidthMil)) mil · min via drill \(BoardUnits.formatMil(manufacturingSettings.minViaDrillMil)) mil · min via diameter \(BoardUnits.formatMil(manufacturingSettings.minViaDiameterMil)) mil · min annular ring \(BoardUnits.formatMil(manufacturingSettings.minAnnularRingMil)) mil. Clearance is adjustable in Preferences.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 } header: {
@@ -2479,20 +2849,10 @@ struct PCBEditorView: View {
 
     private var statusBar: some View {
         HStack(spacing: 14) {
-            Text(cursorText)
-                .font(.callout)
-                .foregroundStyle(.white.opacity(0.85))
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
-            // Hover delivery diagnostics (parts 5.0.2–5.0.3):
-            // per-channel event counts + last hover point, live.
-            // Deliberate debug UI — a follow-up strips it once
-            // delivery is proven on Sean's hardware.
-            Text(hoverDiagnostics.summary)
-                .font(.footnote)
-                .foregroundStyle(.white.opacity(0.55))
-                .lineLimit(1)
-                .fixedSize(horizontal: true, vertical: false)
+            // Cursor position + hover diagnostics (part 5.2):
+            // the only status-bar content observing the pointer
+            // model, in its own subview.
+            BoardPointerReadoutView(pointer: pointerModel)
             Text("Grid \(BoardUnits.formatMil(boardState.gridMil)) mil (\(PCBBoardMerger.formatMM(gridMM)) mm)")
                 .font(.callout)
                 .foregroundStyle(.white.opacity(0.6))
@@ -2531,11 +2891,6 @@ struct PCBEditorView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 6)
         .background(Color(white: 0.11))
-    }
-
-    private var cursorText: String {
-        guard let point = pointerState.currentPoint else { return "X —  Y —" }
-        return "X \(fmt(point.x)) mm  Y \(fmt(point.y)) mm"
     }
 
     private var boardInfoText: String {
@@ -2633,43 +2988,104 @@ struct PCBEditorView: View {
 
     // MARK: - Board canvas + gestures
 
-    /// THE hover entry point (parts 5.0.2–5.0.3): every delivery
-    /// channel funnels through these two helpers — record the
-    /// event against its channel in the diagnostics, then apply
-    /// it to the ONE pointer stream. Arbitration, previews and
-    /// tap resolution are therefore identical no matter which
-    /// channel delivered the event. `PADCB-HOVER` log markers
-    /// mirror the counters for the simulator hover exercise:
-    /// first event per channel, then every 50th.
+    /// THE hover entry point (parts 5.0.2–5.0.3, restructured
+    /// 5.2): every delivery channel funnels through these two
+    /// helpers — the event is recorded against its channel in
+    /// the diagnostics, then applied to the ONE pointer stream
+    /// (via the pointer model: per-channel arbitration +
+    /// coalescing throttle live there now). Arbitration,
+    /// previews and tap resolution are therefore identical no
+    /// matter which channel delivered the event. `PADCB-HOVER`
+    /// log markers mirror the counters for the simulator hover
+    /// exercise: first event per channel, then every 50th.
     private func feedHoverMoved(_ boardPoint: FPPoint,
                                 channel: BoardHoverChannel) {
-        let before = hoverDiagnostics.count(channel)
-        hoverDiagnostics.record(channel, point: boardPoint)
-        pointerState.apply(.hoverMoved(boardPoint))
+        let before = pointerModel.diagnostics.count(channel)
+        pointerModel.feedHoverMoved(boardPoint, channel: channel)
         if before == 0 {
             padcbHoverPrint("PADCB-HOVER first ch=\(channel.rawValue)"
-                + " summary=\(hoverDiagnostics.summary)")
+                + " summary=\(pointerModel.diagnostics.summary)")
         } else if (before + 1) % 50 == 0 {
             padcbHoverPrint("PADCB-HOVER ch=\(channel.rawValue)"
                 + " count=\(before + 1)"
-                + " summary=\(hoverDiagnostics.summary)")
+                + " summary=\(pointerModel.diagnostics.summary)")
         }
+        refreshRoutePreview()
     }
 
     private func feedHoverEnded(channel: BoardHoverChannel) {
-        let before = hoverDiagnostics.count(channel)
-        hoverDiagnostics.record(channel, point: nil)
-        pointerState.apply(.hoverEnded)
+        let before = pointerModel.diagnostics.count(channel)
+        pointerModel.feedHoverEnded(channel: channel)
         if before == 0 {
             padcbHoverPrint("PADCB-HOVER first ch=\(channel.rawValue) (end)"
-                + " summary=\(hoverDiagnostics.summary)")
+                + " summary=\(pointerModel.diagnostics.summary)")
         }
+        refreshRoutePreview()
+    }
+
+    /// Re-resolve the routing head against the CURRENT pointer
+    /// and cache it for the preview layer (part 5.2). Runs on
+    /// pointer events and route-state changes — never during
+    /// drawing — so the stateful head (BoardRouteHead) mutates
+    /// only in event context, exactly like KiCad's Move().
+    private func refreshRoutePreview() {
+        guard routingActive, let model, let last = routePoints.last,
+              let point = pointerModel.state.currentPoint else {
+            routePreviewCache = nil
+            return
+        }
+        routePreviewCache = routeHead.resolve(
+            model, from: last, pointer: point, routeNet: routeNet,
+            snapEnabled: snapEnabled, gridMil: boardState.gridMil,
+            tolerance: tapToleranceMM)
+    }
+
+    /// The static layer's invalidation token (part 5.2): every
+    /// value the static drawing reads, in one Equatable bundle.
+    private var staticToken: StaticBoardToken {
+        StaticBoardToken(
+            renderVersion: boardRenderVersion,
+            boardState: boardState,
+            visibility: visibility,
+            selections: selections,
+            primarySelection: primarySelection,
+            highlightedNet: highlightedNet,
+            activeLayer: activeLayer,
+            showGrid: showGrid,
+            scale: scale,
+            offset: offset,
+            movePreviewOrigins: movePreviewOrigins,
+            moveViaPreview: moveViaPreview,
+            editDragTraceID: editDragTraceID,
+            editDragPreviewPoints: editDragPreviewPoints,
+            ratsnestCount: ratsnestSegments.count)
     }
 
     private func boardCanvas(model: BoardModel) -> some View {
+        BoardCanvasHost(pointer: pointerModel,
+                        onFlush: { refreshRoutePreview() }) { pointer in
+            canvasStack(model: model, pointer: pointer)
+        }
+    }
+
+    private func canvasStack(model: BoardModel,
+                             pointer: BoardPointerState) -> some View {
         GeometryReader { geo in
-            Canvas { ctx, size in
-                drawBoard(ctx: ctx, size: size, model: model)
+            ZStack {
+                // Static layer (part 5.2): the whole board,
+                // redrawn only when its token changes — Pencil
+                // hover never touches it.
+                StaticBoardLayer(token: staticToken, draw: { ctx, size in
+                    drawStaticBoard(ctx: ctx, size: size, model: model)
+                })
+                .equatable()
+                // Preview layer: pointer-driven drawing only
+                // (route head, hover highlight, tool previews,
+                // measure) — cheap paths over indexed queries.
+                Canvas { ctx, size in
+                    drawPreviews(ctx: ctx, size: size, model: model,
+                                 pointer: pointer)
+                }
             }
             .background(Color(red: 0.043, green: 0.055, blue: 0.043)) // #0B0E0B-ish
             .contentShape(Rectangle())
@@ -2751,7 +3167,8 @@ struct PCBEditorView: View {
     private var canvasDrag: some Gesture {
         DragGesture(minimumDistance: 0)
             .onChanged { value in
-                pointerState.apply(.touchMoved(screenToBoard(value.location)))
+                pointerModel.feedTouchMoved(screenToBoard(value.location))
+                refreshRoutePreview()
                 if dragMode == .undecided {
                     // Once per drag (this block runs on the first
                     // change only): exercise-only proof that the
@@ -2765,13 +3182,24 @@ struct PCBEditorView: View {
                     // wins over a footprint's broad bounds.
                     if activeTool == .select, let model,
                        selectionFilter.allows(.via),
-                       let via = BoardGeometry.viaAt(model, point: startBoard,
-                                                     tolerance: tapToleranceMM),
+                       let via = (spatialIndex?.viaAt(
+                                   model, point: startBoard,
+                                   tolerance: tapToleranceMM)
+                                  ?? BoardGeometry.viaAt(
+                                      model, point: startBoard,
+                                      tolerance: tapToleranceMM)),
                        visibility.viaShown(via) {
-                        dragMode = .moveVia
-                        movingViaID = via.id
-                        moveViaStart = via.center
-                        moveViaPreview = via.center
+                        if boardState.isLocked(via.id) {
+                            // Locked via (part 5.2): the press
+                            // pans instead of dragging it.
+                            dragMode = .pan
+                            setStatus("That via is locked — unlock it (Lock button in its details) to move it.")
+                        } else {
+                            dragMode = .moveVia
+                            movingViaID = via.id
+                            moveViaStart = via.center
+                            moveViaPreview = via.center
+                        }
                     } else if activeTool == .select,
                               selectionFilter.allows(.trace),
                               let active = editTrace,
@@ -2787,9 +3215,17 @@ struct PCBEditorView: View {
                     } else if activeTool == .select, let model,
                               visibility.showFootprints,
                               selectionFilter.allows(.component),
-                              let component = BoardGeometry.componentAt(
-                                  model, point: startBoard) {
-                        if multiSelect
+                              let component = (spatialIndex?.componentAt(
+                                                  model, point: startBoard)
+                                               ?? BoardGeometry.componentAt(
+                                                  model, point: startBoard)) {
+                        if boardState.isLocked(reference: component.reference) {
+                            // Locked footprint (part 5.2): the
+                            // press pans; taps still select it so
+                            // it can be unlocked from its details.
+                            dragMode = .pan
+                            setStatus("\(component.reference) is locked — unlock it (Lock button in its details) to move it.")
+                        } else if multiSelect
                             && !selections.contains(.component(component.reference)) {
                             // Multi: pressing an UNSELECTED part is
                             // a tap (toggle) or a pan — never a move.
@@ -2813,6 +3249,13 @@ struct PCBEditorView: View {
                             if moveStartOrigins.isEmpty {
                                 moveStartOrigins[component.reference] = component.origin
                                 movePreviewOrigins[component.reference] = component.origin
+                            }
+                            // Locked members never join a group
+                            // move (part 5.2).
+                            for reference in Array(moveStartOrigins.keys)
+                            where boardState.isLocked(reference: reference) {
+                                moveStartOrigins.removeValue(forKey: reference)
+                                movePreviewOrigins.removeValue(forKey: reference)
                             }
                         }
                     } else {
@@ -2896,7 +3339,8 @@ struct PCBEditorView: View {
                 // The touch is up: the pointer stream falls back
                 // to hover (part 5.0.1). The tap resolution below
                 // uses the gesture's own end location, as before.
-                pointerState.apply(.touchEnded)
+                pointerModel.feedTouchEnded()
+                refreshRoutePreview()
                 let moved = hypot(value.translation.width, value.translation.height)
                 // Exercise-only: the drag's outcome in one line —
                 // moved < 5 = a tap reached the tool handlers;
@@ -2988,6 +3432,8 @@ struct PCBEditorView: View {
     /// track is selected) starts a segment drag. Sets the drag
     /// mode + edit-drag state and returns true when claimed.
     private func beginTraceEditDrag(trace: BoardTrace, at startBoard: FPPoint) -> Bool {
+        // Locked tracks don't bend (part 5.2).
+        if boardState.isLocked(trace.id) { return false }
         if let vertex = BoardGeometry.vertexHit(
             trace, point: startBoard,
             tolerance: max(tapToleranceMM, 4.5 / scale)) {
@@ -3060,6 +3506,16 @@ struct PCBEditorView: View {
             textAnchor = snapPoint(point)
             textDraft = ""
             showTextPrompt = true
+        case .measure:
+            // Measure tool (part 5.2): two taps mark a distance;
+            // a third tap starts a new measurement.
+            measure.tap(snapPoint(point))
+            if let distance = measure.distance, let delta = measure.delta {
+                setStatus("Measured \(fmt(distance)) mm — Δx \(fmt(delta.x)) mm, "
+                          + "Δy \(fmt(delta.y)) mm. Tap again to start over.")
+            } else {
+                setStatus("Measure: first point set — tap the second point.")
+            }
         }
     }
 
@@ -3085,9 +3541,14 @@ struct PCBEditorView: View {
     private func handleDoubleTap(at point: FPPoint) {
         guard activeTool == .select, let model,
               selectionFilter.allows(.trace) else { return }
-        guard let hit = BoardGeometry.segmentAt(
-            model.traces.filter { visibility.traceShown($0) },
-            point: point, tolerance: tapToleranceMM) else { return }
+        guard let hit = spatialIndex?.segmentAt(
+                  model, point: point, tolerance: tapToleranceMM,
+                  allowedTraceIDs: Set(model.traces
+                      .filter { visibility.traceShown($0) }.map(\.id)))
+                  ?? BoardGeometry.segmentAt(
+                      model.traces.filter { visibility.traceShown($0) },
+                      point: point, tolerance: tapToleranceMM)
+        else { return }
         if let fresh = freshSegmentTap,
            fresh.traceID == hit.trace.id, fresh.index == hit.index,
            Date().timeIntervalSince(fresh.time) < 0.6,
@@ -3145,9 +3606,13 @@ struct PCBEditorView: View {
         // nearest segment under the tap, across the visible
         // traces — never the whole track from a plain tap.
         if selectionFilter.allows(.trace),
-           let hit = BoardGeometry.segmentAt(
-               model.traces.filter { visibility.traceShown($0) },
-               point: point, tolerance: tolerance) {
+           let hit = spatialIndex?.segmentAt(
+               model, point: point, tolerance: tolerance,
+               allowedTraceIDs: Set(model.traces
+                   .filter { visibility.traceShown($0) }.map(\.id)))
+               ?? BoardGeometry.segmentAt(
+                   model.traces.filter { visibility.traceShown($0) },
+                   point: point, tolerance: tolerance) {
             if multiSelect {
                 toggleSelection(.segment(hit.trace.id, hit.index))
             } else if case .trace(let selectedID)? = primarySelection,
@@ -3200,7 +3665,8 @@ struct PCBEditorView: View {
             return
         }
         if visibility.showFootprints, selectionFilter.allows(.component),
-           let component = BoardGeometry.componentAt(model, point: point) {
+           let component = spatialIndex?.componentAt(model, point: point)
+               ?? BoardGeometry.componentAt(model, point: point) {
             applyTapSelection(.component(component.reference))
             return
         }
@@ -3243,9 +3709,13 @@ struct PCBEditorView: View {
         // The Delete tool works at selection's granularity
         // (part 5.1): the tapped SEGMENT goes and the track
         // splits at the gap — KiCad's delete does the same.
-        if let hit = BoardGeometry.segmentAt(
-            model.traces.filter { visibility.traceShown($0) },
-            point: point, tolerance: tolerance) {
+        if let hit = spatialIndex?.segmentAt(
+            model, point: point, tolerance: tolerance,
+            allowedTraceIDs: Set(model.traces
+                .filter { visibility.traceShown($0) }.map(\.id)))
+            ?? BoardGeometry.segmentAt(
+                model.traces.filter { visibility.traceShown($0) },
+                point: point, tolerance: tolerance) {
             selectOnly(.segment(hit.trace.id, hit.index))
             deleteSelection()
             return
@@ -3267,7 +3737,8 @@ struct PCBEditorView: View {
             return
         }
         if visibility.showFootprints,
-           let component = BoardGeometry.componentAt(model, point: point) {
+           let component = spatialIndex?.componentAt(model, point: point)
+               ?? BoardGeometry.componentAt(model, point: point) {
             selectOnly(.component(component.reference))
             deleteSelection()
         }
@@ -3282,6 +3753,25 @@ struct PCBEditorView: View {
     /// its two segments into one straight run).
     private func deleteSelection() {
         guard !selections.isEmpty else { return }
+        // Locked items refuse deletion (part 5.2): the whole
+        // delete stops with a clear message rather than quietly
+        // deleting around the locked item.
+        let lockedSelected = selections.contains { item in
+            switch item {
+            case .component(let reference):
+                return boardState.isLocked(reference: reference)
+            case .trace(let id), .via(let id), .zone(let id),
+                 .graphic(let id):
+                return boardState.isLocked(id)
+            case .segment(let id, _), .vertex(let id, _):
+                return boardState.isLocked(id)
+            }
+        }
+        if lockedSelected {
+            setStatus("Something in the selection is locked — unlock it first (Lock button in its details) to delete it.",
+                      warning: true)
+            return
+        }
         let doomed = selections
         clearSelection()
         var removedComponents: [String] = []
@@ -3454,6 +3944,14 @@ struct PCBEditorView: View {
     /// status line says so.
     private func flipSelection() {
         let parts = flippableSelections
+        // Locked items refuse flipping (part 5.2).
+        if parts.components.contains(where: {
+            boardState.isLocked(reference: $0)
+        }) || parts.traces.contains(where: { boardState.isLocked($0.id) }) {
+            setStatus("Something selected is locked — unlock it first (Lock button in its details) to flip it.",
+                      warning: true)
+            return
+        }
         guard !parts.components.isEmpty || !parts.traces.isEmpty else {
             setStatus("Nothing to flip — vias span all layers, and fills and drawings aren't flipped. Select a footprint or an F.Cu/B.Cu track.",
                       warning: true)
@@ -3485,6 +3983,200 @@ struct PCBEditorView: View {
         setStatus(summary.joined(separator: " · "))
     }
 
+    // MARK: - Placement actions (part 5.2)
+
+    /// Selected component references, PRIMARY first (the align
+    /// centre anchor), then the rest in model order.
+    private var selectedComponentReferencesOrdered: [String] {
+        guard let model else { return [] }
+        var refs: [String] = []
+        if case .component(let ref)? = primarySelection,
+           model.components.contains(where: { $0.reference == ref }) {
+            refs.append(ref)
+        }
+        for component in model.components
+        where selections.contains(.component(component.reference))
+            && !refs.contains(component.reference) {
+            refs.append(component.reference)
+        }
+        return refs
+    }
+
+    private func applyAlignment(_ mode: BoardAlignMode) {
+        guard let model else { return }
+        let refs = selectedComponentReferencesOrdered
+        let moves = BoardPlacementTools.alignedOrigins(
+            model, references: refs, mode: mode,
+            lockedReferences: boardState.lockedReferences)
+        guard !moves.isEmpty else {
+            setStatus("Nothing to align — the selected footprints are already there (locked ones never move).")
+            return
+        }
+        mutateBoard { state in
+            for (reference, origin) in moves {
+                state.placements[reference] = origin
+            }
+        }
+        setStatus("\(moves.count) footprint(s) aligned — saved with the board.")
+    }
+
+    private func applyDistribution(horizontal: Bool) {
+        guard let model else { return }
+        let refs = selectedComponentReferencesOrdered
+        let moves = BoardPlacementTools.distributedOrigins(
+            model, references: refs, horizontal: horizontal,
+            lockedReferences: boardState.lockedReferences)
+        guard !moves.isEmpty else {
+            setStatus("Nothing to distribute — pick at least three unlocked footprints that aren't already evenly spaced.")
+            return
+        }
+        mutateBoard { state in
+            for (reference, origin) in moves {
+                state.placements[reference] = origin
+            }
+        }
+        setStatus("\(moves.count) footprint(s) spaced evenly — saved with the board.")
+    }
+
+    /// Duplicate the selected board items (part 5.2): traces
+    /// (a selected segment duplicates its whole trace), vias,
+    /// zones, graphics — offset by one grid step; the copies
+    /// become the selection. Components aren't duplicated
+    /// (they're schematic-owned; a board-only copy would break
+    /// the model).
+    private func duplicateSelection() {
+        let traceIDs = Set(selectedTraces.map(\.id))
+            .union(selectedSegments.map(\.trace.id))
+        let viaIDs = Set(selections.compactMap { selection -> UUID? in
+            if case .via(let id) = selection { return id }
+            return nil
+        })
+        let zoneIDs = Set(selections.compactMap { selection -> UUID? in
+            if case .zone(let id) = selection { return id }
+            return nil
+        })
+        let graphicIDs = Set(selections.compactMap { selection -> UUID? in
+            if case .graphic(let id) = selection { return id }
+            return nil
+        })
+        guard !traceIDs.isEmpty || !viaIDs.isEmpty
+                || !zoneIDs.isEmpty || !graphicIDs.isEmpty else {
+            setStatus("Select a track, via, fill or graphic to duplicate — footprints come from the schematic and can't be copied here.",
+                      warning: true)
+            return
+        }
+        let offset = FPPoint(x: gridMM, y: gridMM)
+        var copies: (traces: [BoardTrace], vias: [BoardVia],
+                     zones: [BoardZone], graphics: [BoardGraphicItem])?
+        mutateBoard { state in
+            copies = state.duplicatedItems(traceIDs: traceIDs,
+                                           viaIDs: viaIDs,
+                                           zoneIDs: zoneIDs,
+                                           graphicIDs: graphicIDs,
+                                           offset: offset)
+        }
+        guard let copies else { return }
+        var newSelection: Set<BoardSelection> = []
+        for trace in copies.traces { newSelection.insert(.trace(trace.id)) }
+        for via in copies.vias { newSelection.insert(.via(via.id)) }
+        for zone in copies.zones { newSelection.insert(.zone(zone.id)) }
+        for graphic in copies.graphics {
+            newSelection.insert(.graphic(graphic.id))
+        }
+        selections = newSelection
+        primarySelection = newSelection.first
+        let count = copies.traces.count + copies.vias.count
+            + copies.zones.count + copies.graphics.count
+        setStatus("\(count) item(s) duplicated, offset by one grid step — saved with the board.")
+    }
+
+    /// Lock/unlock one item (part 5.2): locked items refuse
+    /// delete, drag and flip until unlocked.
+    private func toggleLock(_ selection: BoardSelection) {
+        let locked: Bool
+        switch selection {
+        case .component(let reference):
+            locked = boardState.isLocked(reference: reference)
+            mutateBoard { state in
+                state.setLocked(reference: reference, !locked)
+            }
+        case .trace(let id):
+            locked = boardState.isLocked(id)
+            mutateBoard { state in state.setLocked(id, !locked) }
+        case .via(let id):
+            locked = boardState.isLocked(id)
+            mutateBoard { state in state.setLocked(id, !locked) }
+        case .zone(let id):
+            locked = boardState.isLocked(id)
+            mutateBoard { state in state.setLocked(id, !locked) }
+        case .graphic(let id):
+            locked = boardState.isLocked(id)
+            mutateBoard { state in state.setLocked(id, !locked) }
+        case .segment, .vertex:
+            return
+        }
+        setStatus(locked
+                  ? "Unlocked — it can be moved and deleted again."
+                  : "Locked — it can't be moved, flipped or deleted until you unlock it.")
+    }
+
+    private func lockRow(_ selection: BoardSelection) -> some View {
+        let locked: Bool = {
+            switch selection {
+            case .component(let reference):
+                return boardState.isLocked(reference: reference)
+            case .trace(let id), .via(let id), .zone(let id),
+                 .graphic(let id):
+                return boardState.isLocked(id)
+            case .segment, .vertex:
+                return false
+            }
+        }()
+        return Button {
+            toggleLock(selection)
+        } label: {
+            Label(locked ? "Unlock" : "Lock",
+                  systemImage: locked ? "lock.fill" : "lock.open")
+                .font(.callout.weight(.semibold))
+                .lineLimit(1)
+        }
+        .buttonStyle(.bordered)
+    }
+
+    /// Mass width edit (part 5.2): set every selected trace to
+    /// the typed width in ONE undo step.
+    private func applyWidthToSelectedTraces() {
+        guard let width = Double(widthDraft.trimmingCharacters(
+            in: .whitespaces)), width > 0 else {
+            setStatus("Type a width in mm first (for example 0.25), then Apply to All.",
+                      warning: true)
+            return
+        }
+        let ids = Set(selectedTraces.map(\.id))
+        guard ids.count > 1 else { return }
+        mutateBoard { state in
+            for index in state.traces.indices
+            where ids.contains(state.traces[index].id) {
+                state.traces[index].width = width
+            }
+        }
+        setStatus("\(ids.count) tracks set to \(PCBBoardMerger.formatMM(width)) mm wide — saved with the board.")
+    }
+
+    /// Mass layer edit (part 5.2): move every selected trace to
+    /// one copper layer in ONE undo step.
+    private func applyLayerToSelectedTraces(_ layer: String) {
+        let ids = Set(selectedTraces.map(\.id))
+        guard ids.count > 1 else { return }
+        mutateBoard { state in
+            for index in state.traces.indices
+            where ids.contains(state.traces[index].id) {
+                state.traces[index].layer = layer
+            }
+        }
+        setStatus("\(ids.count) tracks moved to \(layer) — saved with the board.")
+    }
+
     // MARK: - Routing (Route Tracks)
 
     private func handleRouteTap(model: BoardModel, point: FPPoint) {
@@ -3497,21 +4189,24 @@ struct PCBEditorView: View {
                 return
             }
         }
-        // All geometry (pad snap, grid snap, net refusal) is
-        // resolved by BoardGeometry.routeTap — the SAME resolution
-        // the hover preview renders (part 5.0.1), so the segment
-        // Sean sees while hovering is the segment the tap commits.
-        switch BoardGeometry.routeTap(model, point: point,
-                                      routingActive: routingActive,
-                                      routeNet: routeNet,
-                                      snapEnabled: snapEnabled,
-                                      gridMil: boardState.gridMil,
-                                      tolerance: tapToleranceMM) {
+        // Geometry (pad snap, grid snap, net refusal) resolves
+        // through the route head (part 5.2): while routing, the
+        // tap commits the SAME stateful resolution the hover
+        // preview renders — hysteresis included — so the segment
+        // Sean sees while hovering is the segment the tap
+        // commits; starting a route uses the pure resolution.
+        switch routeHead.tapResolution(
+            model, from: routePoints.last, point: point,
+            routingActive: routingActive, routeNet: routeNet,
+            snapEnabled: snapEnabled, gridMil: boardState.gridMil,
+            tolerance: tapToleranceMM) {
         case .needsPad:
             setStatus("Tap a pad to start the track.", warning: true)
         case .startPad(let target):
+            routeHead.reset()
             routeNet = target.netName
             routePoints = [target.center]
+            refreshRoutePreview()
             if let net = target.netName {
                 setStatus("Routing \(net) from \(target.reference) pad "
                           + "\(target.padNumber) on \(activeLayer) — tap "
@@ -3525,24 +4220,29 @@ struct PCBEditorView: View {
                       + "can't join a different net.", warning: true)
         case .finishAtPad(let target):
             if routeNet == nil { routeNet = target.netName }
-            appendRoutePoint(target.center)
+            appendRoutePoint(target.center,
+                              corner: routePreviewCache?.corner)
             finishRoute()
         case .appendPoint(let snapped):
-            appendRoutePoint(snapped)
+            appendRoutePoint(snapped, corner: routePreviewCache?.corner)
         }
     }
 
-    /// Append a point to the in-progress track, inserting the 45°
-    /// corner KiCad's router would make.
-    private func appendRoutePoint(_ point: FPPoint) {
+    /// Append a point to the in-progress track, inserting the
+    /// 45° corner. `corner` carries the preview's corner when
+    /// the caller resolved one through the head (part 5.2);
+    /// other callers get the pure routeCorner.
+    private func appendRoutePoint(_ point: FPPoint, corner: FPPoint? = nil) {
         guard let last = routePoints.last else {
             routePoints = [point]
+            refreshRoutePreview()
             return
         }
-        if let corner = BoardGeometry.routeCorner(from: last, to: point) {
+        if let corner = corner ?? BoardGeometry.routeCorner(from: last, to: point) {
             routePoints.append(corner)
         }
         if point != last { routePoints.append(point) }
+        refreshRoutePreview()
     }
 
     private func finishRoute() {
@@ -3727,7 +4427,10 @@ struct PCBEditorView: View {
         return false
     }
 
-    private func drawBoard(ctx: GraphicsContext, size: CGSize, model: BoardModel) {
+    /// The STATIC board layer's drawing (part 5.2): everything
+    /// except the pointer-driven previews, which live on their
+    /// own layer above (drawPreviews). Reads no pointer state.
+    private func drawStaticBoard(ctx: GraphicsContext, size: CGSize, model: BoardModel) {
         var ctx = ctx
         ctx.fill(Path(CGRect(origin: .zero, size: size)),
                  with: .color(Color(red: 0.043, green: 0.055, blue: 0.043)))
@@ -3764,8 +4467,28 @@ struct PCBEditorView: View {
            visibility.boardGraphicShown(graphic) {
             drawGraphicOverlay(&ctx, item: graphic)
         }
-        // In-progress previews.
-        drawPreviews(&ctx, model: model)
+        // Ratsnest (part 5.2): the unrouted connections, under
+        // the preview layer's work.
+        if visibility.showRatsnest { drawRatsnest(&ctx, model: model) }
+    }
+
+    /// Ratsnest lines (part 5.2): one thin line per MST link
+    /// between unconnected pad groups, computed by
+    /// BoardRatsnest alongside the checks. With a net
+    /// highlighted, only that net's lines draw.
+    private func drawRatsnest(_ ctx: inout GraphicsContext, model: BoardModel) {
+        guard !ratsnestSegments.isEmpty else { return }
+        var path = Path()
+        for segment in ratsnestSegments {
+            if let highlightedNet, segment.netName != highlightedNet {
+                continue
+            }
+            path.move(to: boardToScreen(segment.from))
+            path.addLine(to: boardToScreen(segment.to))
+        }
+        ctx.stroke(path, with: .color(Color(red: 0.55, green: 0.85, blue: 1.0)
+                                      .opacity(0.5)),
+                   style: StrokeStyle(lineWidth: 0.8))
     }
 
     private func drawGridDots(_ ctx: inout GraphicsContext, size: CGSize) {
@@ -4092,28 +4815,28 @@ struct PCBEditorView: View {
         }
     }
 
-    private func drawPreviews(_ ctx: inout GraphicsContext, model: BoardModel) {
-        // The pointer for previews comes from the ONE pointer
-        // stream (part 5.0.1): the touch point while a touch is
-        // down, else the Apple Pencil hover point.
-        let pointer = pointerState.currentPoint
+    /// The PREVIEW layer's drawing (part 5.2): everything the
+    /// pointer drives — the routing head, zone/draw previews,
+    /// the hover highlight, vertex handles, the measure readout.
+    /// The pointer arrives as a parameter from the canvas host
+    /// (the one pointer stream: the touch point while a touch
+    /// is down, else the Apple Pencil hover point).
+    private func drawPreviews(ctx: GraphicsContext, size: CGSize,
+                              model: BoardModel, pointer: BoardPointerState) {
+        var ctx = ctx
+        let pointerPoint = pointer.currentPoint
         // Routing: laid points + the 45° preview head to the
-        // pointer. The head is resolved by BoardGeometry.routePreview
-        // — KiCad's Move(aP, aEndItem): pad-anchored (the exact pad
-        // centre) when a pad is within tolerance, grid-snapped
-        // otherwise, and IDENTICAL to what a tap would commit
-        // (routeTap shares the resolution).
+        // pointer. The head comes from the CACHE the pointer
+        // events maintain (BoardRouteHead — the stateful,
+        // hysteresis-carrying resolution, part 5.2), and a tap
+        // commits through the same head, so the segment Sean
+        // sees while hovering is the segment the tap commits.
         if routingActive {
             var points = routePoints
-            var preview: BoardRoutePreview? = nil
-            if let pointer, let last = points.last {
-                let resolved = BoardGeometry.routePreview(
-                    model, from: last, pointer: pointer,
-                    routeNet: routeNet, snapEnabled: snapEnabled,
-                    gridMil: boardState.gridMil, tolerance: tapToleranceMM)
-                preview = resolved
-                if let corner = resolved.corner { points.append(corner) }
-                points.append(resolved.endPoint)
+            let preview = routePreviewCache
+            if let preview {
+                if let corner = preview.corner { points.append(corner) }
+                points.append(preview.endPoint)
             }
             var path = Path()
             for (index, point) in points.enumerated() {
@@ -4141,7 +4864,7 @@ struct PCBEditorView: View {
         // Zone drawing: vertices so far + preview edge.
         if zoneActive {
             var points = zonePoints
-            if let pointer { points.append(snapPoint(pointer)) }
+            if let pointerPoint { points.append(snapPoint(pointerPoint)) }
             var path = Path()
             for (index, point) in points.enumerated() {
                 let screen = boardToScreen(point)
@@ -4158,8 +4881,8 @@ struct PCBEditorView: View {
             }
         }
         // Draw tools: the shape so far, to the pointer.
-        if !pendingPoints.isEmpty, let pointer {
-            let cursor = snapPoint(pointer)
+        if !pendingPoints.isEmpty, let pointerPoint {
+            let cursor = snapPoint(pointerPoint)
             var path = Path()
             switch activeTool {
             case .drawLine:
@@ -4193,17 +4916,24 @@ struct PCBEditorView: View {
         // (no touch down) and no track is in progress, the pad or
         // trace under the pencil lights up — KiCad's hover
         // feedback, so Sean can see what a tap would act on.
-        if !routingActive, !pointerState.touchActive, let pointer,
-           let hover = BoardGeometry.hoverTarget(
-               model, point: pointer, tolerance: tapToleranceMM) {
+        if !routingActive, !pointer.touchActive, let pointerPoint,
+           let hover = spatialIndex?.hoverTarget(
+               model, point: pointerPoint, tolerance: tapToleranceMM)
+               ?? BoardGeometry.hoverTarget(
+                   model, point: pointerPoint, tolerance: tapToleranceMM) {
             switch hover {
             case .pad(let target):
                 drawPadHoverRing(&ctx, target: target, refused: false)
             case .trace(let id):
                 if activeTool == .select,
-                   let segment = BoardGeometry.segmentAt(
-                       model.traces.filter { visibility.traceShown($0) },
-                       point: pointer, tolerance: tapToleranceMM),
+                   let segment = spatialIndex?.segmentAt(
+                       model, point: pointerPoint, tolerance: tapToleranceMM,
+                       allowedTraceIDs: Set(model.traces
+                           .filter { visibility.traceShown($0) }
+                           .map(\.id)))
+                       ?? BoardGeometry.segmentAt(
+                           model.traces.filter { visibility.traceShown($0) },
+                           point: pointerPoint, tolerance: tapToleranceMM),
                    segment.trace.id == id {
                     // Segment hover (part 5.1): in the Select
                     // tool the segment is the unit of work, so
@@ -4254,6 +4984,35 @@ struct PCBEditorView: View {
                 ctx.stroke(Path(ellipseIn: rect),
                            with: .color(.black.opacity(0.65)),
                            style: StrokeStyle(lineWidth: 1))
+            }
+        }
+        // Measure tool (part 5.2): the two tapped points, their
+        // line, and the distance/delta label.
+        if let a = measure.a {
+            var path = Path()
+            let screenA = boardToScreen(a)
+            path.addEllipse(in: CGRect(x: screenA.x - 4, y: screenA.y - 4,
+                                       width: 8, height: 8))
+            if let b = measure.b {
+                let screenB = boardToScreen(b)
+                path.move(to: screenA)
+                path.addLine(to: screenB)
+                path.addEllipse(in: CGRect(x: screenB.x - 4,
+                                           y: screenB.y - 4,
+                                           width: 8, height: 8))
+            }
+            ctx.stroke(path, with: .color(.yellow),
+                       style: StrokeStyle(lineWidth: 1.4))
+            if let distance = measure.distance, let delta = measure.delta,
+               let b = measure.b {
+                let mid = boardToScreen(FPPoint(x: (a.x + b.x) / 2,
+                                                y: (a.y + b.y) / 2))
+                let text = Text("\(fmt(distance)) mm"
+                                + "  (Δx \(fmt(delta.x)), Δy \(fmt(delta.y)))")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundColor(.yellow)
+                ctx.draw(text, at: CGPoint(x: mid.x, y: mid.y - 14),
+                         anchor: .center)
             }
         }
     }

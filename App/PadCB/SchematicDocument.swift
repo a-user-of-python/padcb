@@ -19,7 +19,7 @@ struct DPoint: Codable, Equatable, Hashable {
     }
 }
 
-struct PlacedSymbol: Identifiable, Codable {
+struct PlacedSymbol: Identifiable, Codable, Equatable {
     var id: UUID
     var library: String
     var symbolName: String
@@ -40,6 +40,15 @@ struct PlacedSymbol: Identifiable, Codable {
     /// so schematic JSON written before part 3 (no such key) still
     /// loads, and existing PlacedSymbol constructions are unchanged.
     var footprintChoice: String? = nil
+    /// De Morgan body style (part 5.2): 2 = the alternate body,
+    /// anything else (or nil) = the standard body. Optional with
+    /// a nil default for the same decode-compatibility reason as
+    /// footprintChoice: schematic JSON written before part 5.2
+    /// has no such key and must still load (as style 1).
+    var bodyStyle: Int? = nil
+
+    /// The body style in effect (nil reads as the standard body).
+    var effectiveBodyStyle: Int { bodyStyle == 2 ? 2 : 1 }
 
     var origin: DPoint { DPoint(x: x, y: y) }
 }
@@ -202,6 +211,22 @@ final class SchematicDocument: ObservableObject {
         if let unit { state.symbols[idx].unit = unit }
     }
 
+    /// Applies an arbitrary edit to one placed symbol as ONE
+    /// undo step (part 5.2). This is the properties card's write
+    /// path: before part 5.2 the card wrote straight into `state`
+    /// with NO history entry at all (the recorded part-1 gap —
+    /// typing in the card could not be undone). A change that
+    /// alters nothing records nothing.
+    func editSymbol(id: UUID, _ change: (inout PlacedSymbol) -> Void) {
+        guard let idx = state.symbols.firstIndex(where: { $0.id == id })
+        else { return }
+        var edited = state.symbols[idx]
+        change(&edited)
+        guard edited != state.symbols[idx] else { return }
+        pushHistory()
+        state.symbols[idx] = edited
+    }
+
     // MARK: Wires / junctions / labels
 
     func addWire(_ w: WireItem) {
@@ -255,6 +280,108 @@ final class SchematicDocument: ObservableObject {
             if n > maxN { maxN = n }
         }
         return prefix + String(maxN + 1)
+    }
+
+    /// The reference prefix: leading characters up to the first
+    /// digit or "?" ("R12" → "R", "R?" → "R", "#PWR" → "#PWR").
+    static func referencePrefix(of reference: String) -> String {
+        var prefix = ""
+        for ch in reference {
+            if ch.isNumber || ch == "?" { break }
+            prefix.append(ch)
+        }
+        return prefix
+    }
+
+    /// A reference is annotated when it carries a numeric suffix
+    /// and no "?" ("R12" yes; "R?", "R", "R1?" no).
+    static func isAnnotated(_ reference: String) -> Bool {
+        guard !reference.contains("?") else { return false }
+        let prefix = referencePrefix(of: reference)
+        let suffix = reference.dropFirst(prefix.count)
+        return !suffix.isEmpty && suffix.allSatisfy { $0.isNumber }
+    }
+
+    /// Automatic annotation (part 5.2; KiCad's Annotate
+    /// Schematic): every logical part ends with a unique
+    /// annotated reference, as ONE undo step. A logical part =
+    /// placed instances sharing (library, symbol, reference)
+    /// whose units differ (the units of one multi-unit part);
+    /// instances are considered in sheet order (top-to-bottom,
+    /// then left-to-right, in y-up document coordinates).
+    /// Parts already validly annotated KEEP their numbers —
+    /// unless a later part duplicates an earlier part's
+    /// reference+unit, in which case the later part is
+    /// reassigned. Unannotated and duplicate parts receive the
+    /// first free number ≥ 1 for their prefix, in sheet order.
+    /// Returns how many parts were (re)assigned.
+    @discardableResult
+    func annotateReferences() -> Int {
+        // Sheet order.
+        let ordered = state.symbols.sorted {
+            if $0.y != $1.y { return $0.y > $1.y }
+            if $0.x != $1.x { return $0.x < $1.x }
+            return $0.unit < $1.unit
+        }
+        // Group into logical parts.
+        struct Part {
+            var key: String          // library \u{1} symbol \u{1} reference
+            var reference: String
+            var units: Set<Int> = []
+            var instanceIDs: [UUID] = []
+        }
+        var parts: [Part] = []
+        for symbol in ordered where !symbol.isPowerSymbol {
+            let key = "\(symbol.library)\u{1}\(symbol.symbolName)\u{1}\(symbol.reference)"
+            if let idx = parts.firstIndex(where: {
+                $0.key == key && !$0.units.contains(symbol.unit)
+            }) {
+                parts[idx].units.insert(symbol.unit)
+                parts[idx].instanceIDs.append(symbol.id)
+            } else {
+                parts.append(Part(key: key, reference: symbol.reference,
+                                  units: [symbol.unit],
+                                  instanceIDs: [symbol.id]))
+            }
+        }
+        // Pass 1: keep valid parts, claim their reference+units.
+        var claimedUnits: [String: Set<Int>] = [:]   // reference -> units
+        var usedNumbers: [String: Set<Int>] = [:]    // prefix -> numbers
+        var needsAssignment: [Int] = []               // part indices
+        for (index, part) in parts.enumerated() {
+            let reference = part.reference
+            let claimed = claimedUnits[reference] ?? []
+            let duplicates = !claimed.isDisjoint(with: part.units)
+            if Self.isAnnotated(reference) && !duplicates {
+                claimedUnits[reference, default: []].formUnion(part.units)
+                let prefix = Self.referencePrefix(of: reference)
+                let number = Int(reference.dropFirst(prefix.count)) ?? 0
+                usedNumbers[prefix, default: []].insert(number)
+            } else {
+                needsAssignment.append(index)
+            }
+        }
+        // Pass 2: assign first-free numbers in sheet order.
+        var assignments: [UUID: String] = [:]
+        for index in needsAssignment {
+            let part = parts[index]
+            let prefix = Self.referencePrefix(of: part.reference)
+            let effectivePrefix = prefix.isEmpty ? "U" : prefix
+            var n = 1
+            while usedNumbers[effectivePrefix, default: []].contains(n) { n += 1 }
+            usedNumbers[effectivePrefix, default: []].insert(n)
+            let newReference = effectivePrefix + String(n)
+            claimedUnits[newReference, default: []].formUnion(part.units)
+            for id in part.instanceIDs { assignments[id] = newReference }
+        }
+        guard !assignments.isEmpty else { return 0 }
+        pushHistory()
+        for idx in state.symbols.indices {
+            if let newReference = assignments[state.symbols[idx].id] {
+                state.symbols[idx].reference = newReference
+            }
+        }
+        return needsAssignment.count
     }
 
     // MARK: Persistence (JSON of SchematicState)

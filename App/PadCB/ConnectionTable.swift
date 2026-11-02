@@ -358,9 +358,9 @@ enum ConnectionTableBuilder {
         distanceFromPointToSegment(p, a, b) <= tolerance
     }
 
-    private static func distanceFromPointToSegment(_ p: DPoint,
-                                                   _ a: DPoint,
-                                                   _ b: DPoint) -> Double {
+    static func distanceFromPointToSegment(_ p: DPoint,
+                                           _ a: DPoint,
+                                           _ b: DPoint) -> Double {
         let ab = b - a
         let lengthSquared = ab.x * ab.x + ab.y * ab.y
         if lengthSquared < 1e-12 { return p.distance(to: a) }
@@ -428,5 +428,230 @@ private struct UnionFind {
             parent[rb] = ra
             rank[ra] += 1
         }
+    }
+}
+
+// MARK: - Electrical rules check (part 5.2)
+
+/// One ERC finding (KiCad's eeschema ERC, PadCB's rule set).
+/// `instanceID` identifies the placed symbol a finding belongs
+/// to where one exists, so the editor can select it.
+struct ERCFinding: Equatable {
+    enum Severity: Equatable {
+        case error, warning
+    }
+    enum Kind: Equatable {
+        case pinNotConnected
+        case powerPinNotDriven
+        case outputConflict
+        case duplicateReference
+        case unannotated
+        case unresolvedSymbol
+        case labelNotConnected
+    }
+    var severity: Severity
+    var kind: Kind
+    var message: String
+    var instanceID: UUID?
+}
+
+/// PadCB's electrical rules check. The net facts come from the
+/// REAL connection-table derivation (ConnectionTableBuilder —
+/// the same nets the PCB editor consumes), plus a census of
+/// every placed pin: a pin the table does not carry sits on a
+/// net of fewer than 2 endpoints, which is precisely KiCad's
+/// "pin not connected". Rules (eeschema/erc.cpp semantics,
+/// restricted to what PadCB's model can know — no buses, no
+/// hierarchical sheets exist here):
+/// - pin not connected (error): a pin (not of type no_connect)
+///   on no 2+-endpoint net.
+/// - power pin not driven (error): a net carrying a power_in
+///   pin of an ordinary symbol but driven by nothing — no
+///   power_out pin and no power symbol. (PadCB has no separate
+///   PWR_FLAG: a power symbol on the net IS the driver, as in
+///   KiCad where a power port drives its net.)
+/// - output conflict (error): a net with 2+ driving pins
+///   (output or power_out of ordinary symbols).
+/// - duplicate reference (error): two placed instances sharing
+///   reference AND unit (the same reference across DIFFERENT
+///   units is one legal multi-unit part).
+/// - unannotated (warning): a reference with no numeric suffix
+///   or a "?" — the Annotate tool fixes these.
+/// - unresolved symbol (error): a placed symbol whose library
+///   definition no longer resolves (from the table build).
+/// - label not connected (warning): a label touching no wire
+///   segment and no pin.
+enum SchematicERC {
+    static func check(state: SchematicState,
+                      resolveSymbol: (PlacedSymbol) -> KiCadSymbolDef?)
+        -> [ERCFinding] {
+        let table = ConnectionTableBuilder.build(
+            state: state, sourceFileName: "",
+            resolveSymbol: resolveSymbol,
+            resolveFootprint: { _, _ in (nil, nil) })
+
+        var findings: [ERCFinding] = []
+
+        // Endpoint census from the table: (instance, pin number).
+        var tabledPins = Set<String>()
+        for net in table.nets {
+            for endpoint in net.endpoints {
+                tabledPins.insert("\(endpoint.instanceID.uuidString)|\(endpoint.pinNumber)")
+            }
+        }
+        let placedByID: [UUID: PlacedSymbol] = Dictionary(
+            uniqueKeysWithValues: state.symbols.map { ($0.id, $0) })
+        func isPowerInstance(_ instanceID: UUID) -> Bool {
+            guard let placed = placedByID[instanceID],
+                  let def = resolveSymbol(placed) else { return false }
+            return def.isPower
+        }
+
+        // -- Pin not connected --
+        var notConnected: [ERCFinding] = []
+        for placed in state.symbols {
+            guard let def = resolveSymbol(placed) else { continue }
+            // Power symbols are their own global net (KiCad
+            // semantics) — never "not connected".
+            if def.isPower { continue }
+            var seenNumbers = Set<String>()
+            for entry in SymbolDrawList.pinWorldPoints(def: def, placed: placed) {
+                let pin = entry.pin
+                if pin.type == .noConnect { continue }
+                // Duplicate pin numbers on one instance are
+                // jumpers (one electrical pin): census once.
+                guard seenNumbers.insert(pin.number).inserted else { continue }
+                let key = "\(placed.id.uuidString)|\(pin.number)"
+                if !tabledPins.contains(key) {
+                    let name = KiCadText.plain(pin.name)
+                    notConnected.append(ERCFinding(
+                        severity: .error, kind: .pinNotConnected,
+                        message: "\(placed.reference) pin \(pin.number)"
+                            + (name.isEmpty ? "" : " (\(name))")
+                            + " is not connected",
+                        instanceID: placed.id))
+                }
+            }
+        }
+        findings += notConnected.sorted { $0.message < $1.message }
+
+        // -- Power not driven + output conflicts (per table net) --
+        var powerFindings: [ERCFinding] = []
+        var outputFindings: [ERCFinding] = []
+        for net in table.nets {
+            var powerInPins: [ConnectionEndpoint] = []
+            var drivers: [ConnectionEndpoint] = []
+            var hasPowerSymbol = false
+            for endpoint in net.endpoints {
+                if isPowerInstance(endpoint.instanceID) {
+                    hasPowerSymbol = true
+                    continue
+                }
+                if endpoint.pinType == KiCadPinType.powerIn.rawValue {
+                    powerInPins.append(endpoint)
+                }
+                if endpoint.pinType == KiCadPinType.powerOut.rawValue
+                    || endpoint.pinType == KiCadPinType.output.rawValue {
+                    drivers.append(endpoint)
+                }
+            }
+            if !powerInPins.isEmpty && drivers.isEmpty && !hasPowerSymbol {
+                let names = powerInPins
+                    .map { "\($0.reference) pin \($0.pinNumber)" }
+                    .joined(separator: ", ")
+                powerFindings.append(ERCFinding(
+                    severity: .error, kind: .powerPinNotDriven,
+                    message: "Net \(net.name): power pin(s) \(names) "
+                        + "are not driven by any output or power symbol",
+                    instanceID: powerInPins.first?.instanceID))
+            }
+            let driving = drivers
+            if driving.count > 1 {
+                let names = driving
+                    .map { "\($0.reference) pin \($0.pinNumber)" }
+                    .joined(separator: ", ")
+                outputFindings.append(ERCFinding(
+                    severity: .error, kind: .outputConflict,
+                    message: "Net \(net.name): outputs \(names) "
+                        + "are wired together",
+                    instanceID: driving.first?.instanceID))
+            }
+        }
+        findings += powerFindings.sorted { $0.message < $1.message }
+        findings += outputFindings.sorted { $0.message < $1.message }
+
+        // -- Duplicate reference + unit --
+        var byRefUnit: [String: [PlacedSymbol]] = [:]
+        for placed in state.symbols where !placed.isPowerSymbol {
+            byRefUnit["\(placed.reference)\u{1}\(placed.unit)", default: []]
+                .append(placed)
+        }
+        var duplicates: [ERCFinding] = []
+        for group in byRefUnit.values where group.count > 1 {
+            duplicates.append(ERCFinding(
+                severity: .error, kind: .duplicateReference,
+                message: "\(group[0].reference) unit \(group[0].unit) is placed "
+                    + "\(group.count) times — references must be unique per unit",
+                instanceID: group[0].id))
+        }
+        findings += duplicates.sorted { $0.message < $1.message }
+
+        // -- Unannotated --
+        var unannotated: [ERCFinding] = []
+        var seenParts = Set<String>()
+        for placed in state.symbols
+        where !placed.isPowerSymbol
+            && !SchematicDocument.isAnnotated(placed.reference) {
+            let partKey = "\(placed.library)\u{1}\(placed.symbolName)\u{1}\(placed.reference)"
+            guard seenParts.insert(partKey).inserted else { continue }
+            unannotated.append(ERCFinding(
+                severity: .warning, kind: .unannotated,
+                message: "\(placed.reference) (\(placed.symbolName)) "
+                    + "is not annotated — run Annotate",
+                instanceID: placed.id))
+        }
+        findings += unannotated.sorted { $0.message < $1.message }
+
+        // -- Unresolved symbols (from the table build) --
+        for line in table.unresolvedSymbols {
+            findings.append(ERCFinding(
+                severity: .error, kind: .unresolvedSymbol,
+                message: "Symbol \(line) could not be loaded from its library",
+                instanceID: nil))
+        }
+
+        // -- Labels touching nothing --
+        var pinPoints: [DPoint] = []
+        for placed in state.symbols {
+            guard let def = resolveSymbol(placed) else { continue }
+            for entry in SymbolDrawList.pinWorldPoints(def: def, placed: placed) {
+                pinPoints.append(entry.point)
+            }
+        }
+        var labelFindings: [ERCFinding] = []
+        for label in state.labels {
+            let onWire = state.wires.contains { wire in
+                guard wire.points.count >= 2 else { return false }
+                for i in 0..<(wire.points.count - 1)
+                where ConnectionTableBuilder.distanceFromPointToSegment(
+                    label.at, wire.points[i], wire.points[i + 1])
+                    <= ConnectionTableBuilder.tolerance {
+                    return true
+                }
+                return false
+            }
+            let onPin = pinPoints.contains {
+                $0.distance(to: label.at) <= ConnectionTableBuilder.tolerance
+            }
+            if !onWire && !onPin {
+                labelFindings.append(ERCFinding(
+                    severity: .warning, kind: .labelNotConnected,
+                    message: "Label \"\(label.text)\" is not on any wire or pin",
+                    instanceID: nil))
+            }
+        }
+        findings += labelFindings.sorted { $0.message < $1.message }
+
+        return findings
     }
 }

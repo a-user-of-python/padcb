@@ -73,9 +73,25 @@ struct KiCadSymbolDef {
     /// Merged properties (child wins by name); order = child's first.
     var properties: [KiCadProperty]
     /// Key = unit number (0 = common to all units). Each unit merges its
-    /// body-style-0 (common to all body styles) and style-1 sub-symbols;
-    /// style 2 (De Morgan) is not merged.
+    /// body-style-0 (common to all body styles) and style-1 sub-symbols.
     var units: [Int: KiCadUnitDef]
+    /// The De Morgan alternate bodies (part 5.2): each unit merges its
+    /// body-style-0 and style-2 sub-symbols, exactly as `units` merges
+    /// style 0 + style 1. A unit with no style-2 sub-symbol has no
+    /// entry and falls back to its style-1 body.
+    var altUnits: [Int: KiCadUnitDef] = [:]
+    /// True when the symbol defines any style-2 (De Morgan) body.
+    var hasAlternateBody: Bool = false
+
+    /// The unit definition to draw/connect for a placed instance:
+    /// the alternate (De Morgan) body when the instance chose
+    /// style 2 and this unit has one, else the standard body.
+    func unitDef(unit: Int, bodyStyle: Int) -> KiCadUnitDef? {
+        if bodyStyle == 2 && hasAlternateBody, let alt = altUnits[unit] {
+            return alt
+        }
+        return units[unit]
+    }
     /// Max unit key excluding 0; 1 when there are no numbered units.
     var unitCount: Int
     var extendsName: String?
@@ -236,12 +252,15 @@ struct KiCadLibrary {
             // parent cannot be resolved (missing/cycle), fall back to
             // the symbol's own units/settings rather than dropping it.
             let units = parent?.units ?? raw.units
+            let altUnits = parent?.altUnits ?? raw.altUnits
 
             let def = KiCadSymbolDef(
                 name: symbolName,
                 library: name,
                 properties: properties,
                 units: units,
+                altUnits: altUnits,
+                hasAlternateBody: parent?.hasAlternateBody ?? raw.hasAltBody,
                 unitCount: units.keys.filter { $0 > 0 }.max() ?? 1,
                 extendsName: raw.extendsName,
                 pinNameOffset: parent?.pinNameOffset ?? raw.pinNameOffset ?? 0.508,
@@ -270,6 +289,9 @@ private struct RawSymbol {
     var extendsName: String?
     var properties: [KiCadProperty] = []
     var units: [Int: KiCadUnitDef] = [:]
+    /// Style-2 (De Morgan) merge, mirroring `units` (part 5.2).
+    var altUnits: [Int: KiCadUnitDef] = [:]
+    var hasAltBody = false
     var pinNameOffset: Double?
     /// Non-nil when a (pin_names ...) node is present (its hide state,
     /// false when the node carries no (hide yes)).
@@ -336,8 +358,10 @@ private func parseSubSymbol(_ node: SExpr, into raw: inout RawSymbol) {
     // of multi-unit logic parts live there (e.g. 4538's pins are in
     // 4538_<unit>_0 while its rectangles are in _<unit>_1) — dropping
     // style 0 rendered 1,288 symbols pinless (part 1.2 census). Style 2
-    // (De Morgan alternate body) is still not used in part 1.
-    guard style == 0 || style == 1 else { return }
+    // (De Morgan) merges into the ALTERNATE body set (part 5.2):
+    // style 0 feeds BOTH body sets, style 1 the standard set,
+    // style 2 the alternate set.
+    guard style == 0 || style == 1 || style == 2 else { return }
     var unitDef = KiCadUnitDef()
     for item in node.items {
         guard case .list(let children) = item,
@@ -350,13 +374,18 @@ private func parseSubSymbol(_ node: SExpr, into raw: inout RawSymbol) {
             unitDef.graphics.append(graphic)
         }
     }
-    if var existing = raw.units[unit] {
-        existing.graphics += unitDef.graphics
-        existing.pins += unitDef.pins
-        raw.units[unit] = existing
-    } else {
-        raw.units[unit] = unitDef
+    func merge(_ unitDef: KiCadUnitDef, into table: inout [Int: KiCadUnitDef]) {
+        if var existing = table[unit] {
+            existing.graphics += unitDef.graphics
+            existing.pins += unitDef.pins
+            table[unit] = existing
+        } else {
+            table[unit] = unitDef
+        }
     }
+    if style == 0 || style == 1 { merge(unitDef, into: &raw.units) }
+    if style == 0 || style == 2 { merge(unitDef, into: &raw.altUnits) }
+    if style == 2 { raw.hasAltBody = true }
 }
 
 // MARK: - Properties

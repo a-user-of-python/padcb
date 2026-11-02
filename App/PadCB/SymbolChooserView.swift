@@ -18,6 +18,10 @@ struct SymbolChooserView: View {
     @State private var searchText = ""
     @State private var libraryFilter: String? = nil   // nil == All libraries
     @State private var selectedEntry: SymbolIndexEntry? = nil
+    /// The unit the preview pane draws (part 5.2 — the preview
+    /// used to be pinned to unit 1): reset to 1 on every new
+    /// selection; the pane offers a stepper for multi-unit parts.
+    @State private var previewUnit = 1
     @State private var def: KiCadSymbolDef? = nil
 
     // Part 3: search and grouping are STATE, computed by the tasks
@@ -375,6 +379,7 @@ struct SymbolChooserView: View {
         let isSelected = selectedEntry?.id == entry.id
         return Button {
             selectedEntry = entry
+            previewUnit = 1
         } label: {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
@@ -419,6 +424,32 @@ struct SymbolChooserView: View {
                         RoundedRectangle(cornerRadius: 10)
                             .strokeBorder(Color.white.opacity(0.15), lineWidth: 1)
                     )
+                if def.unitCount > 1 {
+                    HStack(spacing: 10) {
+                        Text("Preview unit")
+                            .font(.callout.weight(.semibold))
+                            .foregroundStyle(.white.opacity(0.85))
+                            .lineLimit(1)
+                        Spacer(minLength: 0)
+                        Button {
+                            previewUnit = max(1, previewUnit - 1)
+                        } label: {
+                            Image(systemName: "chevron.left").lineLimit(1)
+                        }
+                        .disabled(previewUnit <= 1)
+                        Text("\(previewUnit) of \(def.unitCount)")
+                            .font(.callout)
+                            .lineLimit(1)
+                            .fixedSize(horizontal: true, vertical: false)
+                        Button {
+                            previewUnit = min(def.unitCount, previewUnit + 1)
+                        } label: {
+                            Image(systemName: "chevron.right").lineLimit(1)
+                        }
+                        .disabled(previewUnit >= def.unitCount)
+                    }
+                    .buttonStyle(.bordered)
+                }
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
@@ -444,7 +475,7 @@ struct SymbolChooserView: View {
                                 .font(.callout.weight(.medium))
                             }
                         }
-                        metadataRow("Pins", "\(pinCount(of: def))")
+                        metadataRow("Pins", "\(pinCount(of: def, unit: previewUnit))")
                         metadataRow("Units", "\(def.unitCount) unit\(def.unitCount == 1 ? "" : "s")")
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -477,11 +508,12 @@ struct SymbolChooserView: View {
         .padding(16)
     }
 
-    /// Renders the selected definition (unit 1) fitted into the pane.
+    /// Renders the selected definition (the previewed unit,
+    /// part 5.2) fitted into the pane.
     /// Symbol-local coordinates are y-up; the canvas is y-down, so the map
     /// flips y around the fitted bounds.
     private func previewCanvas(def: KiCadSymbolDef) -> some View {
-        let bounds = SymbolRenderer.graphicsBounds(def: def, unit: 1)
+        let bounds = SymbolRenderer.graphicsBounds(def: def, unit: previewUnit)
         return Group {
             if bounds.width <= 0 || bounds.height <= 0 {
                 Text("No preview")
@@ -505,7 +537,7 @@ struct SymbolChooserView: View {
                             y: originY + drawnH - (local.y - bounds.minY) * scale
                         )
                     }
-                    SymbolRenderer.draw(def: def, unit: 1, in: ctx, map: map,
+                    SymbolRenderer.draw(def: def, unit: previewUnit, in: ctx, map: map,
                                         scale: scale, showPinNumbers: true, showPinNames: true)
                 }
             }
@@ -610,8 +642,10 @@ struct SymbolChooserView: View {
 
     /// Pins visible for a placed unit-1 instance: common (unit 0) pins plus
     /// unit 1's own pins.
-    private func pinCount(of def: KiCadSymbolDef) -> Int {
-        (def.units[0]?.pins.count ?? 0) + (def.units[1]?.pins.count ?? 0)
+    /// Pins of one unit plus the shared (unit 0) pins — the
+    /// count for the unit being previewed (part 5.2).
+    private func pinCount(of def: KiCadSymbolDef, unit: Int) -> Int {
+        (def.units[0]?.pins.count ?? 0) + (def.units[unit]?.pins.count ?? 0)
     }
 
     private func datasheetURL(from def: KiCadSymbolDef) -> URL? {

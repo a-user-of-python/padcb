@@ -29,6 +29,10 @@ struct FileListView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var files: [FileEntry] = []
     @State private var nameField: String = ""
+    // Rename (part 5.2): long-press a file to rename it in place.
+    @State private var renameTarget: FileEntry? = nil
+    @State private var renameDraft = ""
+    @State private var renameError: String? = nil
 
     init(mode: Mode, initialName: String, onDone: @escaping (URL) -> Void) {
         self.mode = mode
@@ -87,6 +91,30 @@ struct FileListView: View {
         files.remove(atOffsets: offsets)
     }
 
+    /// Rename one file (part 5.2): the new name is sanitized
+    /// like a save name; an existing file with that name is
+    /// never overwritten — the rename is refused with a message.
+    private func commitRename() {
+        guard let target = renameTarget else { return }
+        let newName = FileListView.sanitizedName(renameDraft)
+        renameTarget = nil
+        guard !newName.isEmpty, newName != target.name else { return }
+        let destination = FileListView.padcbDirectory
+            .appendingPathComponent(newName)
+            .appendingPathExtension("json")
+        let fm = FileManager.default
+        if fm.fileExists(atPath: destination.path) {
+            renameError = "A schematic named \u{201C}\(newName)\u{201D} already exists — pick a different name."
+            return
+        }
+        do {
+            try fm.moveItem(at: target.url, to: destination)
+            reloadFiles()
+        } catch {
+            renameError = "Could not rename that file: \(error.localizedDescription)"
+        }
+    }
+
     private func finish(with url: URL) {
         onDone(url)
         dismiss()
@@ -128,6 +156,22 @@ struct FileListView: View {
                 }
             }
             .onAppear { reloadFiles() }
+            .alert("Rename Schematic",
+                   isPresented: Binding(get: { renameTarget != nil },
+                                        set: { if !$0 { renameTarget = nil } })) {
+                TextField("Name", text: $renameDraft)
+                Button("Cancel", role: .cancel) { renameTarget = nil }
+                Button("Rename") { commitRename() }
+            } message: {
+                Text("Give the file a new name (the .json extension is kept).")
+            }
+            .alert("Rename Failed",
+                   isPresented: Binding(get: { renameError != nil },
+                                        set: { if !$0 { renameError = nil } })) {
+                Button("OK") { renameError = nil }
+            } message: {
+                Text(renameError ?? "")
+            }
         }
         .preferredColorScheme(.dark)
     }
@@ -208,6 +252,14 @@ struct FileListView: View {
                         .contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
+                    .contextMenu {
+                        Button {
+                            renameDraft = entry.name
+                            renameTarget = entry
+                        } label: {
+                            Label("Rename", systemImage: "pencil")
+                        }
+                    }
                 }
                 .onDelete(perform: deleteFiles)
             }

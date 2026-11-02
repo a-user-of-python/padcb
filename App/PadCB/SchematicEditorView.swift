@@ -42,6 +42,12 @@ struct SchematicEditorView: View {
 
     @State private var titleDraft = ""
     @State private var errorMessage: String? = nil
+    // Part 5.2: New-document confirmation, ERC sheet, and a
+    // one-line info alert for Annotate/ERC outcomes.
+    @State private var showNewConfirm = false
+    @State private var showERC = false
+    @State private var ercFindings: [ERCFinding] = []
+    @State private var infoMessage: String? = nil
 
     // MARK: - Derived state
 
@@ -145,6 +151,83 @@ struct SchematicEditorView: View {
         } message: {
             Text(errorMessage ?? "")
         }
+        .alert("Start a New Schematic?",
+               isPresented: $showNewConfirm) {
+            Button("Cancel", role: .cancel) { }
+            Button("New Schematic", role: .destructive) {
+                startNewDocument()
+            }
+        } message: {
+            Text("The current schematic is replaced by an empty one. Anything not saved is lost.")
+        }
+        .alert("PadCB",
+               isPresented: Binding(get: { infoMessage != nil },
+                                    set: { if !$0 { infoMessage = nil } })) {
+            Button("OK") { infoMessage = nil }
+        } message: {
+            Text(infoMessage ?? "")
+        }
+        .sheet(isPresented: $showERC) {
+            ercSheet
+        }
+    }
+
+    /// New document (part 5.2 — closes the recorded part-1
+    /// gap): replace the state with an empty "Untitled"
+    /// schematic. Like Open, this clears the undo history.
+    private func startNewDocument() {
+        document.replaceState(SchematicState(
+            symbols: [], wires: [], junctions: [], labels: [],
+            title: "Untitled"))
+        selection = nil
+        pendingSymbol = nil
+    }
+
+    /// The ERC results sheet (part 5.2): every finding with its
+    /// severity; tapping a finding that names a symbol selects
+    /// it on the canvas.
+    private var ercSheet: some View {
+        NavigationStack {
+            List {
+                if ercFindings.isEmpty {
+                    Text("No electrical problems found — every pin is connected or marked no-connect, power inputs are driven, and references are annotated and unique.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(Array(ercFindings.enumerated()), id: \.offset) { _, finding in
+                    Button {
+                        if let id = finding.instanceID {
+                            selection = id
+                            showERC = false
+                        }
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: finding.severity == .error
+                                  ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                                .foregroundStyle(finding.severity == .error
+                                                 ? .red : .orange)
+                                .lineLimit(1)
+                            Text(finding.message)
+                                .font(.callout)
+                                .foregroundStyle(.primary)
+                                .multilineTextAlignment(.leading)
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(finding.instanceID == nil)
+                }
+            }
+            .navigationTitle("Electrical Rules Check")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showERC = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 
     // MARK: - Saving (schematic + encrypted connection table)
@@ -194,8 +277,35 @@ struct SchematicEditorView: View {
         HStack(spacing: 10) {
             topButton(icon: "folder", label: "Open") { showOpen = true }
                 .keyboardShortcut("o", modifiers: .command)
+            topButton(icon: "doc.badge.plus", label: "New") {
+                if document.state.symbols.isEmpty
+                    && document.state.wires.isEmpty
+                    && document.state.labels.isEmpty {
+                    startNewDocument()
+                } else {
+                    showNewConfirm = true
+                }
+            }
             topButton(icon: "square.and.arrow.down", label: "Save") { showSave = true }
                 .keyboardShortcut("s", modifiers: .command)
+
+            barDivider
+
+            topButton(icon: "list.number", label: "Annotate") {
+                let changed = document.annotateReferences()
+                infoMessage = changed == 0
+                    ? "Every reference was already annotated — nothing changed."
+                    : "Annotated \(changed) reference(s). Undo puts the old references back."
+            }
+            topButton(icon: "checklist", label: "ERC") {
+                ercFindings = SchematicERC.check(
+                    state: document.state,
+                    resolveSymbol: { placed in
+                        store.symbol(library: placed.library,
+                                     name: placed.symbolName)
+                    })
+                showERC = true
+            }
 
             barDivider
 
@@ -511,6 +621,16 @@ private struct SymbolPropertiesCard: View {
         )
     }
 
+    /// De Morgan body style (part 5.2): 1 = standard body,
+    /// 2 = the alternate (De Morgan) body, where the symbol
+    /// defines one.
+    private var bodyStyleBinding: Binding<Int> {
+        Binding(
+            get: { placed?.effectiveBodyStyle ?? 1 },
+            set: { newStyle in mutate { $0.bodyStyle = newStyle } }
+        )
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
@@ -537,6 +657,15 @@ private struct SymbolPropertiesCard: View {
                                         .lineLimit(1)
                                         .tag(unit)
                                 }
+                            }
+                            .pickerStyle(.segmented)
+                        }
+                    }
+                    if def?.hasAlternateBody == true {
+                        fieldRow("Body") {
+                            Picker("Body", selection: bodyStyleBinding) {
+                                Text("Standard").lineLimit(1).tag(1)
+                                Text("De Morgan").lineLimit(1).tag(2)
                             }
                             .pickerStyle(.segmented)
                         }
@@ -591,10 +720,8 @@ private struct SymbolPropertiesCard: View {
                 choiceKey: placed?.footprintChoice,
                 pinCount: def?.distinctPinCount ?? 0,
                 onPick: { newChoice in
-                    // Like the reference/value edits, this writes
-                    // through mutate() directly — no undo step. That
-                    // is the existing part-1 gap for card edits; kept
-                    // consistent here rather than fixed one-off.
+                    // Writes through mutate() like the other card
+                    // edits — one undo step (part 5.2).
                     mutate { $0.footprintChoice = newChoice }
                 })
         }
@@ -749,12 +876,13 @@ private struct SymbolPropertiesCard: View {
 
     // MARK: - Mutations
 
-    /// Mutates the placed symbol in place. `SchematicDocument.state` is
-    /// `@Published`, so writing through it notifies every observer.
+    /// Mutates the placed symbol through the document's undoable
+    /// edit path (part 5.2 — this closes the recorded part-1 gap
+    /// where card edits made no undo step):
+    /// `SchematicDocument.editSymbol` pushes exactly one history
+    /// step per real change and none for a no-op edit.
     private func mutate(_ change: (inout PlacedSymbol) -> Void) {
-        guard let index = document.state.symbols.firstIndex(where: { $0.id == placedID })
-        else { return }
-        change(&document.state.symbols[index])
+        document.editSymbol(id: placedID, change)
     }
 
     private func syncDrafts() {
