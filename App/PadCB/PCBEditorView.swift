@@ -2905,7 +2905,7 @@ struct PCBEditorView: View {
         // resolved by BoardGeometry.routeTap — the SAME resolution
         // the hover preview renders (part 5.0.1), so the segment
         // Sean sees while hovering is the segment the tap commits.
-        switch BoardGeometry.routeTap(model: model, point: point,
+        switch BoardGeometry.routeTap(model, point: point,
                                       routingActive: routingActive,
                                       routeNet: routeNet,
                                       snapEnabled: snapEnabled,
@@ -3477,7 +3477,7 @@ struct PCBEditorView: View {
             var preview: BoardRoutePreview? = nil
             if let pointer, let last = points.last {
                 let resolved = BoardGeometry.routePreview(
-                    model: model, from: last, pointer: pointer,
+                    model, from: last, pointer: pointer,
                     routeNet: routeNet, snapEnabled: snapEnabled,
                     gridMil: boardState.gridMil, tolerance: tapToleranceMM)
                 preview = resolved
@@ -3564,7 +3564,7 @@ struct PCBEditorView: View {
         // feedback, so Sean can see what a tap would act on.
         if !routingActive, !pointerState.touchActive, let pointer,
            let hover = BoardGeometry.hoverTarget(
-               model: model, point: pointer, tolerance: tapToleranceMM) {
+               model, point: pointer, tolerance: tapToleranceMM) {
             switch hover {
             case .pad(let target):
                 drawPadHoverRing(&ctx, target: target, refused: false)
