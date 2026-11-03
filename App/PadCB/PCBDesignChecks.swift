@@ -1668,15 +1668,23 @@ enum BoardCleanup {
         // Disconnected items: sync orphans (netName nil with a
         // remembered net) among traces and vias.
         if options.removeDisconnected {
+            // Locked ids are snapshotted first: reading `result`
+            // inside removeAll's closure while it mutates
+            // result.traces / result.vias is an exclusivity
+            // violation.
+            let lockedTraceIDs = Set(result.traces
+                .filter { result.isLocked($0.id) }.map { $0.id })
+            let lockedViaIDs = Set(result.vias
+                .filter { result.isLocked($0.id) }.map { $0.id })
             let tracesBefore = result.traces.count
             result.traces.removeAll {
                 $0.netName == nil && $0.disconnectedNetName != nil
-                    && !result.isLocked($0.id)
+                    && !lockedTraceIDs.contains($0.id)
             }
             let viasBefore = result.vias.count
             result.vias.removeAll {
                 $0.netName == nil && $0.disconnectedNetName != nil
-                    && !result.isLocked($0.id)
+                    && !lockedViaIDs.contains($0.id)
             }
             report["disconnectedItems"]! = (tracesBefore - result.traces.count)
                 + (viasBefore - result.vias.count)

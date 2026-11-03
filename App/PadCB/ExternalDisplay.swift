@@ -40,17 +40,15 @@ final class ExternalDisplaySceneDelegate: NSObject, UIWindowSceneDelegate {
                options connectionOptions: UIScene.ConnectionOptions) {
         // Only the external-display roles get a window here; any
         // other session is not ours to touch.
-        let externalRoles: Set<String> = [
-            UIWindowSceneSessionRoleExternalDisplay,
-            UIWindowSceneSessionRoleExternalDisplayNonInteractive,
-        ]
-        guard externalRoles.contains(session.role.rawValue) else { return }
+        guard session.role == UIWindowSceneSessionRoleExternalDisplay
+            || session.role == UIWindowSceneSessionRoleExternalDisplayNonInteractive
+        else { return }
         guard let wscene = (session.scene as? UIWindowScene)
                 ?? (scene as? UIWindowScene) else { return }
 
         let screen = wscene.screen
         self.screen = screen
-        screen.overscanCompensation = .scaleApplicationToSafeArea
+        screen.overscanCompensation = .insetApplicationFrame
 
         // The UIScreen fallback may have beaten the scene to it:
         // adopt its window rather than double-creating.
@@ -148,7 +146,7 @@ final class ExternalDisplayCoordinator: NSObject {
     /// already registered (the one-window-per-display invariant).
     private func showWindow(for screen: UIScreen) {
         guard windows[ObjectIdentifier(screen)] == nil else { return }
-        screen.overscanCompensation = .scaleApplicationToSafeArea
+        screen.overscanCompensation = .insetApplicationFrame
         let w = UIWindow(frame: screen.bounds)
         w.screen = screen
         w.rootViewController = UIHostingController(

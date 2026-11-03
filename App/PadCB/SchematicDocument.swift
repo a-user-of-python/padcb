@@ -837,8 +837,20 @@ final class SchematicDocument: ObservableObject {
         wires = dropDuplicates(wires)
 
         // Collinear merges, to a fixpoint.
+        // Local copy of the builder's point-to-segment distance
+        // (identical math): this file is also compiled WITHOUT
+        // ConnectionTable.swift by the geometry-audit harness,
+        // so it must not reference ConnectionTableBuilder.
+        func pointSegmentDistance(_ p: DPoint, _ a: DPoint, _ b: DPoint) -> Double {
+            let ab = b - a
+            let lengthSquared = ab.x * ab.x + ab.y * ab.y
+            if lengthSquared < 1e-12 { return p.distance(to: a) }
+            let t = max(0, min(1, ((p.x - a.x) * ab.x + (p.y - a.y) * ab.y) / lengthSquared))
+            let projection = DPoint(x: a.x + ab.x * t, y: a.y + ab.y * t)
+            return p.distance(to: projection)
+        }
         func onSegment(_ p: DPoint, _ a: DPoint, _ b: DPoint) -> Bool {
-            ConnectionTableBuilder.distanceFromPointToSegment(p, a, b) <= 1e-9
+            pointSegmentDistance(p, a, b) <= 1e-9
         }
         func continuesStraight(_ d1: DPoint, _ d2: DPoint) -> Bool {
             // Collinear (cross ~ 0) and continuing (dot > 0: a
