@@ -908,7 +908,7 @@ final class SchematicDocument: ObservableObject {
                     guard continuesStraight(d1, d2) else { continue }
                     // The joint point itself drops out: the two
                     // segments become one straight segment.
-                    let joined = Array(left.dropLast()) + right
+                    let joined = Array(left.dropLast()) + Array(right.dropFirst())
                     guard joined.count >= 2 else { continue }
                     wires[i] = WireItem(id: wires[i].id, points: joined)
                     wires.remove(at: j)

@@ -40,8 +40,8 @@ final class ExternalDisplaySceneDelegate: NSObject, UIWindowSceneDelegate {
                options connectionOptions: UIScene.ConnectionOptions) {
         // Only the external-display roles get a window here; any
         // other session is not ours to touch.
-        guard session.role == UIWindowSceneSessionRoleExternalDisplay
-            || session.role == UIWindowSceneSessionRoleExternalDisplayNonInteractive
+        guard session.role == .windowExternalDisplay
+            || session.role == .windowExternalDisplayNonInteractive
         else { return }
         guard let wscene = (session.scene as? UIWindowScene)
                 ?? (scene as? UIWindowScene) else { return }

@@ -2998,11 +2998,18 @@ checkEqual(docNC53.state.noConnects.count, 1,
 // (R1 pin 2 is left alone on a stub) and exempts the pin in ERC.
 let uNC53 = ercPlaced52("U1", "IC", 0, 0)
 let rNC53 = ercPlaced52("R1", "R", 30, 0)
+// The second wire jogs below the first: drawn straight it would lie
+// on the same horizontal line and swallow the first wire's endpoints
+// (endpoint-on-segment unions them into one net — correct builder
+// behaviour, wrong scenario). The jog keeps the two nets disjoint.
+let ncPinA53 = pinPoint52(uNC53, "1")
+let ncPinB53 = pinPoint52(rNC53, "2")
 let stateNC53 = SchematicState(
     symbols: [uNC53, rNC53],
     wires: [
         wire53(UUID(), [pinPoint52(uNC53, "2"), pinPoint52(rNC53, "1")]),
-        wire53(UUID(), [pinPoint52(uNC53, "1"), pinPoint52(rNC53, "2")]),
+        wire53(UUID(), [ncPinA53, dp53(ncPinA53.x, -15),
+                        dp53(ncPinB53.x, -15), ncPinB53]),
     ],
     junctions: [], labels: [], title: "NC53")
 let docFlag53 = makeDoc53(stateNC53)
@@ -3281,19 +3288,22 @@ if let match = matchesRef53.first {
     check(false, "5.3 find: 'r1' has a first match to inspect")
 }
 let matchesFIX53 = docFind53.findMatches(query: "FIX")
-checkEqual(matchesFIX53.count, 3,
-           "5.3 find: 'FIX' has exactly three matches (got \(matchesFIX53.map { "\($0.field.rawValue):\($0.text)" }))")
-if matchesFIX53.count == 3 {
+checkEqual(matchesFIX53.count, 4,
+           "5.3 find: 'FIX' has exactly four matches (got \(matchesFIX53.map { "\($0.field.rawValue):\($0.text)" }))")
+if matchesFIX53.count == 4 {
     check(matchesFIX53[0].field == .value
           && matchesFIX53[0].text == "FIXIC"
           && matchesFIX53[0].symbolID == u1Unit1.id
           && matchesFIX53[1].field == .symbolName
           && matchesFIX53[1].symbolID == u1Unit1.id
           && matchesFIX53[2].field == .symbolName
-          && matchesFIX53[2].symbolID == r1Find53.id,
-          "5.3 find: 'FIX' matches per field — U1's value and symbol name, then R1's symbol name, in document order")
+          && matchesFIX53[2].symbolID == r1Find53.id
+          && matchesFIX53[3].field == .footprint
+          && matchesFIX53[3].text == "FixtureFP:FIXR_FP"
+          && matchesFIX53[3].symbolID == r1Find53.id,
+          "5.3 find: 'FIX' matches per field — U1's value and symbol name, R1's symbol name, and R1's footprint choice (\"FIX\" is a substring of \"FIXR_FP\"), in document order")
 } else {
-    check(false, "5.3 find: 'FIX' matches are U1's value + name and R1's name")
+    check(false, "5.3 find: 'FIX' matches are U1's value + name, R1's name and R1's footprint")
 }
 let matchesValue53 = docFind53.findMatches(query: "10k")
 check(matchesValue53.count == 1 && matchesValue53.first?.field == .value
