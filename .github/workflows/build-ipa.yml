@@ -126,6 +126,24 @@ jobs:
           assert p.get("CFBundleIdentifier") == "com.user.padcb"
           EOF
 
+      - name: Verify external-display scene configuration in built app
+        run: |
+          PLIST="build/dd/Build/Products/Release-iphoneos/PadCB.app/Info.plist"
+          python3 - "$PLIST" <<'EOF'
+          import plistlib, sys
+          with open(sys.argv[1], "rb") as f:
+              p = plistlib.load(f)
+          manifest = p.get("UIApplicationSceneManifest")
+          assert isinstance(manifest, dict), "UIApplicationSceneManifest missing"
+          assert manifest.get("UIApplicationSupportsMultipleScenes") is True
+          configs = manifest.get("UISceneConfigurations", {})
+          ext = configs.get("UIWindowSceneSessionRoleExternalDisplay")
+          assert isinstance(ext, list) and len(ext) == 1, f"external display config: {ext!r}"
+          delegate = ext[0].get("UISceneDelegateClassName", "")
+          assert delegate.endswith("ExternalDisplaySceneDelegate"), delegate
+          print("external display config:", ext[0].get("UISceneConfigurationName"), "->", delegate)
+          EOF
+
       - name: Verify bundled symbol libraries in built app
         run: |
           APP_PATH="build/dd/Build/Products/Release-iphoneos/PadCB.app"
