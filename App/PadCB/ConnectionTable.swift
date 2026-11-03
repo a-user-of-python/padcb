@@ -77,6 +77,27 @@ struct ConnectionNet: Codable, Equatable {
     /// same merged net — recorded instead of silently dropped.
     var aliases: [String]
     var endpoints: [ConnectionEndpoint]
+    /// The schematic wire items forming this net (part 5.3, S1),
+    /// sorted by id string for determinism. OPTIONAL on purpose:
+    /// tables written before part 5.3 have no such key and still
+    /// decode (formatVersion stays 1); read it through
+    /// `wireIDList`, never directly.
+    var wireIDs: [UUID]? = nil
+
+    /// `wireIDs` with the pre-5.3 case folded away.
+    var wireIDList: [UUID] { wireIDs ?? [] }
+
+    /// The symbol instance ids on this net, in endpoint order,
+    /// duplicates removed (an instance with two pins on the net
+    /// appears once).
+    var symbolInstanceIDs: [UUID] {
+        var seen = Set<UUID>()
+        var ids: [UUID] = []
+        for endpoint in endpoints where seen.insert(endpoint.instanceID).inserted {
+            ids.append(endpoint.instanceID)
+        }
+        return ids
+    }
 }
 
 struct ConnectionTable: Codable, Equatable {
@@ -91,8 +112,72 @@ struct ConnectionTable: Codable, Equatable {
     /// custom library that has since been deleted). Their pins cannot
     /// be enumerated, so they contribute no endpoints.
     var unresolvedSymbols: [String]
+    /// Wire item id (UUID string) -> net name, for every wire
+    /// participating in a written net (part 5.3, S1). Recorded by
+    /// the builder from its own union-find, so Highlight Net /
+    /// Select Connection answer membership WITHOUT re-deriving
+    /// the nets. OPTIONAL: pre-5.3 tables decode with nil
+    /// (formatVersion stays 1).
+    var wireNetByWireID: [String: String]? = nil
+    /// "instanceID|pinNumber" keys of the pins a placed
+    /// no-connect flag (part 5.3, S4) excluded from the nets —
+    /// the same key format SchematicERC uses for its pin census,
+    /// so ERC can exempt flagged pins from pin-not-connected.
+    /// OPTIONAL for the same backward-compatibility reason.
+    var flaggedNoConnectPins: [String]? = nil
 
     static let currentFormatVersion = 1
+
+    /// The net called `name`, or nil.
+    func net(named name: String) -> ConnectionNet? {
+        nets.first { $0.name == name }
+    }
+
+    /// The wire->net map with UUID keys (empty for pre-5.3
+    /// tables, which recorded none).
+    var wireNetMap: [UUID: String] {
+        var map: [UUID: String] = [:]
+        for (key, name) in wireNetByWireID ?? [:] {
+            if let id = UUID(uuidString: key) { map[id] = name }
+        }
+        return map
+    }
+
+    /// The net a wire item belongs to, or nil when the wire
+    /// participates in no written net. Answers from the recorded
+    /// map first, then from the per-net wire id lists, so a
+    /// hand-built table carrying only one of the two still
+    /// answers.
+    func netName(forWireID id: UUID) -> String? {
+        if let name = wireNetMap[id] { return name }
+        return nets.first { $0.wireIDList.contains(id) }?.name
+    }
+
+    /// The wire item ids forming the named net (the net's own
+    /// recorded list, plus any map entries naming it that the
+    /// list missed — deduplicated, the list's order kept, map
+    /// extras appended sorted by id string).
+    func wireIDs(forNet name: String) -> [UUID] {
+        guard let net = net(named: name) else { return [] }
+        var ids = net.wireIDList
+        let extras = wireNetMap.filter { $0.value == name }
+            .map(\.key)
+            .filter { !ids.contains($0) }
+            .sorted { $0.uuidString < $1.uuidString }
+        ids += extras
+        return ids
+    }
+
+    /// The symbol instance ids on the named net.
+    func symbolInstanceIDs(forNet name: String) -> [UUID] {
+        net(named: name)?.symbolInstanceIDs ?? []
+    }
+
+    /// The recorded flagged-no-connect pin keys ("instance|pin")
+    /// as a set (empty for pre-5.3 tables).
+    var flaggedNoConnectPinKeySet: Set<String> {
+        Set(flaggedNoConnectPins ?? [])
+    }
 }
 
 // MARK: - Builder
@@ -124,6 +209,7 @@ enum ConnectionTableBuilder {
         var unresolved: [String] = []
         var powerNameByEndpoint: [Int: String] = [:]
         var seenEndpointKeys = Set<String>()
+        var flaggedNoConnects = Set<String>()
 
         let placedSorted = state.symbols.sorted {
             ($0.reference, $0.symbolName, $0.unit, $0.id.uuidString)
@@ -155,6 +241,17 @@ enum ConnectionTableBuilder {
 
             for entry in SymbolDrawList.pinWorldPoints(def: def, placed: placed) {
                 let pin = entry.pin
+                // A placed no-connect flag (part 5.3, S4) excludes
+                // the pin EXACTLY like an intrinsic no-connect:
+                // it never becomes an endpoint, and the table
+                // records its key so ERC can exempt it too.
+                if state.noConnects.contains(where: {
+                    pointsTouch($0.at, entry.point)
+                }) {
+                    flaggedNoConnects.insert(
+                        "\(placed.id.uuidString)|\(pin.number)")
+                    continue
+                }
                 if pin.type == .noConnect { continue }
                 let dedupeKey = "\(placed.id.uuidString)|\(pin.number)|"
                     + "\(Int((entry.point.x * 1000).rounded()))|\(Int((entry.point.y * 1000).rounded()))"
@@ -180,12 +277,14 @@ enum ConnectionTableBuilder {
         unresolved.sort()
 
         // 2. Wire segments and their connectivity.
-        struct Segment { var a: DPoint; var b: DPoint }
+        struct Segment { var a: DPoint; var b: DPoint; var wireID: UUID }
         var segments: [Segment] = []
         for wire in state.wires where wire.points.count >= 2 {
             for i in 0..<(wire.points.count - 1) {
                 let a = wire.points[i], b = wire.points[i + 1]
-                if a.distance(to: b) > 1e-9 { segments.append(Segment(a: a, b: b)) }
+                if a.distance(to: b) > 1e-9 {
+                    segments.append(Segment(a: a, b: b, wireID: wire.id))
+                }
             }
         }
 
@@ -309,33 +408,72 @@ enum ConnectionTableBuilder {
             return (e.reference, Int.max, e.pinNumber, e.symbolName)
         }
 
-        var namedNets: [ConnectionNet] = []
-        var unnamedGroups: [[ConnectionEndpoint]] = []
+        // Net naming: named groups take their primary name;
+        // unnamed groups become Net-1, Net-2, … in first-endpoint
+        // order (the part-2 deterministic rule, unchanged). The
+        // group -> name map is computed FIRST (part 5.3, S1) so
+        // wire membership can be recorded against final names.
+        var groupToNetName: [Int: String] = [:]
+        var namedGroups: [(group: Int, endpoints: [ConnectionEndpoint],
+                           primary: String, aliases: [String])] = []
+        var unnamedGroups: [(group: Int, endpoints: [ConnectionEndpoint])] = []
         for (group, indices) in endpointsByGroup where indices.count >= 2 {
             let sortedEndpoints = indices.map { endpoints[$0] }
                 .sorted { endpointSortKey($0) < endpointSortKey($1) }
             let names = (namesByGroup[group] ?? []).sorted()
             if let primary = names.first {
-                namedNets.append(ConnectionNet(
-                    name: primary,
-                    aliases: Array(names.dropFirst()),
-                    endpoints: sortedEndpoints))
+                namedGroups.append((group, sortedEndpoints, primary,
+                                    Array(names.dropFirst())))
+                groupToNetName[group] = primary
             } else {
-                unnamedGroups.append(sortedEndpoints)
+                unnamedGroups.append((group, sortedEndpoints))
             }
         }
-        namedNets.sort { $0.name < $1.name }
         unnamedGroups.sort {
-            let a = $0.first.map(endpointSortKey), b = $1.first.map(endpointSortKey)
+            let a = $0.endpoints.first.map(endpointSortKey)
+            let b = $1.endpoints.first.map(endpointSortKey)
             switch (a, b) {
             case let (a?, b?): return a < b
             case (nil, _): return false
             case (_, nil): return true
             }
         }
-        var nets = namedNets
-        for (i, groupEndpoints) in unnamedGroups.enumerated() {
-            nets.append(ConnectionNet(name: "Net-\(i + 1)", aliases: [], endpoints: groupEndpoints))
+        for (i, unnamed) in unnamedGroups.enumerated() {
+            groupToNetName[unnamed.group] = "Net-\(i + 1)"
+        }
+
+        // Wire membership per net (part 5.3, S1): a wire item
+        // participates in the net its segments' geometric group
+        // was named into. Wires on groups that were dropped
+        // (fewer than 2 endpoints) participate in no net.
+        var wireIDsByGroup: [Int: Set<UUID>] = [:]
+        var wireNetByWireID: [String: String] = [:]
+        for i in segments.indices {
+            guard let componentIdx = componentIndex["wire:\(union.find(i))"],
+                  let netName = groupToNetName[groupUnion.find(componentIdx)]
+            else { continue }
+            wireIDsByGroup[groupUnion.find(componentIdx), default: []]
+                .insert(segments[i].wireID)
+            wireNetByWireID[segments[i].wireID.uuidString] = netName
+        }
+        func netWireIDs(_ group: Int) -> [UUID] {
+            (wireIDsByGroup[group] ?? []).sorted { $0.uuidString < $1.uuidString }
+        }
+
+        var nets: [ConnectionNet] = []
+        for named in namedGroups.sorted(by: { $0.primary < $1.primary }) {
+            nets.append(ConnectionNet(
+                name: named.primary,
+                aliases: named.aliases,
+                endpoints: named.endpoints,
+                wireIDs: netWireIDs(named.group)))
+        }
+        for unnamed in unnamedGroups {
+            nets.append(ConnectionNet(
+                name: groupToNetName[unnamed.group] ?? "",
+                aliases: [],
+                endpoints: unnamed.endpoints,
+                wireIDs: netWireIDs(unnamed.group)))
         }
 
         return ConnectionTable(
@@ -345,7 +483,9 @@ enum ConnectionTableBuilder {
             generatedAt: Date(),
             components: components,
             nets: nets,
-            unresolvedSymbols: unresolved)
+            unresolvedSymbols: unresolved,
+            wireNetByWireID: wireNetByWireID,
+            flaggedNoConnectPins: flaggedNoConnects.sorted())
     }
 
     // MARK: - Geometry helpers
@@ -440,7 +580,7 @@ struct ERCFinding: Equatable {
     enum Severity: Equatable {
         case error, warning
     }
-    enum Kind: Equatable {
+    enum Kind: String, Equatable {
         case pinNotConnected
         case powerPinNotDriven
         case outputConflict
@@ -453,6 +593,27 @@ struct ERCFinding: Equatable {
     var kind: Kind
     var message: String
     var instanceID: UUID?
+    /// The reference the finding keys on (part 5.3, P7): the
+    /// symbol reference for pin/annotation findings, the NET
+    /// name for per-net findings, the unresolved-symbol line
+    /// for unresolvedSymbol, "" for label findings.
+    var reference: String = ""
+    /// The finding's detail slot: the pin number for
+    /// pinNotConnected, the involved "Ref pin N" list for the
+    /// per-net findings, "unit N" for duplicateReference, the
+    /// symbol name for unannotated, the label text for
+    /// labelNotConnected, "" for unresolvedSymbol.
+    var detail: String = ""
+
+    /// STABLE exclusion identity (part 5.3, P7): kind, reference
+    /// and detail, pipe-joined — content-derived, never
+    /// row-order-derived, so an exclusion stays attached to its
+    /// finding across re-checks and its absence (a fixed
+    /// problem) reads as a stale key rather than silently
+    /// landing on a neighbour.
+    var key: String {
+        [kind.rawValue, reference, detail].joined(separator: "|")
+    }
 }
 
 /// PadCB's electrical rules check. The net facts come from the
@@ -482,6 +643,27 @@ struct ERCFinding: Equatable {
 /// - label not connected (warning): a label touching no wire
 ///   segment and no pin.
 enum SchematicERC {
+    /// Splits findings into visible and excluded by exclusion
+    /// KEY (part 5.3, P7): a finding whose `key` is in
+    /// `excludedKeys` (the state's ercExclusions, as a set) is
+    /// excluded; order is preserved in both lists. check()
+    /// itself is unchanged — exclusions are a presentation
+    /// filter over its output, never an input to it.
+    static func visibleFindings(
+        _ findings: [ERCFinding], excluding excludedKeys: Set<String>
+    ) -> (visible: [ERCFinding], excluded: [ERCFinding]) {
+        var visible: [ERCFinding] = []
+        var excluded: [ERCFinding] = []
+        for finding in findings {
+            if excludedKeys.contains(finding.key) {
+                excluded.append(finding)
+            } else {
+                visible.append(finding)
+            }
+        }
+        return (visible, excluded)
+    }
+
     static func check(state: SchematicState,
                       resolveSymbol: (PlacedSymbol) -> KiCadSymbolDef?)
         -> [ERCFinding] {
@@ -522,6 +704,13 @@ enum SchematicERC {
                 // jumpers (one electrical pin): census once.
                 guard seenNumbers.insert(pin.number).inserted else { continue }
                 let key = "\(placed.id.uuidString)|\(pin.number)"
+                // A pin under a placed no-connect flag (part
+                // 5.3, S4) is exempt exactly like an intrinsic
+                // no-connect: the table recorded its key while
+                // excluding it from the nets.
+                if table.flaggedNoConnectPinKeySet.contains(key) {
+                    continue
+                }
                 if !tabledPins.contains(key) {
                     let name = KiCadText.plain(pin.name)
                     notConnected.append(ERCFinding(
@@ -529,7 +718,9 @@ enum SchematicERC {
                         message: "\(placed.reference) pin \(pin.number)"
                             + (name.isEmpty ? "" : " (\(name))")
                             + " is not connected",
-                        instanceID: placed.id))
+                        instanceID: placed.id,
+                        reference: placed.reference,
+                        detail: pin.number))
                 }
             }
         }
@@ -563,7 +754,9 @@ enum SchematicERC {
                     severity: .error, kind: .powerPinNotDriven,
                     message: "Net \(net.name): power pin(s) \(names) "
                         + "are not driven by any output or power symbol",
-                    instanceID: powerInPins.first?.instanceID))
+                    instanceID: powerInPins.first?.instanceID,
+                    reference: net.name,
+                    detail: names))
             }
             let driving = drivers
             if driving.count > 1 {
@@ -574,7 +767,9 @@ enum SchematicERC {
                     severity: .error, kind: .outputConflict,
                     message: "Net \(net.name): outputs \(names) "
                         + "are wired together",
-                    instanceID: driving.first?.instanceID))
+                    instanceID: driving.first?.instanceID,
+                    reference: net.name,
+                    detail: names))
             }
         }
         findings += powerFindings.sorted { $0.message < $1.message }
@@ -592,7 +787,9 @@ enum SchematicERC {
                 severity: .error, kind: .duplicateReference,
                 message: "\(group[0].reference) unit \(group[0].unit) is placed "
                     + "\(group.count) times — references must be unique per unit",
-                instanceID: group[0].id))
+                instanceID: group[0].id,
+                reference: group[0].reference,
+                detail: "unit \(group[0].unit)"))
         }
         findings += duplicates.sorted { $0.message < $1.message }
 
@@ -608,7 +805,9 @@ enum SchematicERC {
                 severity: .warning, kind: .unannotated,
                 message: "\(placed.reference) (\(placed.symbolName)) "
                     + "is not annotated — run Annotate",
-                instanceID: placed.id))
+                instanceID: placed.id,
+                reference: placed.reference,
+                detail: placed.symbolName))
         }
         findings += unannotated.sorted { $0.message < $1.message }
 
@@ -617,7 +816,8 @@ enum SchematicERC {
             findings.append(ERCFinding(
                 severity: .error, kind: .unresolvedSymbol,
                 message: "Symbol \(line) could not be loaded from its library",
-                instanceID: nil))
+                instanceID: nil,
+                reference: line))
         }
 
         // -- Labels touching nothing --
@@ -647,7 +847,8 @@ enum SchematicERC {
                 labelFindings.append(ERCFinding(
                     severity: .warning, kind: .labelNotConnected,
                     message: "Label \"\(label.text)\" is not on any wire or pin",
-                    instanceID: nil))
+                    instanceID: nil,
+                    detail: label.text))
             }
         }
         findings += labelFindings.sorted { $0.message < $1.message }

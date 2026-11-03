@@ -22,10 +22,17 @@ import SwiftUI
 /// Single-line discipline everywhere (LumenScene lesson): every label is
 /// `.lineLimit(1)` and top-bar buttons are `.fixedSize(horizontal: true)`.
 struct SchematicEditorView: View {
+    /// Cross-probe transport (part 5.3, S8): pushes the PCB
+    /// editor ("pcb") onto HomeView's navigation path. Defaulted
+    /// so other construction sites keep compiling unchanged.
+    var navigate: (String) -> Void = { _ in }
+
     @StateObject private var document = SchematicDocument()
     @StateObject private var canvasState = CanvasViewState()
     @EnvironmentObject private var store: LibraryStore
     @EnvironmentObject private var footprintStore: FootprintStore
+    @EnvironmentObject private var crossProbe: CrossProbe
+    @EnvironmentObject private var liveSession: LiveSessionRegistry
 
     @Environment(\.openURL) private var openURL
 
@@ -49,6 +56,33 @@ struct SchematicEditorView: View {
     @State private var ercFindings: [ERCFinding] = []
     @State private var infoMessage: String? = nil
 
+    // Part 5.3 state: net highlight (S1) + net navigator (S10)
+    // share one lazily built connection table; Find (S2); the
+    // fields table (S6); symbol swap target (S5); the connection
+    // selection (S11); annotate options (S7); and a one-line
+    // action status shown in the status bar.
+    @State private var highlightTable: ConnectionTable? = nil
+    @State private var highlightedNet: String? = nil
+    @State private var highlightArmed = false
+    @State private var showNets = false
+    @State private var showFind = false
+    @State private var findQuery = ""
+    @State private var findResults: [SchematicFindMatch] = []
+    @State private var showFindResults = false
+    @State private var showFields = false
+    @State private var fieldRowsSnapshot: [SymbolFieldRow] = []
+    @State private var fieldSeed: [UUID: FieldEdit] = [:]
+    @State private var fieldEdits: [UUID: FieldEdit] = [:]
+    @State private var swapTargetID: UUID? = nil
+    @State private var selectConnectionArmed = false
+    @State private var connectionSelection: Set<UUID> = []
+    @State private var connectionNetName: String? = nil
+    @State private var actionStatus: String? = nil
+    @State private var showAnnotateOptions = false
+    @State private var annotateSortRaw = 0 // 0 sheet order, 1 by X, 2 by Y
+    @State private var annotateResetAll = false
+    @State private var annotateStartText = "1"
+
     // MARK: - Derived state
 
     private var selectedPlaced: PlacedSymbol? {
@@ -71,6 +105,10 @@ struct SchematicEditorView: View {
         VStack(spacing: 0) {
             topBar
             Divider()
+            if showFind {
+                findBar
+                Divider()
+            }
             HStack(spacing: 0) {
                 leftTools
                 Divider()
@@ -88,7 +126,30 @@ struct SchematicEditorView: View {
                         },
                         onConsumePlacementDone: {
                             pendingSymbol = nil
-                        }
+                        },
+                        highlightedWireIDs: highlightedNet.map {
+                            Set(highlightTable?.wireIDs(forNet: $0) ?? [])
+                        } ?? [],
+                        highlightedSymbolIDs: highlightedNet.map {
+                            Set(highlightTable?.symbolInstanceIDs(forNet: $0) ?? [])
+                        } ?? [],
+                        isHighlightActive: highlightedNet != nil,
+                        connectionSelectedWireIDs: connectionSelection,
+                        highlightArmed: $highlightArmed,
+                        selectConnectionArmed: $selectConnectionArmed,
+                        onHighlightWire: { wireID in
+                            resolveHighlight(wireID: wireID)
+                        },
+                        onHighlightPin: { instanceID, pinNumber in
+                            resolveHighlight(instanceID: instanceID,
+                                             pinNumber: pinNumber)
+                        },
+                        onSelectConnectionWire: { wireID in
+                            resolveConnectionSelection(wireID: wireID)
+                        },
+                        onClearHighlight: { clearHighlight() },
+                        onClearConnectionSelection: { clearConnectionSelection() },
+                        onDeleteConnectionSelection: { deleteConnectionSelection() }
                     )
                     if showProperties, let placed = selectedPlaced {
                         SymbolPropertiesCard(
@@ -96,7 +157,14 @@ struct SchematicEditorView: View {
                             placedID: placed.id,
                             store: store,
                             onClose: { selection = nil },
-                            onSelect: { selection = $0 }
+                            onSelect: { selection = $0 },
+                            onShowOnBoard: { showSelectedOnBoard() },
+                            onChangeSymbol: {
+                                swapTargetID = placed.id
+                                chooserPowerOnly = false
+                                showChooser = true
+                            },
+                            onUpdateFromLibrary: { updateSelectedFromLibrary() }
                         )
                         .padding(.trailing, 12)
                         .padding(.vertical, 12)
@@ -112,10 +180,28 @@ struct SchematicEditorView: View {
         .navigationTitle(document.state.title)
         .navigationBarTitleDisplayMode(.inline)
         .preferredColorScheme(.dark)
-        .sheet(isPresented: $showChooser) {
-            SymbolChooserView(store: store, powerOnly: chooserPowerOnly) { def in
-                pendingSymbol = def
-                tool = .placeSymbol
+        .sheet(isPresented: $showChooser, onDismiss: { swapTargetID = nil }) {
+            SymbolChooserView(store: store, powerOnly: chooserPowerOnly,
+                              swapMode: swapTargetID != nil) { def in
+                // Part 5.3, S5: with a swap target set the pick
+                // CHANGES that symbol's definition in place (the
+                // chooser delivered the full definition; its
+                // library/name are the new key — the same values
+                // placement records); otherwise it places as before.
+                if let target = swapTargetID {
+                    let reference = document.state.symbols
+                        .first(where: { $0.id == target })?.reference ?? "Symbol"
+                    let changed = document.changeSymbol(
+                        id: target, toLibrary: def.library, name: def.name,
+                        definition: def)
+                    actionStatus = changed
+                        ? "Changed \(reference) to \(def.name)"
+                        : "Already \(def.name) — no change"
+                    swapTargetID = nil
+                } else {
+                    pendingSymbol = def
+                    tool = .placeSymbol
+                }
             }
         }
         .sheet(isPresented: $showOpen) {
@@ -124,6 +210,7 @@ struct SchematicEditorView: View {
                     try document.load(from: url)
                     selection = nil
                     pendingSymbol = nil
+                    resetNetState()
                 } catch {
                     errorMessage = "Could not open that file: \(error.localizedDescription)"
                 }
@@ -170,6 +257,84 @@ struct SchematicEditorView: View {
         .sheet(isPresented: $showERC) {
             ercSheet
         }
+        .sheet(isPresented: $showNets) {
+            netsSheet
+        }
+        .sheet(isPresented: $showFields) {
+            fieldsSheet
+        }
+        .sheet(isPresented: $showAnnotateOptions) {
+            annotateSheet
+        }
+        .sheet(isPresented: $showFindResults) {
+            findResultsSheet
+        }
+        // Part 5.3: publish the live document for the external
+        // display (AirPlay hook) — the registry holds the OBJECT,
+        // so the mirror redraws as this editor mutates it.
+        .onAppear {
+            liveSession.schematicDocument = document
+            consumeCrossProbe()
+        }
+        .onDisappear {
+            if liveSession.schematicDocument === document {
+                liveSession.schematicDocument = nil
+            }
+        }
+        // Part 5.3, S8: a "Show in Schematic" probe from the PCB
+        // editor selects + centres the named symbol here.
+        .onChange(of: crossProbe.target) { _, _ in
+            consumeCrossProbe()
+        }
+        // Part 5.3, S11: selecting anything else clears the
+        // connection selection.
+        .onChange(of: selection) { _, _ in
+            if !connectionSelection.isEmpty {
+                connectionSelection = []
+                connectionNetName = nil
+            }
+        }
+    }
+
+    // MARK: - Cross-probe (part 5.3, S8)
+
+    /// Consumes a `.symbol` probe target: select the symbol with
+    /// that reference and centre the canvas on it, then clear the
+    /// target so it cannot re-fire. Other targets (and a stale
+    /// target naming a symbol this sheet does not have) are left
+    /// or reported plainly.
+    private func consumeCrossProbe() {
+        guard let target = crossProbe.target,
+              case .symbol(let reference) = target else { return }
+        crossProbe.target = nil
+        guard let placed = document.placedSymbol(reference: reference) else {
+            actionStatus = "No symbol \(reference) on this sheet"
+            return
+        }
+        selection = placed.id
+        showProperties = true
+        canvasState.centre(on: placed.origin)
+        actionStatus = "Showing \(reference) from the board"
+    }
+
+    /// "Show on Board" (properties card): publish the footprint
+    /// probe for the selected symbol and push the PCB editor.
+    private func showSelectedOnBoard() {
+        guard let placed = selectedPlaced else { return }
+        crossProbe.target = .footprint(reference: placed.reference)
+        navigate("pcb")
+    }
+
+    /// "Update from Library" (properties card, part 5.3, S5):
+    /// refresh the selected symbol from its CURRENT library
+    /// definition.
+    private func updateSelectedFromLibrary() {
+        guard let placed = selectedPlaced, let def = selectedDef else { return }
+        let changed = document.updateSymbolFromLibrary(id: placed.id,
+                                                       definition: def)
+        actionStatus = changed
+            ? "Updated \(placed.reference) from the library"
+            : "\(placed.reference) is already up to date — no change"
     }
 
     /// New document (part 5.2 — closes the recorded part-1
@@ -181,42 +346,78 @@ struct SchematicEditorView: View {
             title: "Untitled"))
         selection = nil
         pendingSymbol = nil
+        resetNetState()
     }
 
-    /// The ERC results sheet (part 5.2): every finding with its
-    /// severity; tapping a finding that names a symbol selects
-    /// it on the canvas.
+    /// Clears every piece of part-5.3 net state (highlight,
+    /// connection selection, armed modes, cached table) — the
+    /// nets they referred to belong to the previous document.
+    private func resetNetState() {
+        highlightTable = nil
+        highlightedNet = nil
+        highlightArmed = false
+        selectConnectionArmed = false
+        connectionSelection = []
+        connectionNetName = nil
+        actionStatus = nil
+    }
+
+    /// The ERC results sheet (part 5.2; exclusions part 5.3, P7):
+    /// findings split by the document's exclusion keys into
+    /// visible and excluded; the header count reflects VISIBLE
+    /// findings only. Tapping a finding that names a symbol
+    /// selects it on the canvas; Exclude/Restore move it between
+    /// the lists (settings-style, no undo — see the document).
+    /// Exclusion keys that match no current finding are reported
+    /// as stale, never silently re-attached.
     private var ercSheet: some View {
-        NavigationStack {
+        let split = SchematicERC.visibleFindings(
+            ercFindings, excluding: Set(document.state.ercExclusions))
+        let currentKeys = Set(ercFindings.map(\.key))
+        let staleKeys = document.state.ercExclusions
+            .filter { !currentKeys.contains($0) }
+        return NavigationStack {
             List {
-                if ercFindings.isEmpty {
-                    Text("No electrical problems found — every pin is connected or marked no-connect, power inputs are driven, and references are annotated and unique.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                ForEach(Array(ercFindings.enumerated()), id: \.offset) { _, finding in
-                    Button {
-                        if let id = finding.instanceID {
-                            selection = id
-                            showERC = false
-                        }
-                    } label: {
-                        HStack(spacing: 10) {
-                            Image(systemName: finding.severity == .error
-                                  ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
-                                .foregroundStyle(finding.severity == .error
-                                                 ? .red : .orange)
-                                .lineLimit(1)
-                            Text(finding.message)
-                                .font(.callout)
-                                .foregroundStyle(.primary)
-                                .multilineTextAlignment(.leading)
-                            Spacer(minLength: 0)
-                        }
-                        .contentShape(Rectangle())
+                Section {
+                    if split.visible.isEmpty {
+                        Text(split.excluded.isEmpty && staleKeys.isEmpty
+                             ? "No electrical problems found — every pin is connected or marked no-connect, power inputs are driven, and references are annotated and unique."
+                             : "No visible findings — every current finding is excluded.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.plain)
-                    .disabled(finding.instanceID == nil)
+                    ForEach(Array(split.visible.enumerated()), id: \.offset) { _, finding in
+                        ercFindingRow(finding, isExcluded: false)
+                    }
+                } header: {
+                    Text("\(split.visible.count) finding\(split.visible.count == 1 ? "" : "s")")
+                        .lineLimit(1)
+                }
+                if !split.excluded.isEmpty {
+                    Section {
+                        ForEach(Array(split.excluded.enumerated()), id: \.offset) { _, finding in
+                            ercFindingRow(finding, isExcluded: true)
+                        }
+                    } header: {
+                        Text("Excluded (\(split.excluded.count))")
+                            .lineLimit(1)
+                    }
+                }
+                if !staleKeys.isEmpty {
+                    Section {
+                        Text("\(staleKeys.count) exclusion\(staleKeys.count == 1 ? "" : "s") no longer match any finding")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                        Button("Remove stale") {
+                            for key in staleKeys {
+                                document.restoreERC(key: key)
+                            }
+                        }
+                        .lineLimit(1)
+                    } header: {
+                        Text("Stale exclusions")
+                            .lineLimit(1)
+                    }
                 }
             }
             .navigationTitle("Electrical Rules Check")
@@ -230,6 +431,46 @@ struct SchematicEditorView: View {
         .preferredColorScheme(.dark)
     }
 
+    /// One ERC finding row: severity + message (tap selects the
+    /// symbol), plus its Exclude / Restore action.
+    private func ercFindingRow(_ finding: ERCFinding, isExcluded: Bool) -> some View {
+        HStack(spacing: 10) {
+            Button {
+                if let id = finding.instanceID {
+                    selection = id
+                    showERC = false
+                }
+            } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: finding.severity == .error
+                          ? "xmark.octagon.fill" : "exclamationmark.triangle.fill")
+                        .foregroundStyle(finding.severity == .error
+                                         ? .red : .orange)
+                        .lineLimit(1)
+                    Text(finding.message)
+                        .font(.callout)
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 0)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(finding.instanceID == nil)
+            if isExcluded {
+                Button("Restore") { document.restoreERC(key: finding.key) }
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            } else {
+                Button("Exclude") { document.excludeERC(key: finding.key) }
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        }
+    }
+
     // MARK: - Saving (schematic + encrypted connection table)
 
     /// Every save writes BOTH files: the schematic JSON and — derived
@@ -239,9 +480,28 @@ struct SchematicEditorView: View {
     /// never leaves a save half-done; a table write failure after the
     /// schematic lands is reported distinctly.
     private func saveSchematic(to url: URL) {
-        let table = ConnectionTableBuilder.build(
+        let table = makeConnectionTable(sourceFileName: url.lastPathComponent)
+        do {
+            try document.save(to: url)
+        } catch {
+            errorMessage = "Could not save that file: \(error.localizedDescription)"
+            return
+        }
+        do {
+            try ConnectionTableStore.save(table, forSchematicFile: url)
+        } catch {
+            errorMessage = "The schematic saved, but its encrypted connection table could not be written: \(error.localizedDescription)"
+        }
+    }
+
+    /// The ONE connection-table construction in this editor:
+    /// saveSchematic writes its result encrypted to disk, and
+    /// the part-5.3 net features (Highlight Net, Net Navigator,
+    /// Select Connection) read membership from the same build.
+    private func makeConnectionTable(sourceFileName: String) -> ConnectionTable {
+        ConnectionTableBuilder.build(
             state: document.state,
-            sourceFileName: url.lastPathComponent,
+            sourceFileName: sourceFileName,
             resolveSymbol: { placed in
                 store.symbol(library: placed.library, name: placed.symbolName)
             },
@@ -258,22 +518,517 @@ struct SchematicEditorView: View {
                 return (key: match.resolved?.resolutionKey,
                         kind: match.kind?.rawValue)
             })
-        do {
-            try document.save(to: url)
-        } catch {
-            errorMessage = "Could not save that file: \(error.localizedDescription)"
+    }
+
+    // MARK: - Net features (part 5.3: S1 highlight, S10 navigator, S11 connection)
+
+    /// The cached table, building it on first use. Arming a
+    /// feature passes `rebuild: true` so the membership always
+    /// reflects the sheet as it stands at that moment.
+    private func ensureHighlightTable(rebuild: Bool = false) -> ConnectionTable {
+        if !rebuild, let highlightTable { return highlightTable }
+        let table = makeConnectionTable(sourceFileName: "")
+        highlightTable = table
+        return table
+    }
+
+    private func setHighlight(_ netName: String) {
+        highlightedNet = netName
+        actionStatus = "Net \(netName) highlighted"
+    }
+
+    private func clearHighlight() {
+        highlightedNet = nil
+        highlightArmed = false
+        actionStatus = nil
+    }
+
+    /// Highlight resolution from a wire tap (S1).
+    private func resolveHighlight(wireID: UUID) {
+        let table = ensureHighlightTable()
+        if let name = table.netName(forWireID: wireID) {
+            setHighlight(name)
+        } else {
+            actionStatus = "That wire is not on any net"
+        }
+    }
+
+    /// Highlight resolution from a symbol-pin tap (S1): the net
+    /// whose endpoints contain this (instance, pin number).
+    private func resolveHighlight(instanceID: UUID, pinNumber: String) {
+        let table = ensureHighlightTable()
+        if let net = table.nets.first(where: { net in
+            net.endpoints.contains {
+                $0.instanceID == instanceID && $0.pinNumber == pinNumber
+            }
+        }) {
+            setHighlight(net.name)
+        } else {
+            actionStatus = "That pin is not on any net"
+        }
+    }
+
+    /// Select Connection resolution (S11): every wire item of
+    /// the tapped wire's net becomes the connection selection.
+    private func resolveConnectionSelection(wireID: UUID) {
+        let table = ensureHighlightTable()
+        guard let name = table.netName(forWireID: wireID) else {
+            actionStatus = "That wire is not on any net"
             return
         }
-        do {
-            try ConnectionTableStore.save(table, forSchematicFile: url)
-        } catch {
-            errorMessage = "The schematic saved, but its encrypted connection table could not be written: \(error.localizedDescription)"
+        connectionSelection = Set(table.wireIDs(forNet: name))
+        connectionNetName = name
+        actionStatus = "\(connectionSelection.count) wires · net \(name)"
+    }
+
+    private func clearConnectionSelection() {
+        connectionSelection = []
+        connectionNetName = nil
+        actionStatus = nil
+    }
+
+    /// Delete with a connection selection (S11): exactly those
+    /// wires, as one undo step through the document.
+    private func deleteConnectionSelection() {
+        let removed = document.deleteWires(connectionSelection)
+        connectionSelection = []
+        connectionNetName = nil
+        actionStatus = removed == 0
+            ? "No wires to delete"
+            : "Deleted \(removed) wire\(removed == 1 ? "" : "s")"
+    }
+
+    /// The Net Navigator sheet (S10): every net from the table,
+    /// sorted by name, with its endpoint count. Tapping a row
+    /// highlights that net (S1 rendering); tapping the active
+    /// row again clears the highlight.
+    private var netsSheet: some View {
+        NavigationStack {
+            List {
+                if let table = highlightTable {
+                    if table.nets.isEmpty {
+                        Text("No nets yet — a net needs at least two connected pins.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                    ForEach(table.nets.sorted { $0.name < $1.name }, id: \.name) { net in
+                        Button {
+                            if highlightedNet == net.name {
+                                clearHighlight()
+                            } else {
+                                setHighlight(net.name)
+                            }
+                        } label: {
+                            HStack(spacing: 10) {
+                                Text(net.name)
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                Spacer(minLength: 0)
+                                Text("\(net.endpoints.count) pins")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                if highlightedNet == net.name {
+                                    Image(systemName: "checkmark")
+                                        .lineLimit(1)
+                                }
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } else {
+                    Text("No nets yet — a net needs at least two connected pins.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Nets")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showNets = false }
+                }
+                if highlightedNet != nil {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Clear Highlight") { clearHighlight() }
+                    }
+                }
+            }
         }
+        .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Find (part 5.3, S2)
+
+    /// The find bar under the top bar: query field, live result
+    /// count, and a button opening the results list.
+    private var findBar: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            TextField("Find reference, value, symbol, footprint or label",
+                      text: $findQuery)
+                .autocorrectionDisabled()
+                .lineLimit(1)
+                .onSubmit { runFind() }
+                .onChange(of: findQuery) { _, _ in runFind() }
+            Text(findQuery.trimmingCharacters(in: .whitespaces).isEmpty
+                 ? "" : "\(findResults.count) match\(findResults.count == 1 ? "" : "es")")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+            Button("Results") { showFindResults = true }
+                .lineLimit(1)
+                .fixedSize(horizontal: true, vertical: false)
+                .disabled(findResults.isEmpty)
+            Button {
+                showFind = false
+                findQuery = ""
+                findResults = []
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(white: 0.13))
+    }
+
+    private func runFind() {
+        findResults = document.findMatches(query: findQuery)
+    }
+
+    /// Tapping a result (S2): a symbol match selects + centres
+    /// the symbol; a label match centres on the label's point.
+    private func focusFindMatch(_ match: SchematicFindMatch) {
+        if let symbolID = match.symbolID,
+           let placed = document.state.symbols.first(where: { $0.id == symbolID }) {
+            selection = symbolID
+            showProperties = true
+            canvasState.centre(on: placed.origin)
+            actionStatus = "Found \(placed.reference)"
+        } else if let labelID = match.labelID,
+                  let label = document.state.labels.first(where: { $0.id == labelID }) {
+            canvasState.centre(on: label.at)
+            actionStatus = "Found label “\(label.text)”"
+        }
+        showFindResults = false
+    }
+
+    private func findFieldTag(_ field: SchematicFindMatch.Field) -> String {
+        switch field {
+        case .reference: return "Reference"
+        case .value: return "Value"
+        case .symbolName: return "Symbol"
+        case .footprint: return "Footprint"
+        case .label: return "Label"
+        }
+    }
+
+    private var findResultsSheet: some View {
+        NavigationStack {
+            List {
+                if findResults.isEmpty {
+                    Text("No matches for “\(findQuery)”.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(Array(findResults.enumerated()), id: \.offset) { _, match in
+                    Button {
+                        focusFindMatch(match)
+                    } label: {
+                        HStack(spacing: 10) {
+                            Text(findFieldTag(match.field))
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(.white)
+                                .lineLimit(1)
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.accentColor,
+                                            in: RoundedRectangle(cornerRadius: 4))
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(match.text)
+                                    .font(.callout.weight(.semibold))
+                                    .foregroundStyle(.primary)
+                                    .lineLimit(1)
+                                if match.symbolID != nil {
+                                    Text(match.reference)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                            }
+                            Spacer(minLength: 0)
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            .navigationTitle("Find Results")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showFindResults = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Clean up sheet (part 5.3, S3)
+
+    /// Clean Up: every pin world point of the sheet (resolved
+    /// through the store, drawn-list geometry — the same points
+    /// the save flow's table builder uses) feeds the document's
+    /// one-step cleanup; the report names each non-zero rule in
+    /// plain words.
+    private func cleanUpSheet() {
+        var pinPoints: [DPoint] = []
+        for placed in document.state.symbols {
+            if let def = store.symbol(library: placed.library,
+                                      name: placed.symbolName) {
+                pinPoints += SymbolDrawList.pinWorldPoints(
+                    def: def, placed: placed).map { $0.point }
+            }
+        }
+        let counts = document.cleanUpSheet(pinPoints: pinPoints)
+        func phrase(_ key: String, _ one: String, _ many: String) -> String? {
+            guard let n = counts[key], n > 0 else { return nil }
+            return "\(n) \(n == 1 ? one : many)"
+        }
+        var parts: [String] = []
+        if let p = phrase("nullWires", "zero-length wire removed",
+                          "zero-length wires removed") { parts.append(p) }
+        if let p = phrase("duplicateWires", "duplicate wire removed",
+                          "duplicate wires removed") { parts.append(p) }
+        if let p = phrase("mergedWires", "collinear segment merged",
+                          "collinear segments merged") { parts.append(p) }
+        if let p = phrase("isolatedWires", "isolated wire removed",
+                          "isolated wires removed") { parts.append(p) }
+        if let p = phrase("duplicateJunctions", "duplicate junction removed",
+                          "duplicate junctions removed") { parts.append(p) }
+        if let p = phrase("droppedJunctions", "dangling junction removed",
+                          "dangling junctions removed") { parts.append(p) }
+        if parts.isEmpty {
+            infoMessage = "Sheet is already clean"
+        } else {
+            let joined = parts.joined(separator: ", ")
+            let summary = joined.prefix(1).uppercased() + String(joined.dropFirst())
+            infoMessage = summary + ". Undo puts everything back."
+            resetNetState()
+        }
+    }
+
+    // MARK: - Fields table (part 5.3, S6)
+
+    /// Opens the fields sheet: rows + edit seed snapshotted from
+    /// the document, so Cancel is a pure discard.
+    private func openFields() {
+        let rows = document.fieldRows()
+        fieldRowsSnapshot = rows
+        let seed = Dictionary(uniqueKeysWithValues: rows.map {
+            ($0.instanceID, FieldEdit(value: $0.value, footprint: $0.footprint))
+        })
+        fieldSeed = seed
+        fieldEdits = seed
+        showFields = true
+    }
+
+    private func fieldValueBinding(for row: SymbolFieldRow) -> Binding<String> {
+        Binding(
+            get: { fieldEdits[row.instanceID]?.value ?? row.value },
+            set: { newValue in
+                var edit = fieldEdits[row.instanceID]
+                    ?? FieldEdit(value: row.value, footprint: row.footprint)
+                edit.value = newValue
+                fieldEdits[row.instanceID] = edit
+            })
+    }
+
+    private func fieldFootprintBinding(for row: SymbolFieldRow) -> Binding<String> {
+        Binding(
+            get: { fieldEdits[row.instanceID]?.footprint ?? row.footprint },
+            set: { newValue in
+                var edit = fieldEdits[row.instanceID]
+                    ?? FieldEdit(value: row.value, footprint: row.footprint)
+                edit.footprint = newValue
+                fieldEdits[row.instanceID] = edit
+            })
+    }
+
+    /// Apply: only rows the user actually changed go to the
+    /// document, which commits them as one undo step.
+    private func applyFields() {
+        var changed: [UUID: FieldEdit] = [:]
+        for (id, edit) in fieldEdits where edit != fieldSeed[id] {
+            changed[id] = edit
+        }
+        let updated = document.applyFieldEdits(changed)
+        showFields = false
+        actionStatus = updated == 0
+            ? "No changes"
+            : "\(updated) fields updated"
+    }
+
+    private var fieldsSheet: some View {
+        NavigationStack {
+            List {
+                if fieldRowsSnapshot.isEmpty {
+                    Text("No symbols on this sheet yet.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(fieldRowsSnapshot) { row in
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            Text(row.reference)
+                                .font(.callout.weight(.bold))
+                                .lineLimit(1)
+                            Text("Unit \(SchematicEditorSupport.unitLetter(row.unit))")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            Spacer(minLength: 0)
+                            Text(row.symbolName)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+                        HStack(spacing: 8) {
+                            Text("Value")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .frame(width: 64, alignment: .leading)
+                            TextField("Value", text: fieldValueBinding(for: row))
+                                .textFieldStyle(.roundedBorder)
+                                .autocorrectionDisabled()
+                        }
+                        HStack(spacing: 8) {
+                            Text("Footprint")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .frame(width: 64, alignment: .leading)
+                            TextField("Footprint choice", text: fieldFootprintBinding(for: row))
+                                .textFieldStyle(.roundedBorder)
+                                .autocorrectionDisabled()
+                        }
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+            .navigationTitle("Symbol Fields")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showFields = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Apply") { applyFields() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    // MARK: - Annotate options (part 5.3, S7)
+
+    private var annotateSheet: some View {
+        NavigationStack {
+            Form {
+                Picker("Sort order", selection: $annotateSortRaw) {
+                    Text("Sheet order").lineLimit(1).tag(0)
+                    Text("By X").lineLimit(1).tag(1)
+                    Text("By Y").lineLimit(1).tag(2)
+                }
+                Toggle("Reset all references", isOn: $annotateResetAll)
+                HStack(spacing: 10) {
+                    Text("Start number")
+                        .lineLimit(1)
+                    Spacer(minLength: 0)
+                    TextField("1", text: $annotateStartText)
+                        .keyboardType(.numberPad)
+                        .multilineTextAlignment(.trailing)
+                        .frame(width: 80)
+                }
+            }
+            .navigationTitle("Annotate")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showAnnotateOptions = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Annotate") { runAnnotate() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func runAnnotate() {
+        let sortOrder: AnnotateOptions.SortOrder
+        switch annotateSortRaw {
+        case 1: sortOrder = .byX
+        case 2: sortOrder = .byY
+        default: sortOrder = .sheetOrder
+        }
+        let options = AnnotateOptions(
+            sortOrder: sortOrder,
+            resetAll: annotateResetAll,
+            startNumber: Int(annotateStartText) ?? 1)
+        let changed = document.annotateReferences(options: options)
+        showAnnotateOptions = false
+        actionStatus = changed == 0
+            ? "Every reference was already annotated — nothing changed."
+            : "Annotated \(changed) reference(s). Undo puts the old references back."
+    }
+
+    // MARK: - Align / zoom to selection (part 5.3, S12 / P17)
+
+    /// Align to Grid: the selected symbol's pin world points
+    /// (store definition + drawn-list geometry) go to the
+    /// document, which snaps it and carries its connections.
+    private func alignSelectedToGrid() {
+        guard let placed = selectedPlaced, let def = selectedDef else { return }
+        let pinPoints = SymbolDrawList.pinWorldPoints(
+            def: def, placed: placed).map { $0.point }
+        let aligned = document.alignSymbolToGrid(id: placed.id,
+                                                 pinPoints: pinPoints)
+        actionStatus = aligned
+            ? "Aligned \(placed.reference) to the grid"
+            : "Already on grid"
+    }
+
+    /// Zoom to Selection: frame the selected symbol's placed
+    /// bounds (the renderer's own bounds helper).
+    private func zoomToSelection() {
+        guard let placed = selectedPlaced, let def = selectedDef else {
+            actionStatus = "Select a symbol first, then Zoom to Selection"
+            return
+        }
+        let bounds = SymbolRenderer.placedBounds(def: def, placed: placed)
+        canvasState.frame(rect: bounds, size: canvasState.canvasSize)
     }
 
     // MARK: - Top bar
 
     private var topBar: some View {
+        // Part 5.3 added Highlight Net / Nets / Find / Clean Up /
+        // Fields / Zoom to Selection to this row — wider than the
+        // panel at some sizes, so the row scrolls horizontally
+        // instead of clipping or wrapping a label.
+        ScrollView(.horizontal, showsIndicators: false) {
         HStack(spacing: 10) {
             topButton(icon: "folder", label: "Open") { showOpen = true }
                 .keyboardShortcut("o", modifiers: .command)
@@ -292,10 +1047,7 @@ struct SchematicEditorView: View {
             barDivider
 
             topButton(icon: "list.number", label: "Annotate") {
-                let changed = document.annotateReferences()
-                infoMessage = changed == 0
-                    ? "Every reference was already annotated — nothing changed."
-                    : "Annotated \(changed) reference(s). Undo puts the old references back."
+                showAnnotateOptions = true
             }
             topButton(icon: "checklist", label: "ERC") {
                 ercFindings = SchematicERC.check(
@@ -305,6 +1057,39 @@ struct SchematicEditorView: View {
                                      name: placed.symbolName)
                     })
                 showERC = true
+            }
+
+            barDivider
+
+            // Part 5.3 net + sheet tools (S1, S10, S2, S3, S6).
+            topButton(icon: "bolt", label: highlightArmed ? "Tap a Wire or Pin" : "Highlight Net") {
+                if highlightArmed {
+                    highlightArmed = false
+                } else {
+                    _ = ensureHighlightTable(rebuild: true)
+                    selectConnectionArmed = false
+                    highlightArmed = true
+                    actionStatus = "Tap a wire or a symbol pin to highlight its net"
+                }
+            }
+            if highlightedNet != nil {
+                topButton(icon: "xmark.circle", label: "Clear Highlight") {
+                    clearHighlight()
+                }
+            }
+            topButton(icon: "point.3.connected.trianglepath.dotted", label: "Nets") {
+                _ = ensureHighlightTable(rebuild: true)
+                showNets = true
+            }
+            topButton(icon: "magnifyingglass", label: "Find") {
+                showFind.toggle()
+                if showFind { runFind() }
+            }
+            topButton(icon: "sparkles", label: "Clean Up") {
+                cleanUpSheet()
+            }
+            topButton(icon: "tablecells", label: "Fields") {
+                openFields()
             }
 
             barDivider
@@ -322,6 +1107,9 @@ struct SchematicEditorView: View {
             topButton(icon: "plus.magnifyingglass", label: "Zoom In") { canvasState.zoomIn() }
             topButton(icon: "arrow.up.left.and.down.right.magnifyingglass", label: "Fit") {
                 canvasState.fit(document)
+            }
+            topButton(icon: "scope", label: "Zoom to Selection") {
+                zoomToSelection()
             }
 
             barDivider
@@ -349,6 +1137,7 @@ struct SchematicEditorView: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+        }
         .background(Color(white: 0.15))
     }
 
@@ -391,6 +1180,7 @@ struct SchematicEditorView: View {
             toolButton(tool: .wire, icon: "cable.connector", caption: "Wire")
             toolButton(tool: .junction, icon: "circle.circle", caption: "Junction")
             toolButton(tool: .label, icon: "tag", caption: "Label")
+            toolButton(tool: .noConnect, icon: "xmark", caption: "No Conn")
             toolButton(tool: .delete, icon: "trash", caption: "Delete")
             Spacer(minLength: 0)
         }
@@ -423,6 +1213,25 @@ struct SchematicEditorView: View {
                 if let url = selectedDatasheetURL { openURL(url) }
             }
             .disabled(selectedDatasheetURL == nil)
+            // Part 5.3, S11: arm Select Connection — the next
+            // canvas tap on a wire selects its whole net's wires.
+            actionToolButton(icon: "arrow.triangle.branch", caption: "Connect",
+                             isActive: selectConnectionArmed) {
+                if selectConnectionArmed {
+                    selectConnectionArmed = false
+                } else {
+                    _ = ensureHighlightTable()
+                    highlightArmed = false
+                    selectConnectionArmed = true
+                    actionStatus = "Tap a wire to select its whole connection"
+                }
+            }
+            // Part 5.3, S12: snap the selected symbol to the grid,
+            // connections following its pins.
+            actionToolButton(icon: "grid", caption: "Align") {
+                alignSelectedToGrid()
+            }
+            .disabled(selection == nil)
             actionToolButton(icon: "sidebar.right", caption: "Props",
                              isActive: showProperties) {
                 showProperties.toggle()
@@ -503,6 +1312,11 @@ struct SchematicEditorView: View {
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .lineLimit(1)
+            if let actionStatus {
+                Text(actionStatus)
+                    .font(.caption.weight(.semibold))
+                    .lineLimit(1)
+            }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 12)
@@ -529,6 +1343,7 @@ struct SchematicEditorView: View {
         case .wire: return "Wire"
         case .junction: return "Junction"
         case .label: return "Label"
+        case .noConnect: return "No Connect"
         case .delete: return "Delete"
         }
     }
@@ -584,6 +1399,12 @@ private struct SymbolPropertiesCard: View {
     @EnvironmentObject private var footprintStore: FootprintStore
     var onClose: () -> Void
     var onSelect: (UUID) -> Void
+    /// Part 5.3 card actions owned by the editor (cross-probe,
+    /// chooser swap, library update + their status reporting).
+    /// Defaulted so the card keeps one construction pattern.
+    var onShowOnBoard: () -> Void = {}
+    var onChangeSymbol: () -> Void = {}
+    var onUpdateFromLibrary: () -> Void = {}
 
     @State private var refDraft = ""
     @State private var valueDraft = ""
@@ -699,6 +1520,8 @@ private struct SymbolPropertiesCard: View {
                     }
                     Divider()
                     actionButtons
+                    Divider()
+                    symbolActions
                 }
                 .padding(14)
             }
@@ -823,6 +1646,25 @@ private struct SymbolPropertiesCard: View {
                 cardButton(icon: "trash", label: "Delete", destructive: true) {
                     document.deleteSymbol(id: placedID)
                     onClose()
+                }
+            }
+        }
+    }
+
+    /// Part 5.3 card actions: cross-probe to the board (S8) and
+    /// the Change / Update Symbol pair (S5). Full-width rows —
+    /// these labels do not fit the three-across button grid.
+    private var symbolActions: some View {
+        VStack(spacing: 8) {
+            cardButton(icon: "circuitboard", label: "Show on Board") {
+                onShowOnBoard()
+            }
+            HStack(spacing: 8) {
+                cardButton(icon: "arrow.left.arrow.right", label: "Change Symbol…") {
+                    onChangeSymbol()
+                }
+                cardButton(icon: "arrow.clockwise", label: "Update from Library") {
+                    onUpdateFromLibrary()
                 }
             }
         }

@@ -33,6 +33,8 @@
 		ED061E3E69B0FF5FA85DA2EA = {isa = PBXBuildFile; fileRef = 78F5DDE7027E4B5FE3575AA4; };
 		66D51099C28EC7E4889D8E18 = {isa = PBXBuildFile; fileRef = 4BE74291B5A09CF26CD51BBF; };
 		718F7E9C9805078C23565A7E = {isa = PBXBuildFile; fileRef = 9C7EFA4EE44A116E24340010; };
+		B298441BB2FBDE6B7238890F = {isa = PBXBuildFile; fileRef = 55A42187A58F54F6FD9CDC05; };
+		98C29A50B6320E6C3FF01681 = {isa = PBXBuildFile; fileRef = 0BE7DF646473902374BF343E; };
 		0F15F06CC3A3F35233925645 = {isa = PBXBuildFile; fileRef = 8BFFC205A534FC8EA370874A; };
 		1C19026F54EA37768D9382D3 = {isa = PBXBuildFile; fileRef = 53A0311B05DDE8827ABE1837; };
 		277DEAEA55019486EBED2CAB = {isa = PBXBuildFile; fileRef = D75751A9FF624D7D05EE7A16; };
@@ -65,6 +67,8 @@
 		78F5DDE7027E4B5FE3575AA4 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PCBBoardState.swift; sourceTree = "<group>"; };
 		4BE74291B5A09CF26CD51BBF = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PCBDesignChecks.swift; sourceTree = "<group>"; };
 		9C7EFA4EE44A116E24340010 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TheoryAIBridge.swift; sourceTree = "<group>"; };
+		55A42187A58F54F6FD9CDC05 = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SessionBridge.swift; sourceTree = "<group>"; };
+		0BE7DF646473902374BF343E = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ExternalDisplay.swift; sourceTree = "<group>"; };
 		8BFFC205A534FC8EA370874A = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		53A0311B05DDE8827ABE1837 = {isa = PBXFileReference; lastKnownFileType = folder; path = Symbols; sourceTree = "<group>"; };
 		D75751A9FF624D7D05EE7A16 = {isa = PBXFileReference; lastKnownFileType = folder; path = Footprints; sourceTree = "<group>"; };
@@ -129,6 +133,8 @@
 				78F5DDE7027E4B5FE3575AA4,
 				4BE74291B5A09CF26CD51BBF,
 				9C7EFA4EE44A116E24340010,
+				55A42187A58F54F6FD9CDC05,
+				0BE7DF646473902374BF343E,
 				53A0311B05DDE8827ABE1837,
 				D75751A9FF624D7D05EE7A16,
 				CDA78191F08760227FF2C479,
@@ -232,6 +238,8 @@
 				ED061E3E69B0FF5FA85DA2EA,
 				66D51099C28EC7E4889D8E18,
 				718F7E9C9805078C23565A7E,
+				B298441BB2FBDE6B7238890F,
+				98C29A50B6320E6C3FF01681,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

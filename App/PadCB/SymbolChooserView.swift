@@ -11,6 +11,13 @@ struct SymbolChooserView: View {
     @ObservedObject var store: LibraryStore
     @EnvironmentObject private var footprintStore: FootprintStore
     let powerOnly: Bool
+    /// Swap mode (part 5.3, S5): the same chooser, presented to
+    /// CHANGE the selected symbol's definition in place instead
+    /// of placing a new one. Only the titles differ — the pick
+    /// still delivers the definition through `onPick`, and the
+    /// editor routes it to `changeSymbol` when a swap target is
+    /// set. Defaulted so the placement call sites are unchanged.
+    let swapMode: Bool
     var onPick: (KiCadSymbolDef) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -41,9 +48,11 @@ struct SymbolChooserView: View {
 
     private static let searchRowCap = 800
 
-    init(store: LibraryStore, powerOnly: Bool, onPick: @escaping (KiCadSymbolDef) -> Void) {
+    init(store: LibraryStore, powerOnly: Bool, swapMode: Bool = false,
+         onPick: @escaping (KiCadSymbolDef) -> Void) {
         _store = ObservedObject(wrappedValue: store)
         self.powerOnly = powerOnly
+        self.swapMode = swapMode
         self.onPick = onPick
     }
 
@@ -155,7 +164,8 @@ struct SymbolChooserView: View {
                 }
             }
             .background(Color(white: 0.10))
-            .navigationTitle(powerOnly ? "Choose Power Symbol" : "Choose Symbol")
+            .navigationTitle(powerOnly ? "Choose Power Symbol"
+                             : (swapMode ? "Change Symbol" : "Choose Symbol"))
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -626,7 +636,7 @@ struct SymbolChooserView: View {
                     dismiss()
                 }
             } label: {
-                Text("Place Symbol")
+                Text(swapMode ? "Change Symbol" : "Place Symbol")
                     .font(.body.weight(.semibold))
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)

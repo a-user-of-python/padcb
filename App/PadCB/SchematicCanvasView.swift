@@ -17,6 +17,41 @@ final class CanvasViewState: ObservableObject {
     func zoomIn() { scale = min(scale * 1.3, Self.maxScale) }
     func zoomOut() { scale = max(scale / 1.3, Self.minScale) }
 
+    /// Centres the view on a world point (part 5.3, S2/S8),
+    /// keeping the current zoom unless `scale` names a new one.
+    /// Mirrors fit's offset math: screen = (offset.x + x*scale,
+    /// offset.y - y*scale), so the point lands at the canvas
+    /// centre when offset = centre -/+ point * scale. No-op
+    /// until the canvas has registered its size.
+    func centre(on point: DPoint, scale newScale: CGFloat? = nil) {
+        guard canvasSize.width > 10, canvasSize.height > 10 else { return }
+        if let newScale {
+            scale = min(max(newScale, Self.minScale), Self.maxScale)
+        }
+        offset = CGPoint(x: canvasSize.width / 2 - CGFloat(point.x) * scale,
+                         y: canvasSize.height / 2 + CGFloat(point.y) * scale)
+    }
+
+    /// Frames an arbitrary world-space rect (part 5.3, P17 —
+    /// Zoom to Selection), mirroring fit's math: 8 mm of padding
+    /// around the rect, a 32 pt screen margin, the scale clamped
+    /// to the usual range, and the rect's centre at the canvas
+    /// centre.
+    func frame(rect: CGRect, size: CGSize) {
+        guard size.width > 10, size.height > 10 else { return }
+        let pad = 8.0
+        let minX = Double(rect.minX) - pad, maxX = Double(rect.maxX) + pad
+        let minY = Double(rect.minY) - pad, maxY = Double(rect.maxY) + pad
+        let w = max(maxX - minX, 1), h = max(maxY - minY, 1)
+        let sx = (size.width - 32) / CGFloat(w)
+        let sy = (size.height - 32) / CGFloat(h)
+        let newScale = min(max(min(sx, sy), Self.minScale), Self.maxScale)
+        let cx = (minX + maxX) / 2, cy = (minY + maxY) / 2
+        scale = newScale
+        offset = CGPoint(x: size.width / 2 - CGFloat(cx) * newScale,
+                         y: size.height / 2 + CGFloat(cy) * newScale)
+    }
+
     /// Registered by SchematicCanvasView so the editor's toolbar Fit button
     /// can call `fit(_:)` without owning a store reference or canvas size.
     var store: LibraryStore?
@@ -86,6 +121,40 @@ struct SchematicCanvasView: View {
     var pendingSymbol: KiCadSymbolDef?
     var onRequestSymbolChooser: (Bool) -> Void = { _ in }
     var onConsumePlacementDone: () -> Void = {}
+
+    // Part 5.3 (S1/S10/S11): net highlight + connection selection.
+    // All DEFAULTED — the external-display mirror constructs this
+    // view with none of them and keeps compiling/rendering plainly.
+    /// Wire items belonging to the highlighted net (full strength,
+    /// accent colour while a highlight is active).
+    var highlightedWireIDs: Set<UUID> = []
+    /// Symbol instances on the highlighted net (full strength;
+    /// every other symbol draws dimmed while a highlight is active).
+    var highlightedSymbolIDs: Set<UUID> = []
+    /// True while a net highlight is active (even in the edge case
+    /// where the net's member sets are both empty).
+    var isHighlightActive: Bool = false
+    /// Wire items in the Select Connection selection (S11), drawn
+    /// in the selection colour; Delete removes exactly these.
+    var connectionSelectedWireIDs: Set<UUID> = []
+    /// One-shot modes armed by the editor's top/right bars. While
+    /// either is armed, the next Select-tool tap on a wire (or, for
+    /// highlight, a symbol pin) is consumed by the mode instead of
+    /// changing the symbol selection; the canvas disarms on a hit.
+    var highlightArmed: Binding<Bool> = .constant(false)
+    var selectConnectionArmed: Binding<Bool> = .constant(false)
+    /// A highlighted-mode tap hit this wire item.
+    var onHighlightWire: (UUID) -> Void = { _ in }
+    /// A highlighted-mode tap hit this symbol instance's pin.
+    var onHighlightPin: (UUID, String) -> Void = { _, _ in }
+    /// A Select Connection tap hit this wire item.
+    var onSelectConnectionWire: (UUID) -> Void = { _ in }
+    /// Esc with a highlight active / Delete-or-Esc with a
+    /// connection selection: the editor owns that state, the
+    /// canvas just forwards the key intent.
+    var onClearHighlight: () -> Void = {}
+    var onClearConnectionSelection: () -> Void = {}
+    var onDeleteConnectionSelection: () -> Void = {}
 
     // Drag bookkeeping
     private enum DragKind { case none, pan, moveSymbol, track }
@@ -219,6 +288,42 @@ struct SchematicCanvasView: View {
         return nil
     }
 
+    /// The nearest pin with its owning instance + pin number
+    /// (part 5.3, S1: a pin tap resolves its net through the
+    /// connection table's endpoints). Same threshold as
+    /// `nearestPin(to:defs:)`.
+    private func nearestPinInfo(to w: DPoint, defs: [UUID: KiCadSymbolDef])
+        -> (instanceID: UUID, pinNumber: String, point: DPoint, distance: Double)? {
+        var best: (instanceID: UUID, pinNumber: String, point: DPoint, distance: Double)?
+        for s in document.state.symbols {
+            guard let d = defs[s.id] else { continue }
+            for entry in SymbolRenderer.pinWorldPoints(def: d, placed: s) {
+                let dist = w.distance(to: entry.point)
+                if best == nil || dist < best!.distance {
+                    best = (s.id, entry.pin.number, entry.point, dist)
+                }
+            }
+        }
+        let threshold = max(0.9, 7.0 / scaleD)
+        if let best, best.distance <= threshold { return best }
+        return nil
+    }
+
+    /// The first wire item whose segments pass within tap
+    /// tolerance of the world point — the same hit test the
+    /// Delete tool uses (part 5.3, S1/S11 tap resolution).
+    private func wireAt(_ w: DPoint) -> WireItem? {
+        let tol = max(0.9, 6.0 / scaleD)
+        for wire in document.state.wires {
+            for i in 0..<(wire.points.count - 1) {
+                if Self.pointSegmentDistance(w, wire.points[i], wire.points[i + 1]).distance <= tol {
+                    return wire
+                }
+            }
+        }
+        return nil
+    }
+
     private static func pointSegmentDistance(_ p: DPoint, _ a: DPoint, _ b: DPoint) -> (distance: Double, projected: DPoint) {
         let abx = b.x - a.x, aby = b.y - a.y
         let lenSq = abx * abx + aby * aby
@@ -346,7 +451,12 @@ struct SchematicCanvasView: View {
         guard dragKind == .none else { return }
         switch tool {
         case .select:
-            if let hit = symbolAt(world(startLocation), defs: defsByID) {
+            if highlightArmed.wrappedValue || selectConnectionArmed.wrappedValue {
+                // Armed one-shot modes (part 5.3): a press must not
+                // start a symbol drag or change the selection — the
+                // tap split in handlePanEnded resolves the mode.
+                dragKind = .track
+            } else if let hit = symbolAt(world(startLocation), defs: defsByID) {
                 dragKind = .moveSymbol
                 dragSymbolID = hit.id
                 selection = hit.id
@@ -471,6 +581,27 @@ struct SchematicCanvasView: View {
 
     private func handleTap(at location: CGPoint) {
         let w = world(location)
+        // Part 5.3 one-shot modes intercept Select-tool taps. A tap
+        // that hits nothing the mode can use leaves it armed.
+        if tool == .select {
+            if selectConnectionArmed.wrappedValue, let wire = wireAt(w) {
+                selectConnectionArmed.wrappedValue = false
+                onSelectConnectionWire(wire.id)
+                return
+            }
+            if highlightArmed.wrappedValue {
+                if let wire = wireAt(w) {
+                    highlightArmed.wrappedValue = false
+                    onHighlightWire(wire.id)
+                    return
+                }
+                if let pin = nearestPinInfo(to: w, defs: defsByID) {
+                    highlightArmed.wrappedValue = false
+                    onHighlightPin(pin.instanceID, pin.pinNumber)
+                    return
+                }
+            }
+        }
         switch tool {
         case .select:
             selection = symbolAt(w, defs: defsByID)?.id
@@ -484,8 +615,24 @@ struct SchematicCanvasView: View {
             labelPoint = snap(w)
             labelText = ""
             showingLabelAlert = true
+        case .noConnect:
+            noConnectTap(at: w)
         case .delete:
             deleteTap(at: w)
+        }
+    }
+
+    /// No-connect tool (part 5.3, S4): tap places a flag at the
+    /// snapped point (the junction tool's grid snap); tapping
+    /// within one grid step of an existing flag removes it.
+    private func noConnectTap(at w: DPoint) {
+        let p = snap(w)
+        if let existing = document.state.noConnects.first(where: {
+            $0.at.distance(to: p) <= Self.grid + 1e-9
+        }) {
+            document.removeNoConnect(id: existing.id)
+        } else {
+            document.addNoConnect(at: p)
         }
     }
 
@@ -692,6 +839,12 @@ struct SchematicCanvasView: View {
             lastWireTap = nil
             wireDragStart = nil
             wireDragActive = false
+        } else if !connectionSelectedWireIDs.isEmpty {
+            // Part 5.3, S11: Esc clears the connection selection.
+            onClearConnectionSelection()
+        } else if isHighlightActive {
+            // Part 5.3, S1: Esc clears the net highlight.
+            onClearHighlight()
         } else if tool == .placeSymbol || tool == .placePower {
             tool = .select
             onConsumePlacementDone()
@@ -727,6 +880,13 @@ struct SchematicCanvasView: View {
     }
 
     private func deleteSelection() {
+        // Part 5.3, S11: with a connection selection, Delete
+        // removes exactly those wires (the editor does it as one
+        // undo step through deleteWires) instead of the symbol.
+        if !connectionSelectedWireIDs.isEmpty {
+            onDeleteConnectionSelection()
+            return
+        }
         if let id = selection {
             document.deleteSymbol(id: id)
             selection = nil
@@ -755,13 +915,27 @@ extension SchematicCanvasView {
 
         drawGrid(&ctx, size: size)
 
-        // Wires
+        // Wires (part 5.3: while a net highlight is active, members
+        // draw full strength in the accent colour and non-members
+        // dim to ~0.25; connection-selected wires draw in the
+        // selection colour, which wins over the highlight).
+        let highlightActive = isHighlightActive
+            || !highlightedWireIDs.isEmpty || !highlightedSymbolIDs.isEmpty
         let wireWidth = max(0.15 * scaleD, 1.0)
         for w in document.state.wires where w.points.count >= 2 {
             var path = Path()
             path.move(to: screen(w.points[0]))
             for p in w.points.dropFirst() { path.addLine(to: screen(p)) }
-            ctx.stroke(path, with: .color(Self.wireColor),
+            let color: Color
+            if connectionSelectedWireIDs.contains(w.id) {
+                color = .orange
+            } else if highlightActive {
+                color = highlightedWireIDs.contains(w.id)
+                    ? .accentColor : Self.wireColor.opacity(0.25)
+            } else {
+                color = Self.wireColor
+            }
+            ctx.stroke(path, with: .color(color),
                        style: StrokeStyle(lineWidth: CGFloat(wireWidth), lineCap: .round, lineJoin: .round))
         }
 
@@ -773,6 +947,24 @@ extension SchematicCanvasView {
                      with: .color(Self.wireColor))
         }
 
+        // No-connect flags (part 5.3, S4): an × marker about one
+        // grid step across, in the accent colour — the same
+        // treatment KiCad gives SCH_NO_CONNECT items.
+        if !document.state.noConnects.isEmpty {
+            let half = CGFloat(max(0.635 * scaleD, 3.5))
+            var path = Path()
+            for item in document.state.noConnects {
+                let c = screen(item.at)
+                path.move(to: CGPoint(x: c.x - half, y: c.y - half))
+                path.addLine(to: CGPoint(x: c.x + half, y: c.y + half))
+                path.move(to: CGPoint(x: c.x - half, y: c.y + half))
+                path.addLine(to: CGPoint(x: c.x + half, y: c.y - half))
+            }
+            ctx.stroke(path, with: .color(.accentColor),
+                       style: StrokeStyle(lineWidth: max(1.5, CGFloat(0.15 * scaleD)),
+                                          lineCap: .round))
+        }
+
         // Labels (KiCad label texts support _{...} markup -> KiCadText)
         for l in document.state.labels {
             let sizePt = max(CGFloat(1.27 * scaleD), 9)
@@ -782,14 +974,20 @@ extension SchematicCanvasView {
                            anchor: UnitPoint(x: 0, y: 1), bold: false, italic: false)
         }
 
-        // Symbols + property texts
+        // Symbols + property texts (part 5.3: while a net highlight
+        // is active, symbols off the net draw dimmed to ~0.25 —
+        // a context copy's opacity, so the renderer is untouched).
         for s in document.state.symbols {
             let placed = effectivePlaced(s)
+            var sctx = ctx
+            if highlightActive && !highlightedSymbolIDs.contains(s.id) {
+                sctx.opacity = 0.25
+            }
             if let def = defs[s.id] {
-                drawSymbol(&ctx, def: def, placed: placed)
-                drawPropertyTexts(&ctx, def: def, placed: placed)
+                drawSymbol(&sctx, def: def, placed: placed)
+                drawPropertyTexts(&sctx, def: def, placed: placed)
             } else {
-                drawMissingDefPlaceholder(&ctx, placed: placed)
+                drawMissingDefPlaceholder(&sctx, placed: placed)
             }
         }
 

@@ -18,8 +18,23 @@ import UIKit
 /// pre-gate one, unchanged.
 @main
 struct PadCBApp: App {
-    @StateObject private var store = LibraryStore()
-    @StateObject private var footprintStore = FootprintStore()
+    // Part 5.3: the stores come FROM the session hub
+    // (SessionBridge.swift) so the UIKit-instantiated external
+    // display scene reaches the SAME objects through
+    // `AppSessionHub.shared`. The cross-probe and live-session
+    // registry are the hub's instances too, injected alongside.
+    @StateObject private var store = AppSessionHub.shared.libraryStore
+    @StateObject private var footprintStore = AppSessionHub.shared.footprintStore
+    private let crossProbe = AppSessionHub.shared.crossProbe
+    private let liveSession = AppSessionHub.shared.liveSession
+
+    init() {
+        // Part 5.3 rider: arm the UIScreen connect/disconnect
+        // fallback for external displays (the scene-manifest path
+        // in Info.plist is primary; the coordinator guarantees one
+        // window per display either way).
+        ExternalDisplayCoordinator.shared.start()
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -45,15 +60,21 @@ struct PadCBApp: App {
             HoverCheckRootView()
                 .environmentObject(store)
                 .environmentObject(footprintStore)
+                .environmentObject(crossProbe)
+                .environmentObject(liveSession)
         } else {
             HomeView()
                 .environmentObject(store)
                 .environmentObject(footprintStore)
+                .environmentObject(crossProbe)
+                .environmentObject(liveSession)
         }
         #else
         HomeView()
             .environmentObject(store)
             .environmentObject(footprintStore)
+            .environmentObject(crossProbe)
+            .environmentObject(liveSession)
         #endif
     }
 }

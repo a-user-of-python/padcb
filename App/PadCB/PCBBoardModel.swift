@@ -94,6 +94,8 @@ struct BoardModel {
     /// Placed vias + copper fill zones (part 5), merged the same way.
     var vias: [BoardVia] = []
     var zones: [BoardZone] = []
+    /// Teardrop copper polygons (part 5.3), merged the same way.
+    var teardrops: [TeardropItem] = []
     /// Problems that belong to the merged board as a whole (part 4):
     /// traces whose net vanished from the schematic, kept visible
     /// here instead of being silently dropped.
@@ -492,6 +494,71 @@ enum PCBBoardModelBuilder {
             }
         }
         return (ca.count - i) < (cb.count - j)
+    }
+}
+
+// MARK: - Update footprints from library (part 5.3, P10)
+//
+// Is the builder fresh-per-build? YES at the builder level — and
+// this function exists because the MODEL is not: build() calls
+// its resolveFootprint closure once per component on EVERY build
+// (the editor's closure re-reads FootprintStore —
+// entry(forResolutionKey:) + footprint(for:) — on every open and
+// every sync), so a fresh build always sees the store's current
+// definitions. But the BoardModel VALUE a caller already holds
+// snapshots the parsed KiCadFootprint per component: nothing in
+// it changes when the library does. refreshed(model:store:) is
+// the in-place equivalent of rebuilding just the footprint
+// definitions: every component with a footprintKey is re-resolved
+// through the store's CURRENT entries, its parsed footprint is
+// replaced, its pins are re-bound to the new footprint's pads BY
+// NUMBER (first pad per distinct number — the builder's rule),
+// and its bounds size follows the new footprint. Origins, sides,
+// values, nets and every other field are untouched, so the
+// caller re-merges its BoardState over the result exactly like
+// a sync (placements/traces/sides/locks live in the state, not
+// here). A key the store no longer resolves leaves the component
+// footprint-less with the placeholder size, mirroring the
+// builder's unresolved case.
+//
+// Caveat, stated once: "the store's current definitions" is what
+// FootprintStore returns today — user footprints re-parse on
+// rescan, and bundled parses are cached by the store after first
+// use (FootprintStore.footprint(for:)), so a bundled file edited
+// on disk mid-session is picked up on the store's terms, not by
+// this function reaching past the store to the files.
+
+extension PCBBoardModelBuilder {
+
+    static func refreshed(model: BoardModel, store: FootprintStore) -> BoardModel {
+        var result = model
+        for index in result.components.indices {
+            guard let key = result.components[index].footprintKey else { continue }
+            guard let entry = store.entry(forResolutionKey: key),
+                  let parsed = store.footprint(for: entry) else {
+                result.components[index].footprint = nil
+                result.components[index].boundsSize = Self.placeholderSize
+                for pinIndex in result.components[index].pins.indices {
+                    result.components[index].pins[pinIndex].pad = nil
+                }
+                continue
+            }
+            result.components[index].footprint = parsed
+            let bounds = parsed.bounds
+            result.components[index].boundsSize = (w: bounds.maxX - bounds.minX,
+                                                   h: bounds.maxY - bounds.minY)
+            var padByNumber: [String: KiCadFootprintPad] = [:]
+            for pad in parsed.pads where !pad.number.isEmpty {
+                if padByNumber[pad.number] == nil {
+                    padByNumber[pad.number] = pad
+                }
+            }
+            for pinIndex in result.components[index].pins.indices {
+                let number = result.components[index].pins[pinIndex].pinNumber
+                result.components[index].pins[pinIndex].pad = padByNumber[number]
+            }
+        }
+        return result
     }
 }
 

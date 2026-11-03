@@ -113,7 +113,7 @@ enum BoardGrid {
 /// - zones: their polygon, radius 0, `filled`
 struct CopperShape {
     enum Kind: String {
-        case pad, trace, via, zone
+        case pad, trace, via, zone, teardrop
     }
 
     var kind: Kind
@@ -249,6 +249,32 @@ enum BoardCopper {
                 filledPolygon: zone.points,
                 testPoints: zone.points,
                 highlight: .zone(zone.id)))
+        }
+
+        // Teardrops (part 5.3): real copper of their net + layer,
+        // shaped exactly like a zone polygon, so connectivity
+        // unions them with the pad/track they flare between and
+        // clearance measures them against foreign nets. With no
+        // teardrops on the board this loop appends nothing and
+        // every existing result is unchanged. The highlight
+        // targets the ANCHOR TRACK (a teardrop has no selection
+        // of its own in the check UI).
+        for teardrop in model.teardrops where teardrop.points.count >= 3 {
+            var segments: [(FPPoint, FPPoint)] = []
+            for index in teardrop.points.indices {
+                segments.append((teardrop.points[index],
+                                 teardrop.points[(index + 1) % teardrop.points.count]))
+            }
+            shapes.append(CopperShape(
+                kind: .teardrop,
+                label: "teardrop on \(teardrop.layer)",
+                netName: teardrop.netName,
+                layers: [teardrop.layer],
+                segments: segments,
+                radius: 0,
+                filledPolygon: teardrop.points,
+                testPoints: teardrop.points,
+                highlight: .trace(UUID(uuidString: teardrop.anchorTrackID) ?? UUID())))
         }
         return shapes
     }
@@ -496,7 +522,11 @@ struct RatsnestSegment: Equatable {
 /// ordering: nets in the model's order, groups by first pad
 /// label, Prim's algorithm with lowest-index tie-breaks.
 enum BoardRatsnest {
-    static func segments(model: BoardModel, copperCount: Int)
+    /// `hiddenNets` (part 5.3, P8): nets the user hid in the Nets
+    /// panel contribute NO segments. Defaulted empty, so existing
+    /// callers and fixtures are untouched.
+    static func segments(model: BoardModel, copperCount: Int,
+                         hiddenNets: Set<String> = [])
         -> [RatsnestSegment] {
         let shapes = BoardCopper.shapes(model: model, copperCount: copperCount)
         // Pad nodes exactly as BoardConnectivity builds them.
@@ -556,7 +586,7 @@ enum BoardRatsnest {
         }
 
         var result: [RatsnestSegment] = []
-        for net in model.netNames {
+        for net in model.netNames where !hiddenNets.contains(net) {
             guard let byRoot = groupsByNet[net], byRoot.count > 1
             else { continue }
             // Deterministic group order: by first pad label.
@@ -639,6 +669,44 @@ enum BoardPinStatus {
     }
 }
 
+// MARK: - Netclasses (part 5.3, P16) — the clearance source of truth
+
+/// Netclass effects, in ONE place: every clearance computation
+/// in the app (the live tier-1 check and manufacturing rule 1)
+/// asks requiredClearanceMM what a pair of nets demands, so a
+/// class assignment can never be honoured by one checker and
+/// ignored by the other. The requirement for a pair is the
+/// LARGEST of: the board's own clearance setting, net A's class
+/// clearance, net B's class clearance. With no classes assigned
+/// this is exactly the pre-5.3 flat board clearance.
+enum BoardNetClasses {
+
+    /// The class a net is assigned to on this board, if any.
+    static func netClass(forNet net: String, boardState: BoardState) -> NetClass? {
+        boardState.netClass(forNet: net)
+    }
+
+    static func requiredClearanceMM(netA: String, netB: String,
+                                    boardState: BoardState) -> Double {
+        var required = BoardUnits.mm(fromMil: boardState.clearanceMil)
+        if let netClass = netClass(forNet: netA, boardState: boardState) {
+            required = max(required, netClass.clearanceMM)
+        }
+        if let netClass = netClass(forNet: netB, boardState: boardState) {
+            required = max(required, netClass.clearanceMM)
+        }
+        return required
+    }
+
+    /// The width a NEW route of this net starts at: its class's
+    /// track width, or nil when the net has no class (the editor
+    /// then falls back to its own default-width setting).
+    static func defaultTrackWidthMM(forNet net: String,
+                                    boardState: BoardState) -> Double? {
+        netClass(forNet: net, boardState: boardState)?.trackWidthMM
+    }
+}
+
 // MARK: - Clearance / net-touch check (tier 1)
 
 /// One clearance violation: two DIFFERENT nets' copper closer
@@ -663,9 +731,32 @@ struct ClearanceViolation: Equatable {
 }
 
 enum BoardClearance {
+
+    /// The pre-5.3 entry point (flat clearance, no classes): kept
+    /// for existing callers, and implemented THROUGH the
+    /// board-state path below so there is exactly one clearance
+    /// computation in the app.
     static func violations(model: BoardModel, copperCount: Int,
                            clearanceMM: Double) -> [ClearanceViolation] {
+        violations(model: model, copperCount: copperCount,
+                   boardState: BoardState(
+                    clearanceMil: BoardUnits.mil(fromMM: clearanceMM)))
+    }
+
+    /// Per-pair requirements from BoardNetClasses (board setting
+    /// vs the two nets' class clearances). With no netclasses
+    /// assigned the per-pair requirement is the board clearance
+    /// for every pair and the result is identical to the flat
+    /// computation above.
+    static func violations(model: BoardModel, copperCount: Int,
+                           boardState: BoardState) -> [ClearanceViolation] {
         let shapes = BoardCopper.shapes(model: model, copperCount: copperCount)
+        // Bounding-box prefilter bound: no violating pair can be
+        // farther apart than the LARGEST requirement in play.
+        var prefilterMM = BoardUnits.mm(fromMil: boardState.clearanceMil)
+        for netClass in boardState.netClasses {
+            prefilterMM = max(prefilterMM, netClass.clearanceMM)
+        }
         var found: [ClearanceViolation] = []
         for i in shapes.indices {
             for j in shapes.indices where j > i {
@@ -674,14 +765,16 @@ enum BoardClearance {
                       netA != netB else { continue }
                 guard !a.layers.isDisjoint(with: b.layers) else { continue }
                 let ab = a.bounds, bb = b.bounds
-                if ab.maxX < bb.minX - clearanceMM
-                    || bb.maxX < ab.minX - clearanceMM
-                    || ab.maxY < bb.minY - clearanceMM
-                    || bb.maxY < ab.minY - clearanceMM {
+                if ab.maxX < bb.minX - prefilterMM
+                    || bb.maxX < ab.minX - prefilterMM
+                    || ab.maxY < bb.minY - prefilterMM
+                    || bb.maxY < ab.minY - prefilterMM {
                     continue
                 }
+                let required = BoardNetClasses.requiredClearanceMM(
+                    netA: netA, netB: netB, boardState: boardState)
                 let distance = BoardCopper.distance(a, b)
-                if distance < clearanceMM - 1e-9 {
+                if distance < required - 1e-9 {
                     let location = a.testPoints.first ?? .zero
                     found.append(ClearanceViolation(
                         netA: netA, netB: netB,
@@ -718,11 +811,40 @@ struct ManufacturingSettings: Equatable {
     var minAnnularRingMil: Double = 5
 }
 
+/// One manufacturing finding with a STABLE identity (part 5.3,
+/// P7): `key` is the rule identity + the sorted involved item
+/// ids + the involved net names, pipe-joined — content-derived,
+/// never row order, so a BoardState.manufacturingExclusions entry
+/// keeps naming the same finding across edits that don't touch
+/// it, and a key that matches nothing any more is stale (the UI
+/// reports it as such; nothing re-attaches it silently).
+struct ManufacturingFinding: Equatable {
+    /// Stable rule identity, e.g. "clearance", "minTraceWidth".
+    var ruleID: String
+    /// The display message — byte-identical to the violation
+    /// string the rule has always produced.
+    var message: String
+    /// Item ids involved (trace/via/zone uuidStrings, component
+    /// references, "REF pin N" pin ids), sorted in the key.
+    var itemIDs: [String]
+    /// Net names involved, sorted in the key.
+    var netNames: [String]
+
+    var key: String {
+        ([ruleID] + itemIDs.sorted() + netNames.sorted())
+            .joined(separator: "|")
+    }
+}
+
 struct ManufacturingRuleResult: Equatable {
     var name: String
     var passed: Bool
     /// One line per violation, with locations. Empty when passed.
     var violations: [String]
+    /// The same violations as keyed findings (part 5.3), in the
+    /// same order. `violations` stays the display source of
+    /// truth; findings are its identity-carrying twin.
+    var findings: [ManufacturingFinding] = []
 }
 
 struct ManufacturingReport: Equatable {
@@ -730,25 +852,76 @@ struct ManufacturingReport: Equatable {
     var passedCount: Int { rules.filter(\.passed).count }
     var failedCount: Int { rules.count - passedCount }
     var allPassed: Bool { failedCount == 0 }
+    /// Every finding on the board, in rule order (part 5.3).
+    var findings: [ManufacturingFinding] { rules.flatMap(\.findings) }
 }
 
 /// A deterministic rule set Sean can run any time. Every rule here
 /// is actually implemented — the report names only what ran.
 enum BoardManufacturing {
+
+    /// The pre-5.3 entry point: implemented through the
+    /// board-state overload below with a classless board state
+    /// carrying the settings' clearance, so there is exactly one
+    /// manufacturing computation. Results are identical to the
+    /// board-state overload whenever the board has no netclasses.
     static func check(model: BoardModel, copperCount: Int,
                       settings: ManufacturingSettings,
                       connectivity: [String: NetConnectivity])
         -> ManufacturingReport {
-        var rules: [ManufacturingRuleResult] = []
-        let clearanceMM = BoardUnits.mm(fromMil: settings.clearanceMil)
+        check(model: model, copperCount: copperCount, settings: settings,
+              connectivity: connectivity,
+              boardState: BoardState(clearanceMil: settings.clearanceMil))
+    }
 
-        // 1. Clearance between different nets (the tier-1 check).
+    /// Board-state overload (part 5.3): rule 1's clearance goes
+    /// through BoardNetClasses.requiredClearanceMM like the live
+    /// check (the settings' clearanceMil wins as the board
+    /// setting — in the editor the settings are DERIVED from the
+    /// board state, so the two agree). Every violation also
+    /// produces a keyed ManufacturingFinding; rule order, rule
+    /// names and violation strings are unchanged from before.
+    static func check(model: BoardModel, copperCount: Int,
+                      settings: ManufacturingSettings,
+                      connectivity: [String: NetConnectivity],
+                      boardState: BoardState)
+        -> ManufacturingReport {
+        var rules: [ManufacturingRuleResult] = []
+        var effectiveBoard = boardState
+        effectiveBoard.clearanceMil = settings.clearanceMil
+
+        func highlightID(_ highlight: CheckHighlight) -> String {
+            switch highlight {
+            case .component(let reference): return reference
+            case .trace(let id): return id.uuidString
+            case .via(let id): return id.uuidString
+            case .zone(let id): return id.uuidString
+            }
+        }
+        func net(of trace: BoardTrace) -> [String] {
+            (trace.netName ?? trace.disconnectedNetName).map { [$0] } ?? []
+        }
+        func net(of via: BoardVia) -> [String] {
+            (via.netName ?? via.disconnectedNetName).map { [$0] } ?? []
+        }
+        func net(of zone: BoardZone) -> [String] {
+            (zone.netName ?? zone.disconnectedNetName).map { [$0] } ?? []
+        }
+
+        // 1. Clearance between different nets (the tier-1 check,
+        // netclass-aware through BoardClearance's board-state path).
         let clearance = BoardClearance.violations(
-            model: model, copperCount: copperCount, clearanceMM: clearanceMM)
+            model: model, copperCount: copperCount, boardState: effectiveBoard)
         rules.append(ManufacturingRuleResult(
             name: "Clearance ≥ \(BoardUnits.formatMil(settings.clearanceMil)) mil between different nets",
             passed: clearance.isEmpty,
-            violations: clearance.map(\.message)))
+            violations: clearance.map(\.message),
+            findings: clearance.map {
+                ManufacturingFinding(
+                    ruleID: "clearance", message: $0.message,
+                    itemIDs: $0.highlights.map(highlightID),
+                    netNames: [$0.netA, $0.netB])
+            }))
 
         // 2. Minimum trace width.
         let minWidthMM = BoardUnits.mm(fromMil: settings.minTraceWidthMil)
@@ -758,6 +931,12 @@ enum BoardManufacturing {
             passed: thinTraces.isEmpty,
             violations: thinTraces.map {
                 "A trace on \($0.layer) is \(BoardUnits.formatLength(mm: $0.width)) wide"
+            },
+            findings: thinTraces.map {
+                ManufacturingFinding(
+                    ruleID: "minTraceWidth",
+                    message: "A trace on \($0.layer) is \(BoardUnits.formatLength(mm: $0.width)) wide",
+                    itemIDs: [$0.id.uuidString], netNames: net(of: $0))
             }))
 
         // 3. Minimum via drill.
@@ -769,6 +948,13 @@ enum BoardManufacturing {
             violations: smallDrills.map {
                 "The via at (\(BoardUnits.formatMM($0.center.x)), \(BoardUnits.formatMM($0.center.y))) "
                 + "has a \(BoardUnits.formatLength(mm: $0.drill)) drill"
+            },
+            findings: smallDrills.map {
+                ManufacturingFinding(
+                    ruleID: "minViaDrill",
+                    message: "The via at (\(BoardUnits.formatMM($0.center.x)), \(BoardUnits.formatMM($0.center.y))) "
+                        + "has a \(BoardUnits.formatLength(mm: $0.drill)) drill",
+                    itemIDs: [$0.id.uuidString], netNames: net(of: $0))
             }))
 
         // 4. Minimum via diameter.
@@ -780,50 +966,78 @@ enum BoardManufacturing {
             violations: smallVias.map {
                 "The via at (\(BoardUnits.formatMM($0.center.x)), \(BoardUnits.formatMM($0.center.y))) "
                 + "is \(BoardUnits.formatLength(mm: $0.diameter)) across"
+            },
+            findings: smallVias.map {
+                ManufacturingFinding(
+                    ruleID: "minViaDiameter",
+                    message: "The via at (\(BoardUnits.formatMM($0.center.x)), \(BoardUnits.formatMM($0.center.y))) "
+                        + "is \(BoardUnits.formatLength(mm: $0.diameter)) across",
+                    itemIDs: [$0.id.uuidString], netNames: net(of: $0))
             }))
 
         // 5. Every net fully routed.
         var unroutedLines: [String] = []
+        var unroutedFindings: [ManufacturingFinding] = []
         for net in model.netNames {
             guard let info = connectivity[net], !info.unroutedPads.isEmpty
             else { continue }
-            unroutedLines.append(
-                "\(net): \(info.unroutedPads.count) of \(info.padCount) pads "
-                + "reach nothing — \(info.unroutedPads.joined(separator: ", "))")
+            let line = "\(net): \(info.unroutedPads.count) of \(info.padCount) pads "
+                + "reach nothing — \(info.unroutedPads.joined(separator: ", "))"
+            unroutedLines.append(line)
+            unroutedFindings.append(ManufacturingFinding(
+                ruleID: "fullyRouted", message: line,
+                itemIDs: info.unroutedPads, netNames: [net]))
         }
         rules.append(ManufacturingRuleResult(
             name: "Every net fully routed (all pads connected)",
             passed: unroutedLines.isEmpty,
-            violations: unroutedLines))
+            violations: unroutedLines,
+            findings: unroutedFindings))
 
         // 6. No disconnected pins (pins on no net at all).
         var disconnectedLines: [String] = []
+        var disconnectedFindings: [ManufacturingFinding] = []
         for component in model.components {
             for pin in component.pins where pin.netName == nil {
                 let name = pin.pinName.isEmpty ? "" : " (\(pin.pinName))"
-                disconnectedLines.append(
-                    "\(component.reference) pin \(pin.pinNumber)\(name) is on no net")
+                let line = "\(component.reference) pin \(pin.pinNumber)\(name) is on no net"
+                disconnectedLines.append(line)
+                disconnectedFindings.append(ManufacturingFinding(
+                    ruleID: "noDisconnectedPins", message: line,
+                    itemIDs: ["\(component.reference) pin \(pin.pinNumber)"],
+                    netNames: []))
             }
         }
         rules.append(ManufacturingRuleResult(
             name: "No disconnected pins",
             passed: disconnectedLines.isEmpty,
-            violations: disconnectedLines))
+            violations: disconnectedLines,
+            findings: disconnectedFindings))
 
         // 7. Nothing on layers the board doesn't have.
         var orphanLines: [String] = []
+        var orphanFindings: [ManufacturingFinding] = []
         for trace in model.traces
         where !BoardLayers.layerExists(trace.layer, copperCount: copperCount) {
-            orphanLines.append("A trace sits on \(trace.layer), which this board doesn't have")
+            let line = "A trace sits on \(trace.layer), which this board doesn't have"
+            orphanLines.append(line)
+            orphanFindings.append(ManufacturingFinding(
+                ruleID: "layersExist", message: line,
+                itemIDs: [trace.id.uuidString], netNames: net(of: trace)))
         }
         for zone in model.zones
         where !BoardLayers.layerExists(zone.layer, copperCount: copperCount) {
-            orphanLines.append("A copper fill sits on \(zone.layer), which this board doesn't have")
+            let line = "A copper fill sits on \(zone.layer), which this board doesn't have"
+            orphanLines.append(line)
+            orphanFindings.append(ManufacturingFinding(
+                ruleID: "layersExist", message: line,
+                itemIDs: [zone.id.uuidString], netNames: net(of: zone)))
         }
         rules.append(ManufacturingRuleResult(
             name: "Nothing on layers the board doesn't have",
             passed: orphanLines.isEmpty,
-            violations: orphanLines))
+            violations: orphanLines,
+            findings: orphanFindings))
 
         // 8. Every component has a footprint.
         let unresolved = model.components.filter { $0.footprint == nil }
@@ -832,6 +1046,12 @@ enum BoardManufacturing {
             passed: unresolved.isEmpty,
             violations: unresolved.map {
                 "\($0.reference) has no resolved footprint"
+            },
+            findings: unresolved.map {
+                ManufacturingFinding(
+                    ruleID: "footprintResolved",
+                    message: "\($0.reference) has no resolved footprint",
+                    itemIDs: [$0.reference], netNames: [])
             }))
 
         // 9. Annular ring (part 5.2): the copper ring around each
@@ -847,6 +1067,13 @@ enum BoardManufacturing {
             violations: thinRings.map {
                 "The via at (\(BoardUnits.formatMM($0.center.x)), \(BoardUnits.formatMM($0.center.y))) "
                 + "has a \(BoardUnits.formatLength(mm: ($0.diameter - $0.drill) / 2)) annular ring"
+            },
+            findings: thinRings.map {
+                ManufacturingFinding(
+                    ruleID: "minAnnularRing",
+                    message: "The via at (\(BoardUnits.formatMM($0.center.x)), \(BoardUnits.formatMM($0.center.y))) "
+                        + "has a \(BoardUnits.formatLength(mm: ($0.diameter - $0.drill) / 2)) annular ring",
+                    itemIDs: [$0.id.uuidString], netNames: net(of: $0))
             }))
 
         // 10. Courtyard overlap (part 5.2): two components'
@@ -857,6 +1084,7 @@ enum BoardManufacturing {
         // the bounding box of its outline points (exact for the
         // rectangular courtyards nearly every footprint uses).
         var courtyardLines: [String] = []
+        var courtyardFindings: [ManufacturingFinding] = []
         let courtyards: [(reference: String,
                           bounds: (minX: Double, minY: Double,
                                    maxX: Double, maxY: Double))] =
@@ -871,18 +1099,52 @@ enum BoardManufacturing {
                 let overlapX = min(a.maxX, b.maxX) - max(a.minX, b.minX)
                 let overlapY = min(a.maxY, b.maxY) - max(a.minY, b.minY)
                 if overlapX > 0.01 && overlapY > 0.01 {
-                    courtyardLines.append(
-                        "\(courtyards[i].reference) and \(courtyards[j].reference) "
-                        + "have overlapping courtyards")
+                    let line = "\(courtyards[i].reference) and \(courtyards[j].reference) "
+                        + "have overlapping courtyards"
+                    courtyardLines.append(line)
+                    courtyardFindings.append(ManufacturingFinding(
+                        ruleID: "courtyardOverlap", message: line,
+                        itemIDs: [courtyards[i].reference, courtyards[j].reference],
+                        netNames: []))
                 }
             }
         }
         rules.append(ManufacturingRuleResult(
             name: "Component courtyards don't overlap",
             passed: courtyardLines.isEmpty,
-            violations: courtyardLines))
+            violations: courtyardLines,
+            findings: courtyardFindings))
 
         return ManufacturingReport(rules: rules)
+    }
+
+    /// Partition findings by an exclusion key list (part 5.3,
+    /// P7): findings whose key is in `excluding` (the board
+    /// state's manufacturingExclusions) go to `excluded`, the
+    /// rest stay `visible`. Input order is preserved in both.
+    static func visibleFindings(_ findings: [ManufacturingFinding],
+                                excluding excludedKeys: [String])
+        -> (visible: [ManufacturingFinding], excluded: [ManufacturingFinding]) {
+        let excludedSet = Set(excludedKeys)
+        var visible: [ManufacturingFinding] = []
+        var excluded: [ManufacturingFinding] = []
+        for finding in findings {
+            if excludedSet.contains(finding.key) {
+                excluded.append(finding)
+            } else {
+                visible.append(finding)
+            }
+        }
+        return (visible, excluded)
+    }
+
+    /// Exclusion keys that match NO current finding — stale
+    /// exclusions, reported as such by the UI, never silently
+    /// re-attached to a different finding.
+    static func staleExclusions(_ excludedKeys: [String],
+                                findings: [ManufacturingFinding]) -> [String] {
+        let liveKeys = Set(findings.map(\.key))
+        return excludedKeys.filter { !liveKeys.contains($0) }
     }
 }
 
@@ -1127,5 +1389,799 @@ enum BoardSummaryText {
             }
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+// MARK: - Teardrops (part 5.3, P6)
+//
+// KiCad's teardrop generator (pcbnew/teardrop), PadCB geometry:
+// at every track vertex coincident (≤ 0.02 mm) with a same-net
+// pad centre or via centre on the track's layer, one teardrop
+// per adjacent segment direction — a trapezoid whose base edge
+// spans the junction's half-width (round pad: its radius; other
+// pads: min(padW, padH)/2; via: its radius) at the junction
+// point, tapering to the track's half-width at a run of
+// max(1.2 × track width, 0.3 mm) along the segment. (KiCad's
+// real profile is curved; the trapezoid is the stated
+// approximation.) When a pad AND a via coincide at one vertex,
+// the wider junction wins — one teardrop per direction, never
+// two stacked. Only named-net tracks generate (a teardrop is
+// copper OF a net).
+
+enum BoardTeardrops {
+
+    static let coincidenceTolerance = 0.02
+
+    /// The full new teardrops array for the state: freshly
+    /// generated teardrops REPLACE any existing teardrop with
+    /// the same anchor key (keeping its id, so locks and
+    /// selections survive regeneration); existing teardrops
+    /// whose anchors were not regenerated are kept. Order:
+    /// generated first (trace order, vertex order, incoming
+    /// direction before outgoing), then kept ones in their
+    /// original order. `model` is the merged model (its traces /
+    /// vias / pads are the board's truth).
+    static func generate(state: BoardState, model: BoardModel) -> [TeardropItem] {
+        let stack = BoardLayers.copperLayers(count: state.copperLayerCount)
+        struct Junction {
+            var centre: FPPoint
+            var net: String
+            var layers: Set<String>
+            var baseHalf: Double
+        }
+        var junctions: [Junction] = []
+        for component in model.components {
+            guard let footprint = component.footprint else { continue }
+            for rawPad in footprint.pads where !rawPad.number.isEmpty {
+                guard let net = BoardGeometry.netName(component, rawPad)
+                else { continue }
+                let pad = BoardGeometry.boardPad(component, rawPad)
+                var layers = Set<String>()
+                for layer in pad.layers {
+                    if layer == "*.Cu" {
+                        layers.formUnion(stack)
+                    } else if BoardLayers.isCopper(layer) {
+                        layers.insert(layer)
+                    }
+                }
+                guard !layers.isEmpty else { continue }
+                let baseHalf = pad.shape == .circle
+                    ? pad.width / 2
+                    : min(pad.width, pad.height) / 2
+                junctions.append(Junction(
+                    centre: BoardGeometry.padCenter(component, rawPad),
+                    net: net, layers: layers, baseHalf: baseHalf))
+            }
+        }
+        for via in model.vias {
+            guard let net = via.netName else { continue }
+            junctions.append(Junction(
+                centre: via.center, net: net, layers: Set(stack),
+                baseHalf: via.diameter / 2))
+        }
+
+        var generated: [TeardropItem] = []
+        for trace in model.traces {
+            guard let net = trace.netName, trace.points.count > 1
+            else { continue }
+            for (vertex, point) in trace.points.enumerated() {
+                var best: Junction? = nil
+                for junction in junctions
+                where junction.net == net
+                    && junction.layers.contains(trace.layer)
+                    && point.distance(to: junction.centre) <= coincidenceTolerance {
+                    if best == nil || junction.baseHalf > best!.baseHalf {
+                        best = junction
+                    }
+                }
+                guard let junction = best else { continue }
+                // Adjacent segment directions: incoming first.
+                var directions: [FPPoint] = []
+                if vertex > 0 {
+                    let from = trace.points[vertex - 1]
+                    let length = point.distance(to: from)
+                    if length > 1e-9 {
+                        directions.append(FPPoint(
+                            x: (point.x - from.x) / length,
+                            y: (point.y - from.y) / length))
+                    }
+                }
+                if vertex + 1 < trace.points.count {
+                    let to = trace.points[vertex + 1]
+                    let length = to.distance(to: point)
+                    if length > 1e-9 {
+                        directions.append(FPPoint(
+                            x: (to.x - point.x) / length,
+                            y: (to.y - point.y) / length))
+                    }
+                }
+                let run = max(1.2 * trace.width, 0.3)
+                let trackHalf = trace.width / 2
+                for direction in directions {
+                    let perp = FPPoint(x: -direction.y, y: direction.x)
+                    let tipCentre = FPPoint(
+                        x: point.x + direction.x * run,
+                        y: point.y + direction.y * run)
+                    let points = [
+                        FPPoint(x: point.x + perp.x * junction.baseHalf,
+                                y: point.y + perp.y * junction.baseHalf),
+                        FPPoint(x: tipCentre.x + perp.x * trackHalf,
+                                y: tipCentre.y + perp.y * trackHalf),
+                        FPPoint(x: tipCentre.x - perp.x * trackHalf,
+                                y: tipCentre.y - perp.y * trackHalf),
+                        FPPoint(x: point.x - perp.x * junction.baseHalf,
+                                y: point.y - perp.y * junction.baseHalf),
+                    ]
+                    generated.append(TeardropItem(
+                        id: UUID(), netName: net, layer: trace.layer,
+                        points: points,
+                        anchorTrackID: trace.id.uuidString,
+                        anchorPoint: point))
+                }
+            }
+        }
+
+        var result: [TeardropItem] = generated.map { generatedItem in
+            var copy = generatedItem
+            if let old = state.teardrops.first(where: {
+                $0.anchorKey == copy.anchorKey
+            }) {
+                copy.id = old.id
+            }
+            return copy
+        }
+        let generatedKeys = Set(result.map(\.anchorKey))
+        result += state.teardrops.filter { !generatedKeys.contains($0.anchorKey) }
+        return result
+    }
+
+    /// Remove every teardrop (KiCad's "remove all teardrops").
+    static func removingAll(from state: BoardState) -> BoardState {
+        var result = state
+        result.teardrops = []
+        return result
+    }
+
+    /// Remove one net's teardrops (KiCad's per-net removal).
+    static func removing(from state: BoardState, net: String) -> BoardState {
+        var result = state
+        result.teardrops.removeAll { $0.netName == net }
+        return result
+    }
+}
+
+// MARK: - Cleanup tracks & vias / graphics (part 5.3, P4 + P5)
+//
+// KiCad's TRACKS_CLEANER + graphics cleaner, as pure BoardState
+// transforms with a dry-run-friendly report (the view shows the
+// report from a first call, then commits a second call through
+// mutateBoard — the functions are pure, so both calls agree).
+// LOCKED items are never removed or merged, in either cleaner.
+
+struct BoardCleanupOptions: Equatable {
+    var removeDangling = true
+    var removeNullSegments = true
+    var mergeCollinear = true
+    var removeDuplicateVias = true
+    var removeDisconnected = true
+}
+
+enum BoardCleanup {
+
+    /// Report keys (always all present):
+    /// "nullSegments" (zero-length segments collapsed; a trace
+    /// removed for falling below 2 points contributes its
+    /// collapsed segments, minimum 1), "mergedSegments"
+    /// (collinear vertices merged away), "duplicateVias",
+    /// "danglingTracks", "disconnectedItems".
+    static func cleanTracksAndVias(state: BoardState, model: BoardModel,
+                                   options: BoardCleanupOptions = BoardCleanupOptions())
+        -> (state: BoardState, report: [String: Int]) {
+        var report: [String: Int] = [
+            "nullSegments": 0, "mergedSegments": 0, "duplicateVias": 0,
+            "danglingTracks": 0, "disconnectedItems": 0,
+        ]
+        var result = state
+
+        // Zero-length segments: consecutive duplicate points
+        // collapse; a trace left with < 2 points is removed.
+        if options.removeNullSegments {
+            var kept: [BoardTrace] = []
+            for trace in result.traces {
+                if result.isLocked(trace.id) { kept.append(trace); continue }
+                var cleaned: [FPPoint] = []
+                var collapsed = 0
+                for point in trace.points {
+                    if let last = cleaned.last,
+                       last.distance(to: point) < 1e-9 {
+                        collapsed += 1
+                    } else {
+                        cleaned.append(point)
+                    }
+                }
+                if cleaned.count < 2 {
+                    report["nullSegments"]! += max(collapsed, 1)
+                    continue
+                }
+                report["nullSegments"]! += collapsed
+                var edited = trace
+                edited.points = cleaned
+                kept.append(edited)
+            }
+            result.traces = kept
+        }
+
+        // Collinear merges: an interior vertex whose two
+        // segments run the SAME direction (cross ≈ 0 within
+        // 1e-6 relative, dot > 0 — a backtracking vertex is not
+        // collinear for this purpose) is merged away.
+        if options.mergeCollinear {
+            for index in result.traces.indices
+            where !result.isLocked(result.traces[index].id) {
+                var points = result.traces[index].points
+                var changed = true
+                while changed, points.count > 2 {
+                    changed = false
+                    for vertex in 1..<(points.count - 1) {
+                        let a = points[vertex - 1], v = points[vertex]
+                        let b = points[vertex + 1]
+                        let d1 = FPPoint(x: v.x - a.x, y: v.y - a.y)
+                        let d2 = FPPoint(x: b.x - v.x, y: b.y - v.y)
+                        let l1 = (d1.x * d1.x + d1.y * d1.y).squareRoot()
+                        let l2 = (d2.x * d2.x + d2.y * d2.y).squareRoot()
+                        guard l1 > 1e-12, l2 > 1e-12 else { continue }
+                        let cross = d1.x * d2.y - d1.y * d2.x
+                        let dot = d1.x * d2.x + d1.y * d2.y
+                        if abs(cross) <= 1e-6 * l1 * l2, dot > 0 {
+                            points.remove(at: vertex)
+                            report["mergedSegments"]! += 1
+                            changed = true
+                            break
+                        }
+                    }
+                }
+                result.traces[index].points = points
+            }
+        }
+
+        // Duplicate vias: same centre (±1e-9), same net (named or
+        // remembered), same diameter and drill — keep the first.
+        if options.removeDuplicateVias {
+            var kept: [BoardVia] = []
+            for via in result.vias {
+                let duplicate = kept.contains {
+                    $0.center.distance(to: via.center) < 1e-9
+                        && $0.netName == via.netName
+                        && $0.disconnectedNetName == via.disconnectedNetName
+                        && abs($0.diameter - via.diameter) < 1e-9
+                        && abs($0.drill - via.drill) < 1e-9
+                }
+                if duplicate, !result.isLocked(via.id) {
+                    report["duplicateVias"]! += 1
+                    continue
+                }
+                kept.append(via)
+            }
+            result.vias = kept
+        }
+
+        // Disconnected items: sync orphans (netName nil with a
+        // remembered net) among traces and vias.
+        if options.removeDisconnected {
+            let tracesBefore = result.traces.count
+            result.traces.removeAll {
+                $0.netName == nil && $0.disconnectedNetName != nil
+                    && !result.isLocked($0.id)
+            }
+            let viasBefore = result.vias.count
+            result.vias.removeAll {
+                $0.netName == nil && $0.disconnectedNetName != nil
+                    && !result.isLocked($0.id)
+            }
+            report["disconnectedItems"]! = (tracesBefore - result.traces.count)
+                + (viasBefore - result.vias.count)
+        }
+
+        // Dangling tracks, to a fixpoint: a trace is dangling
+        // when EITHER endpoint touches no other copper of its
+        // net — pads, vias, other traces, zones and teardrops
+        // all count as anchors (BoardCopper shapes over the
+        // working state; a trace never anchors itself). Endpoint
+        // contact is BoardCopper distance ≤ the connectivity
+        // touch tolerance. Net matching is by equality of
+        // netName (pads carry named nets only, so an unnamed
+        // trace can anchor only on unnamed copper). Removing
+        // one dangling trace can strand its neighbour, hence
+        // the loop.
+        if options.removeDangling {
+            while true {
+                var working = model
+                working.traces = result.traces
+                working.vias = result.vias
+                working.zones = result.zones
+                working.teardrops = result.teardrops
+                let shapes = BoardCopper.shapes(
+                    model: working, copperCount: result.copperLayerCount)
+                var dangling: Set<UUID> = []
+                for trace in result.traces
+                where !result.isLocked(trace.id) && trace.points.count > 1 {
+                    func anchored(_ point: FPPoint) -> Bool {
+                        let probe = CopperShape(
+                            kind: .via, label: "cleanup probe",
+                            netName: trace.netName, layers: [trace.layer],
+                            segments: [(point, point)], radius: 0,
+                            filledPolygon: nil, testPoints: [point],
+                            highlight: .trace(trace.id))
+                        for shape in shapes {
+                            // Never self-anchored: the trace's own
+                            // shape — and its own teardrops, whose
+                            // highlight is the anchor trace — are
+                            // skipped.
+                            if shape.highlight == .trace(trace.id),
+                               shape.kind == .trace || shape.kind == .teardrop {
+                                continue
+                            }
+                            guard shape.netName == trace.netName
+                            else { continue }
+                            guard shape.layers.contains(trace.layer)
+                            else { continue }
+                            if BoardCopper.distance(probe, shape)
+                                <= BoardConnectivity.touchTolerance {
+                                return true
+                            }
+                        }
+                        return false
+                    }
+                    if !anchored(trace.points.first!)
+                        || !anchored(trace.points.last!) {
+                        dangling.insert(trace.id)
+                    }
+                }
+                if dangling.isEmpty { break }
+                result.traces.removeAll { dangling.contains($0.id) }
+                report["danglingTracks"]! += dangling.count
+            }
+        }
+        return (result, report)
+    }
+
+    /// Report keys (always both present): "duplicateGraphics"
+    /// (exact duplicates — same kind, layer and every geometry
+    /// field, id aside — removed, first kept) and
+    /// "mergedGraphics" (collinear LINE graphics on the same
+    /// layer touching at an endpoint merged into one line,
+    /// keeping the first line's id and stroke width).
+    static func cleanGraphics(state: BoardState)
+        -> (state: BoardState, report: [String: Int]) {
+        var report: [String: Int] = [
+            "duplicateGraphics": 0, "mergedGraphics": 0,
+        ]
+        var result = state
+
+        func sameGeometry(_ a: BoardGraphicItem, _ b: BoardGraphicItem) -> Bool {
+            a.kind == b.kind && a.layer == b.layer && a.points == b.points
+                && a.radius == b.radius && a.strokeWidth == b.strokeWidth
+                && a.text == b.text && a.textSize == b.textSize
+        }
+        var kept: [BoardGraphicItem] = []
+        for item in result.graphics {
+            if kept.contains(where: { sameGeometry($0, item) }),
+               !result.isLocked(item.id) {
+                report["duplicateGraphics"]! += 1
+                continue
+            }
+            kept.append(item)
+        }
+        result.graphics = kept
+
+        func mergedLine(_ a: BoardGraphicItem, _ b: BoardGraphicItem)
+            -> BoardGraphicItem? {
+            let a0 = a.points[0], a1 = a.points[1]
+            let b0 = b.points[0], b1 = b.points[1]
+            let shared: FPPoint
+            let outerA: FPPoint, outerB: FPPoint
+            func close(_ p: FPPoint, _ q: FPPoint) -> Bool {
+                p.distance(to: q) < 1e-9
+            }
+            if close(a1, b0) { shared = a1; outerA = a0; outerB = b1 }
+            else if close(a1, b1) { shared = a1; outerA = a0; outerB = b0 }
+            else if close(a0, b0) { shared = a0; outerA = a1; outerB = b1 }
+            else if close(a0, b1) { shared = a0; outerA = a1; outerB = b0 }
+            else { return nil }
+            // Collinear, and the two outers head AWAY from the
+            // shared point in opposite directions (a doubled-back
+            // pair is an overlap, not a merge).
+            let u = FPPoint(x: outerA.x - shared.x, y: outerA.y - shared.y)
+            let v = FPPoint(x: outerB.x - shared.x, y: outerB.y - shared.y)
+            let lu = (u.x * u.x + u.y * u.y).squareRoot()
+            let lv = (v.x * v.x + v.y * v.y).squareRoot()
+            guard lu > 1e-12, lv > 1e-12 else { return nil }
+            let cross = u.x * v.y - u.y * v.x
+            let dot = u.x * v.x + u.y * v.y
+            guard abs(cross) <= 1e-6 * lu * lv, dot < 0 else { return nil }
+            var merged = a
+            merged.points = [outerA, outerB]
+            return merged
+        }
+        var changed = true
+        while changed {
+            changed = false
+            outer: for i in result.graphics.indices {
+                for j in result.graphics.indices where j > i {
+                    let a = result.graphics[i], b = result.graphics[j]
+                    guard a.kind == .line, b.kind == .line,
+                          a.layer == b.layer,
+                          a.points.count == 2, b.points.count == 2,
+                          !result.isLocked(a.id), !result.isLocked(b.id),
+                          let merged = mergedLine(a, b)
+                    else { continue }
+                    result.graphics[i] = merged
+                    result.graphics.remove(at: j)
+                    report["mergedGraphics"]! += 1
+                    changed = true
+                    break outer
+                }
+            }
+        }
+        return (result, report)
+    }
+}
+
+// MARK: - Net queries (part 5.3, P2 + P3)
+
+enum BoardNetQueries {
+
+    /// Everything carrying one net, for Select All on Net.
+    /// Matching is by netName ONLY — an item whose net vanished
+    /// in a sync (netName nil, name remembered in
+    /// disconnectedNetName) does NOT match its old net.
+    /// References are the footprints having a PAD on the net
+    /// (a pin bound to a pad of that net).
+    static func itemIDs(onNet net: String, state: BoardState, model: BoardModel)
+        -> (traceIDs: Set<String>, viaIDs: Set<String>, references: Set<String>) {
+        let traceIDs = Set(state.traces.filter { $0.netName == net }
+            .map(\.id.uuidString))
+        let viaIDs = Set(state.vias.filter { $0.netName == net }
+            .map(\.id.uuidString))
+        var references = Set<String>()
+        for component in model.components
+        where component.pins.contains(where: {
+            $0.netName == net && $0.pad != nil
+        }) {
+            references.insert(component.reference)
+        }
+        return (traceIDs, viaIDs, references)
+    }
+
+    /// References with at least one UNROUTED pad (a pin on a net
+    /// whose pad reaches none of the net's other pads, per
+    /// BoardConnectivity) — KiCad's selectUnconnected set.
+    /// Sorted ascending in natural reference order (R2 < R10).
+    static func unconnectedReferences(model: BoardModel, copperCount: Int)
+        -> [String] {
+        let connectivity = BoardConnectivity.analyze(
+            model: model, copperCount: copperCount)
+        var references: [String] = []
+        for component in model.components {
+            let hasUnrouted = component.pins.contains { pin in
+                guard let net = pin.netName, pin.pad != nil else { return false }
+                let label = "\(component.reference) pin \(pin.pinNumber) (pad \(pin.pinNumber))"
+                return connectivity[net]?.unroutedPads.contains(label) == true
+            }
+            if hasUnrouted { references.append(component.reference) }
+        }
+        return references.sorted(by: PCBBoardModelBuilder.naturalLess)
+    }
+}
+
+// MARK: - Unroute (part 5.3, P14)
+//
+// KiCad's unrouteSelected: walk the copper connected to a
+// footprint's pads (or to one trace) and remove the traces/vias
+// of that connected component. The walk is a graph over pads
+// (anchors), traces and vias of the relevant net(s), joined by
+// BoardCopper touch (≤ 0.02 mm on a shared layer). Expansion
+// STOPS at any other footprint's pad: a trace touching a foreign
+// pad is removed (it routes TO that pad), but the walk does not
+// continue through the pad to whatever else touches it. Locked
+// traces/vias are barriers — never traversed, never removed.
+// Teardrops anchored to removed tracks are removed with them.
+
+enum BoardUnroute {
+
+    static func removingRouting(forReference reference: String,
+                                state: BoardState, model: BoardModel)
+        -> (state: BoardState, removedTraces: Int, removedVias: Int) {
+        guard let component = model.components.first(where: {
+            $0.reference == reference
+        }) else { return (state, 0, 0) }
+        let nets = Set(component.pins.compactMap(\.netName))
+        return walk(state: state, model: model,
+                    seedReference: reference, seedTraceID: nil,
+                    relevantNets: nets)
+    }
+
+    static func removingRouting(fromTraceID traceID: UUID,
+                                state: BoardState, model: BoardModel)
+        -> (state: BoardState, removedTraces: Int, removedVias: Int) {
+        guard let trace = state.traces.first(where: { $0.id == traceID })
+        else { return (state, 0, 0) }
+        guard !state.isLocked(traceID) else { return (state, 0, 0) }
+        let nets: Set<String> = (trace.netName ?? trace.disconnectedNetName)
+            .map { [$0] } ?? []
+        return walk(state: state, model: model,
+                    seedReference: nil, seedTraceID: traceID,
+                    relevantNets: nets)
+    }
+
+    private struct Node {
+        enum Kind { case pad, trace, via }
+        var kind: Kind
+        var id: UUID?
+        var reference: String?
+        var netKey: String?
+        var shape: CopperShape
+        var locked: Bool
+    }
+
+    private static func walk(state: BoardState, model: BoardModel,
+                             seedReference: String?, seedTraceID: UUID?,
+                             relevantNets: Set<String>)
+        -> (state: BoardState, removedTraces: Int, removedVias: Int) {
+        let stack = BoardLayers.copperLayers(count: state.copperLayerCount)
+        var nodes: [Node] = []
+        for component in model.components {
+            guard let footprint = component.footprint else { continue }
+            for rawPad in footprint.pads where !rawPad.number.isEmpty {
+                guard let net = BoardGeometry.netName(component, rawPad)
+                else { continue }
+                let pad = BoardGeometry.boardPad(component, rawPad)
+                var layers = Set<String>()
+                for layer in pad.layers {
+                    if layer == "*.Cu" {
+                        layers.formUnion(stack)
+                    } else if BoardLayers.isCopper(layer) {
+                        layers.insert(layer)
+                    }
+                }
+                guard !layers.isEmpty else { continue }
+                let outline = BoardCopper.outlinePolygon(
+                    component: component, rawPad: rawPad)
+                var segments: [(FPPoint, FPPoint)] = []
+                for index in outline.indices {
+                    segments.append((outline[index],
+                                     outline[(index + 1) % outline.count]))
+                }
+                nodes.append(Node(
+                    kind: .pad, id: nil, reference: component.reference,
+                    netKey: net,
+                    shape: CopperShape(
+                        kind: .pad,
+                        label: "\(component.reference) pad \(rawPad.number)",
+                        netName: net, layers: layers, segments: segments,
+                        radius: 0, filledPolygon: outline,
+                        testPoints: outline
+                            + [BoardGeometry.padCenter(component, rawPad)],
+                        highlight: .component(component.reference)),
+                    locked: false))
+            }
+        }
+        for trace in state.traces where trace.points.count > 1 {
+            var segments: [(FPPoint, FPPoint)] = []
+            for index in 1..<trace.points.count {
+                segments.append((trace.points[index - 1], trace.points[index]))
+            }
+            nodes.append(Node(
+                kind: .trace, id: trace.id, reference: nil,
+                netKey: trace.netName ?? trace.disconnectedNetName,
+                shape: CopperShape(
+                    kind: .trace, label: "trace on \(trace.layer)",
+                    netName: trace.netName, layers: [trace.layer],
+                    segments: segments, radius: trace.width / 2,
+                    filledPolygon: nil, testPoints: trace.points,
+                    highlight: .trace(trace.id)),
+                locked: state.isLocked(trace.id)))
+        }
+        for via in state.vias {
+            nodes.append(Node(
+                kind: .via, id: via.id, reference: nil,
+                netKey: via.netName ?? via.disconnectedNetName,
+                shape: CopperShape(
+                    kind: .via, label: "via",
+                    netName: via.netName, layers: Set(stack),
+                    segments: [(via.center, via.center)],
+                    radius: via.diameter / 2, filledPolygon: nil,
+                    testPoints: [via.center], highlight: .via(via.id)),
+                locked: state.isLocked(via.id)))
+        }
+
+        // Seeds.
+        var visited = Set<Int>()
+        var queue: [Int] = []
+        func seed(_ index: Int) {
+            if visited.insert(index).inserted { queue.append(index) }
+        }
+        if let seedReference {
+            for index in nodes.indices
+            where nodes[index].kind == .pad
+                && nodes[index].reference == seedReference
+                && nodes[index].netKey.map(relevantNets.contains) == true {
+                seed(index)
+            }
+        }
+        if let seedTraceID {
+            guard let index = nodes.firstIndex(where: {
+                $0.kind == .trace && $0.id == seedTraceID
+            }) else {
+                // Degenerate (≤ 1 point) seed trace: no graph to
+                // walk — it is its own component.
+                var result = state
+                result.traces.removeAll { $0.id == seedTraceID }
+                result.teardrops.removeAll {
+                    $0.anchorTrackID == seedTraceID.uuidString
+                }
+                return (result, 1, 0)
+            }
+            seed(index)
+        }
+        if queue.isEmpty { return (state, 0, 0) }
+
+        // BFS. A pad of another footprint (or, for the trace
+        // variant, ANY pad) is a leaf: visited, never expanded.
+        // Locked traces/vias are never even visited.
+        //
+        // Pad-centre contact rule: two items that touch ONLY at
+        // a leaf pad's centre (the classic case — one track ends
+        // on the pad, another starts there) are connected
+        // THROUGH that pad, not directly, so their direct edge
+        // is suppressed and the pad's leaf rule decides. A
+        // direct edge survives when the items touch away from
+        // every leaf pad centre they share.
+        func touchesAtLeafPadCentre(_ a: CopperShape, _ b: CopperShape,
+                                    net: String) -> Bool {
+            for pad in nodes
+            where pad.kind == .pad && pad.reference != seedReference
+                && pad.netKey == net {
+                let centre = pad.shape.testPoints.last!
+                func centreDistance(_ shape: CopperShape) -> Double {
+                    let probe = CopperShape(
+                        kind: .via, label: "unroute probe",
+                        netName: net, layers: shape.layers,
+                        segments: [(centre, centre)], radius: 0,
+                        filledPolygon: nil, testPoints: [centre],
+                        highlight: .component(pad.reference ?? ""))
+                    return BoardCopper.distance(probe, shape)
+                }
+                if BoardCopper.distance(pad.shape, a)
+                        <= BoardConnectivity.touchTolerance,
+                   BoardCopper.distance(pad.shape, b)
+                        <= BoardConnectivity.touchTolerance,
+                   centreDistance(a) <= BoardConnectivity.touchTolerance,
+                   centreDistance(b) <= BoardConnectivity.touchTolerance {
+                    return true
+                }
+            }
+            return false
+        }
+        var head = 0
+        while head < queue.count {
+            let current = queue[head]
+            head += 1
+            let node = nodes[current]
+            guard let net = node.netKey else { continue }
+            for index in nodes.indices where !visited.contains(index) {
+                let other = nodes[index]
+                if other.kind != .pad, other.locked { continue }
+                guard other.netKey == net else { continue }
+                guard !node.shape.layers.isDisjoint(with: other.shape.layers)
+                else { continue }
+                guard BoardCopper.distance(node.shape, other.shape)
+                        <= BoardConnectivity.touchTolerance
+                else { continue }
+                if node.kind != .pad, other.kind != .pad,
+                   touchesAtLeafPadCentre(node.shape, other.shape, net: net) {
+                    continue
+                }
+                visited.insert(index)
+                if other.kind == .pad, other.reference != seedReference {
+                    continue  // leaf: do not expand through it
+                }
+                queue.append(index)
+            }
+        }
+
+        let removedTraceIDs = Set(visited.compactMap {
+            nodes[$0].kind == .trace ? nodes[$0].id : nil
+        })
+        let removedViaIDs = Set(visited.compactMap {
+            nodes[$0].kind == .via ? nodes[$0].id : nil
+        })
+        if removedTraceIDs.isEmpty, removedViaIDs.isEmpty {
+            return (state, 0, 0)
+        }
+        var result = state
+        result.traces.removeAll { removedTraceIDs.contains($0.id) }
+        result.vias.removeAll { removedViaIDs.contains($0.id) }
+        let removedTrackStrings = Set(removedTraceIDs.map(\.uuidString))
+        result.teardrops.removeAll {
+            removedTrackStrings.contains($0.anchorTrackID)
+        }
+        return (result, removedTraceIDs.count, removedViaIDs.count)
+    }
+}
+
+// MARK: - PCB Find (part 5.3, P12)
+//
+// KiCad's dialog_find, data side: case-insensitive substring
+// search over footprint references, footprint VALUES (which live
+// on BoardComponent.value in the board model) and net names.
+// Deterministic order: component hits first — references in
+// natural ascending order, a reference hit before a value hit on
+// the same component — then net hits by net name ascending. A
+// net hit carries the reference of the net's first pad (model
+// order) so the view can centre on it; a net with no pad at all
+// produces no hit (there is nothing to centre on).
+
+struct BoardFindHit: Equatable {
+    enum Kind: String, Equatable {
+        case reference, value, net
+    }
+    var kind: Kind
+    /// The footprint to select/centre: for net hits, the
+    /// reference owning the net's first pad.
+    var reference: String
+    /// The matched text (the reference, value or net name).
+    var text: String
+}
+
+enum BoardFind {
+    static func hits(model: BoardModel, query: String) -> [BoardFindHit] {
+        let needle = query
+            .trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return [] }
+
+        var componentHits: [BoardFindHit] = []
+        for component in model.components {
+            if component.reference.lowercased().contains(needle) {
+                componentHits.append(BoardFindHit(
+                    kind: .reference, reference: component.reference,
+                    text: component.reference))
+            }
+            if component.value.lowercased().contains(needle) {
+                componentHits.append(BoardFindHit(
+                    kind: .value, reference: component.reference,
+                    text: component.value))
+            }
+        }
+        componentHits.sort {
+            if $0.reference != $1.reference {
+                return PCBBoardModelBuilder.naturalLess($0.reference, $1.reference)
+            }
+            return $0.kind == .reference && $1.kind != .reference
+        }
+
+        var netHits: [BoardFindHit] = []
+        for net in model.netNames where net.lowercased().contains(needle) {
+            var owner: String? = nil
+            ownerSearch: for component in model.components {
+                for pin in component.pins
+                where pin.netName == net && pin.pad != nil {
+                    owner = component.reference
+                    break ownerSearch
+                }
+            }
+            if owner == nil {
+                ownerSearchFallback: for component in model.components {
+                    for pin in component.pins where pin.netName == net {
+                        owner = component.reference
+                        break ownerSearchFallback
+                    }
+                }
+            }
+            guard let owner else { continue }
+            netHits.append(BoardFindHit(kind: .net, reference: owner, text: net))
+        }
+        netHits.sort { PCBBoardModelBuilder.naturalLess($0.text, $1.text) }
+        return componentHits + netHits
     }
 }

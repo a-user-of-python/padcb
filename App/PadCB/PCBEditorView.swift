@@ -139,6 +139,11 @@ private struct StaticBoardToken: Equatable {
     var editDragTraceID: UUID?
     var editDragPreviewPoints: [FPPoint]?
     var ratsnestCount: Int
+    /// Inactive-layer appearance mode (part 5.3, P9), raw value.
+    /// BoardState itself is in the token, so teardrops (part 5.3)
+    /// already invalidate the static layer through boardState +
+    /// renderVersion — this field covers the mode switch itself.
+    var inactiveLayerModeRaw: String
 }
 
 /// The static board layer (part 5.2, KiCad's VIEW/GAL layer
@@ -198,7 +203,15 @@ private struct BoardPointerReadoutView: View {
 struct PCBEditorView: View {
     @EnvironmentObject private var libraryStore: LibraryStore
     @EnvironmentObject private var footprintStore: FootprintStore
+    @EnvironmentObject private var crossProbe: CrossProbe
+    @EnvironmentObject private var liveSession: LiveSessionRegistry
     @Environment(\.dismiss) private var dismiss
+
+    /// Cross-editor navigation (part 5.3): HomeView passes a
+    /// closure that pushes the named editor ("schematic") so
+    /// "Show in Schematic" can cross-probe. Defaults to a no-op
+    /// for the exercise root, which has no sibling editor.
+    var navigate: (String) -> Void = { _ in }
 
     /// The left-rail tools (also the Place/Tools menu targets).
     enum PCBTool: String, CaseIterable {
@@ -406,6 +419,58 @@ struct PCBEditorView: View {
     @State private var connectivity: [String: NetConnectivity] = [:]
     @State private var clearanceViolations: [ClearanceViolation] = []
 
+    // -- Part 5.3 state --
+    /// Inactive-layer appearance (P9): how items NOT on the active
+    /// layer draw. View state only, like the highlight toggle it
+    /// generalises.
+    enum InactiveLayerMode: String, CaseIterable {
+        case normal = "Normal"
+        case dim = "Dim"
+        case hide = "Hide"
+    }
+    @State private var inactiveLayerMode: InactiveLayerMode = .normal
+    // Move Exactly (P1) sheet drafts.
+    @State private var showMoveExactly = false
+    @State private var moveDeltaXDraft = "0"
+    @State private var moveDeltaYDraft = "0"
+    @State private var movePolar = false
+    @State private var moveDistanceDraft = "0"
+    @State private var moveAngleDraft = "0"
+    @State private var moveRotationDraft = "0"
+    // Cleanup sheets (P4/P5): option toggles mirror
+    // BoardCleanupOptions' defaults (all on).
+    @State private var showCleanupTracks = false
+    @State private var cleanupDangling = true
+    @State private var cleanupNullSegments = true
+    @State private var cleanupMergeCollinear = true
+    @State private var cleanupDuplicateVias = true
+    @State private var cleanupDisconnected = true
+    @State private var showCleanupGraphics = false
+    // Global Deletions (P13) sheet: every class starts OFF.
+    @State private var showGlobalDelete = false
+    @State private var globalDeleteTracks = false
+    @State private var globalDeleteVias = false
+    @State private var globalDeleteZones = false
+    @State private var globalDeleteGraphics = false
+    @State private var globalDeleteTeardrops = false
+    @State private var globalDeleteIncludeLocked = false
+    // Swap Layers (P15) confirmation.
+    @State private var showSwapLayersConfirm = false
+    // Clipboard (P11): the in-app slice + the armed paste tap.
+    @State private var clipboardSlice: BoardClipboardSlice? = nil
+    @State private var pasteArmed = false
+    // PCB Find (P12) sheet.
+    @State private var showFind = false
+    @State private var findQuery = ""
+    // Select Unconnected (P3): the "Next" stepper position.
+    @State private var nextUnconnectedIndex = 0
+    // Netclasses (P16) sheet drafts.
+    @State private var showNetClasses = false
+    @State private var netClassNameDraft = ""
+    @State private var netClassWidthDraft = "0.25"
+    @State private var netClassClearanceDraft = "0.2"
+    @State private var netClassEditingName: String? = nil
+
     /// Per-layer display colours. Copper rows are generated from
     /// the board's copper count (inner layers cycle the palette);
     /// the named rows keep the part-4 colours.
@@ -568,6 +633,127 @@ struct PCBEditorView: View {
         freshSegmentTap = nil
     }
 
+    /// The selection as the model transforms' id set (part 5.3):
+    /// traces / vias / zones / graphics / teardrops by id
+    /// uuidString (a segment or vertex stands for its whole
+    /// trace), footprints by reference — exactly the identity
+    /// BoardTransforms / BoardClipboard key on.
+    private var selectionItemIDs: Set<String> {
+        var ids = Set<String>()
+        for item in selections {
+            switch item {
+            case .component(let reference):
+                ids.insert(reference)
+            case .trace(let id), .segment(let id, _), .vertex(let id, _):
+                ids.insert(id.uuidString)
+            case .graphic(let id), .via(let id), .zone(let id):
+                ids.insert(id.uuidString)
+            }
+        }
+        return ids
+    }
+
+    /// Every geometry point of the current selection, resolved
+    /// against the live model: footprint bounds corners (plus,
+    /// when `includePads`, every pad outline of selected
+    /// footprints — Zoom to Selection's contract), trace points
+    /// (a segment contributes its two ends, a vertex itself),
+    /// via discs, zone and graphic points.
+    private func selectionGeometryPoints(includePads: Bool) -> [FPPoint] {
+        guard let model else { return [] }
+        var points: [FPPoint] = []
+        for item in selections {
+            switch item {
+            case .component(let reference):
+                guard let component = model.components.first(
+                    where: { $0.reference == reference }) else { continue }
+                let b = BoardGeometry.componentBounds(component)
+                points.append(FPPoint(x: b.minX, y: b.minY))
+                points.append(FPPoint(x: b.maxX, y: b.maxY))
+                if includePads, let footprint = component.footprint {
+                    for pad in footprint.pads {
+                        points += BoardGeometry.padOutline(component, pad)
+                    }
+                }
+            case .trace(let id):
+                if let trace = model.traces.first(where: { $0.id == id }) {
+                    points += trace.points
+                }
+            case .segment(let id, let index):
+                if let trace = model.traces.first(where: { $0.id == id }),
+                   trace.points.indices.contains(index),
+                   trace.points.indices.contains(index + 1) {
+                    points.append(trace.points[index])
+                    points.append(trace.points[index + 1])
+                }
+            case .vertex(let id, let index):
+                if let trace = model.traces.first(where: { $0.id == id }),
+                   trace.points.indices.contains(index) {
+                    points.append(trace.points[index])
+                }
+            case .via(let id):
+                if let via = model.vias.first(where: { $0.id == id }) {
+                    points.append(FPPoint(x: via.center.x - via.diameter / 2,
+                                          y: via.center.y - via.diameter / 2))
+                    points.append(FPPoint(x: via.center.x + via.diameter / 2,
+                                          y: via.center.y + via.diameter / 2))
+                }
+            case .zone(let id):
+                if let zone = model.zones.first(where: { $0.id == id }) {
+                    points += zone.points
+                }
+            case .graphic(let id):
+                if let item = model.graphics.first(where: { $0.id == id }) {
+                    points += item.points
+                    if item.kind == .circle, let centre = item.points.first {
+                        points.append(FPPoint(x: centre.x - item.radius,
+                                              y: centre.y - item.radius))
+                        points.append(FPPoint(x: centre.x + item.radius,
+                                              y: centre.y + item.radius))
+                    }
+                }
+            }
+        }
+        return points
+    }
+
+    /// The centre of the selection's bounds (Move Exactly's
+    /// rotation centre, part 5.3 P1), from item geometry.
+    private var selectionBoundsCentre: FPPoint? {
+        let points = selectionGeometryPoints(includePads: false)
+        guard let first = points.first else { return nil }
+        var minX = first.x, minY = first.y, maxX = first.x, maxY = first.y
+        for point in points {
+            minX = min(minX, point.x); minY = min(minY, point.y)
+            maxX = max(maxX, point.x); maxY = max(maxY, point.y)
+        }
+        return FPPoint(x: (minX + maxX) / 2, y: (minY + maxY) / 2)
+    }
+
+    /// The net Select All Tracks in Net (P2) works on: the net of
+    /// the primary selected trace/via, else of any selected
+    /// trace/via, else the highlighted net, else nil (disabled).
+    private var netSelectionContext: String? {
+        guard let model else { return highlightedNet }
+        func net(of item: BoardSelection) -> String? {
+            switch item {
+            case .trace(let id), .segment(let id, _), .vertex(let id, _):
+                return model.traces.first { $0.id == id }?.netName
+            case .via(let id):
+                return model.vias.first { $0.id == id }?.netName
+            default:
+                return nil
+            }
+        }
+        if let primarySelection, let net = net(of: primarySelection) {
+            return net
+        }
+        for item in selections {
+            if let net = net(of: item) { return net }
+        }
+        return highlightedNet
+    }
+
     /// "3 objects · 2 traces · 25.40 mm · 1000 mil total" — the
     /// traces subtotal Sean pinned: shown whenever the selection
     /// contains traces, in single AND mixed selections. Part 5.1
@@ -689,6 +875,39 @@ struct PCBEditorView: View {
         .sheet(isPresented: $showTheory) {
             theorySheet
         }
+        .sheet(isPresented: $showMoveExactly) {
+            moveExactlySheet
+        }
+        .sheet(isPresented: $showCleanupTracks) {
+            cleanupTracksSheet
+        }
+        .sheet(isPresented: $showCleanupGraphics) {
+            cleanupGraphicsSheet
+        }
+        .sheet(isPresented: $showGlobalDelete) {
+            globalDeleteSheet
+        }
+        .sheet(isPresented: $showNetClasses) {
+            netClassesSheet
+        }
+        .sheet(isPresented: $showFind) {
+            findSheet
+        }
+        .alert("Swap Front/Back Copper?", isPresented: $showSwapLayersConfirm) {
+            Button("Swap Layers") { swapLayers() }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Every trace, fill, teardrop and copper graphic swaps front ↔ back (inner layers mirror through the stack), and every footprint flips side.")
+        }
+        // Cross-probe (part 5.3, S8/P-side): a "Show on Board"
+        // from the schematic lands here. Consumption is retried
+        // when the canvas gets a size (a probe set before this
+        // editor opened can only centre once the canvas exists);
+        // the target is cleared only on a successful consume.
+        .onAppear { consumeCrossProbe() }
+        .onChange(of: crossProbe.target) { _, _ in consumeCrossProbe() }
+        .onChange(of: canvasSize) { _, _ in consumeCrossProbe() }
+        .onDisappear { liveSession.clearPCB() }
         .sheet(isPresented: Binding(
             get: { netChoicePurpose != nil },
             set: { if !$0 { netChoicePurpose = nil } }
@@ -741,15 +960,63 @@ struct PCBEditorView: View {
         }
         connectivity = BoardConnectivity.analyze(
             model: model, copperCount: boardState.copperLayerCount)
+        // Part 5.3: the boardState overloads, so netclass
+        // clearances (P16) take effect live (the board clearance
+        // in boardState IS manufacturingSettings.clearanceMil —
+        // the settings are derived from it).
         clearanceViolations = BoardClearance.violations(
             model: model, copperCount: boardState.copperLayerCount,
-            clearanceMM: BoardUnits.mm(fromMil: boardState.clearanceMil))
+            boardState: boardState)
         // Part 5.2: the spatial index and the ratsnest rebuild
         // with the checks — once per edit/commit, never per
-        // pointer event.
+        // pointer event. Part 5.3 (P8): nets hidden in the Nets
+        // panel contribute no ratsnest segments.
         spatialIndex = BoardSpatialIndex.build(model)
         ratsnestSegments = BoardRatsnest.segments(
-            model: model, copperCount: boardState.copperLayerCount)
+            model: model, copperCount: boardState.copperLayerCount,
+            hiddenNets: Set(boardState.ratsnestHiddenNets))
+        // Part 5.3: publish the live session for the external
+        // display at this same choke point (title = the board's
+        // table title, as the table bar shows it).
+        liveSession.publishPCB(title: model.tableTitle,
+                               state: boardState, model: model)
+    }
+
+    // MARK: - Cross-probe + centring (part 5.3)
+
+    /// Consume a cross-probe target naming a footprint: select
+    /// the component (the same selection state the Components
+    /// panel writes) and centre the canvas on its placement,
+    /// using the same offset math as Fit Board. Only a target
+    /// that resolves — model loaded, reference present, canvas
+    /// sized — is cleared; anything else stays pending for the
+    /// next trigger (appear / target change / canvas size).
+    private func consumeCrossProbe() {
+        guard case .footprint(let reference)? = crossProbe.target,
+              let model,
+              model.components.contains(where: { $0.reference == reference }),
+              canvasSize.width > 10, canvasSize.height > 10
+        else { return }
+        selectOnly(.component(reference))
+        centreOnComponent(reference)
+        crossProbe.target = nil
+        setStatus("Showing \(reference) — cross-probed from the schematic.")
+    }
+
+    /// Centre the canvas on a board point at the current scale
+    /// (Fit Board's offset formula, minus the rescale).
+    private func centreOnBoardPoint(_ point: FPPoint) {
+        guard canvasSize.width > 10, canvasSize.height > 10 else { return }
+        offset = CGPoint(x: canvasSize.width / 2 - CGFloat(point.x * scale),
+                         y: canvasSize.height / 2 - CGFloat(point.y * scale))
+    }
+
+    private func centreOnComponent(_ reference: String) {
+        guard let component = model?.components.first(
+            where: { $0.reference == reference }) else { return }
+        let b = BoardGeometry.componentBounds(component)
+        centreOnBoardPoint(FPPoint(x: (b.minX + b.maxX) / 2,
+                                   y: (b.minY + b.maxY) / 2))
     }
 
     private var manufacturingSettings: ManufacturingSettings {
@@ -1178,7 +1445,11 @@ struct PCBEditorView: View {
     }
 
     private func handleEscapeKey() {
-        if routingActive {
+        if pasteArmed {
+            // An armed paste (part 5.3, P11) cancels first.
+            pasteArmed = false
+            setStatus("Paste cancelled.")
+        } else if routingActive {
             cancelInProgress()
             setStatus("Routing cancelled.")
         } else if zoneActive {
@@ -1229,6 +1500,8 @@ struct PCBEditorView: View {
     // MARK: - Menu strip (every item performs a real action)
 
     private func setTool(_ tool: PCBTool) {
+        // Switching tools also disarms a pending paste (P11).
+        pasteArmed = false
         if tool != .route, routingActive { cancelInProgress() }
         if tool != .fillZone, zoneActive { zonePoints = [] }
         if tool != activeTool { pendingPoints = [] }
@@ -1242,6 +1515,10 @@ struct PCBEditorView: View {
                     Task { await syncFromSchematic() }
                 }
                 .disabled(isSyncing)
+                Button("Update Footprints from Library") {
+                    updateFootprintsFromLibrary()
+                }
+                .disabled(model == nil)
                 Button("Rescan Tables") { rescanTables() }
                 Button("Save Board Now") {
                     try? BoardStateStore.save(boardState, tableStem: tableStem)
@@ -1255,8 +1532,25 @@ struct PCBEditorView: View {
                 Button("Redo") { redo() }
                     .disabled(redoStack.isEmpty)
                 Divider()
+                Button("Copy") { copySelectionToClipboard() }
+                    .disabled(selections.isEmpty)
+                Button("Paste") {
+                    pasteArmed = true
+                    setStatus("Tap to paste — tap the board where the copied items should land (Esc cancels).")
+                }
+                .disabled(clipboardSlice == nil)
+                Divider()
+                Button("Move Exactly…") { showMoveExactly = true }
+                    .disabled(selections.isEmpty)
+                Button("Select All Tracks in Net") { selectAllOnNet(deselect: false) }
+                    .disabled(netSelectionContext == nil)
+                Button("Deselect All Tracks in Net") { selectAllOnNet(deselect: true) }
+                    .disabled(netSelectionContext == nil)
+                Divider()
                 Button(flipActionTitle) { flipSelection() }
                     .disabled(!canFlipSelection)
+                Button("Swap Front/Back Copper") { showSwapLayersConfirm = true }
+                    .disabled(model == nil)
                 Button("Delete Selection") { deleteSelection() }
                     .disabled(selections.isEmpty)
                 Button("Clear Net Highlight") { highlightedNet = nil }
@@ -1266,6 +1560,8 @@ struct PCBEditorView: View {
                 Button("Zoom In") { zoomIn() }
                 Button("Zoom Out") { zoomOut() }
                 Button("Fit Board") { fitBoard() }
+                Button("Zoom to Selection") { zoomToSelection() }
+                    .disabled(selections.isEmpty)
                 Divider()
                 Button(showGrid ? "✓ Grid" : "Grid") { showGrid.toggle() }
                 Button(snapEnabled ? "✓ Snap to Grid" : "Snap to Grid") {
@@ -1277,6 +1573,14 @@ struct PCBEditorView: View {
                 Button(highlightActiveLayer
                        ? "✓ Highlight Active Layer" : "Highlight Active Layer") {
                     highlightActiveLayer.toggle()
+                }
+                Menu("Inactive Layers") {
+                    ForEach(InactiveLayerMode.allCases, id: \.rawValue) { mode in
+                        Button(inactiveLayerMode == mode
+                               ? "✓ \(mode.rawValue)" : mode.rawValue) {
+                            inactiveLayerMode = mode
+                        }
+                    }
                 }
                 Button("Show All Layers & Objects") {
                     visibility = BoardVisibility(
@@ -1314,6 +1618,9 @@ struct PCBEditorView: View {
                 }
             }
             Menu("Inspect") {
+                Button("Find…") { showFind = true }
+                    .disabled(model == nil)
+                Divider()
                 Button("Highlight Net") { setTool(.highlightNet) }
                 Button("Clear Highlight") { highlightedNet = nil }
                     .disabled(highlightedNet == nil)
@@ -1332,8 +1639,44 @@ struct PCBEditorView: View {
                         setTool(tool)
                     }
                 }
+                Divider()
+                Button("Select Unconnected Footprints") { selectUnconnectedFootprints() }
+                    .disabled(model == nil)
+                Button("Next Unconnected Footprint") { selectNextUnconnectedFootprint() }
+                    .disabled(model == nil)
+                Divider()
+                Button("Cleanup Tracks & Vias…") { showCleanupTracks = true }
+                    .disabled(model == nil)
+                Button("Cleanup Graphics…") { showCleanupGraphics = true }
+                    .disabled(model == nil)
+                Divider()
+                Button("Add Teardrops") { addTeardrops() }
+                    .disabled(model == nil)
+                Menu("Remove Teardrops") {
+                    Button("All") {
+                        mutateBoard { state in
+                            state = BoardTeardrops.removingAll(from: state)
+                        }
+                        setStatus("All teardrops removed.")
+                    }
+                    Button("For Highlighted Net") {
+                        if let highlightedNet {
+                            mutateBoard { state in
+                                state = BoardTeardrops.removing(from: state,
+                                                                 net: highlightedNet)
+                            }
+                            setStatus("Teardrops removed for \(highlightedNet).")
+                        }
+                    }
+                    .disabled(highlightedNet == nil)
+                }
+                Divider()
+                Button("Global Deletions…") { showGlobalDelete = true }
+                    .disabled(model == nil)
             }
             Menu("Preferences") {
+                Button("Netclasses…") { showNetClasses = true }
+                Divider()
                 Menu("Grid Spacing") {
                     ForEach(BoardGrid.presetMils, id: \.self) { mils in
                         Button(boardState.gridMil == mils
@@ -1773,10 +2116,7 @@ struct PCBEditorView: View {
                     .lineLimit(2)
             }
             ForEach(nets, id: \.netName) { net in
-                Button {
-                    highlightedNet = highlightedNet == net.netName
-                        ? nil : net.netName
-                } label: {
+                VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         Text(net.netName)
                             .font(.callout.weight(.semibold))
@@ -1800,21 +2140,65 @@ struct PCBEditorView: View {
                                 .lineLimit(1)
                                 .fixedSize(horizontal: true, vertical: false)
                         }
+                        // Per-net ratsnest eye (part 5.3, P8):
+                        // a real Button beside the row's tap area
+                        // (the row itself is a tap gesture, like
+                        // the Layers panel, so the buttons inside
+                        // it stay tappable).
+                        Button {
+                            toggleRatsnestHidden(net.netName)
+                        } label: {
+                            Image(systemName: boardState.ratsnestHiddenNets
+                                  .contains(net.netName) ? "eye.slash" : "eye")
+                                .font(.callout)
+                                .foregroundStyle(.white.opacity(0.8))
+                                .lineLimit(1)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(highlightedNet == net.netName
-                                ? Color.accentColor.opacity(0.30)
-                                : Color.white.opacity(0.05),
-                                in: RoundedRectangle(cornerRadius: 7))
-                    .contentShape(Rectangle())
+                    // Netclass assignment (part 5.3, P16).
+                    HStack(spacing: 8) {
+                        Text("Class")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        Menu {
+                            Button(boardState.netClassByNet[net.netName] == nil
+                                   ? "✓ No class" : "No class") {
+                                assignNetClass(net.netName, className: nil)
+                            }
+                            ForEach(boardState.netClasses, id: \.name) { netClass in
+                                Button(boardState.netClassByNet[net.netName] == netClass.name
+                                       ? "✓ \(netClass.name)" : netClass.name) {
+                                    assignNetClass(net.netName,
+                                                   className: netClass.name)
+                                }
+                            }
+                        } label: {
+                            Text(boardState.netClassByNet[net.netName] ?? "No class")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(Color.accentColor)
+                                .lineLimit(1)
+                        }
+                        Spacer(minLength: 0)
+                    }
                 }
-                .buttonStyle(.plain)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(highlightedNet == net.netName
+                            ? Color.accentColor.opacity(0.30)
+                            : Color.white.opacity(0.05),
+                            in: RoundedRectangle(cornerRadius: 7))
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    highlightedNet = highlightedNet == net.netName
+                        ? nil : net.netName
+                }
             }
-            Text("Tap a net to highlight it on the board; tap again to clear. \"Open\" counts pads that reach no other pad — the ratsnest lines show where they still need to go.")
+            Text("Tap a net to highlight it on the board; tap again to clear. \"Open\" counts pads that reach no other pad — the ratsnest lines show where they still need to go. The eye hides that net's ratsnest lines; Class assigns a netclass (Preferences ▸ Netclasses edits them).")
                 .font(.caption)
                 .foregroundStyle(.secondary)
-                .lineLimit(5)
+                .lineLimit(6)
         }
     }
 
@@ -2205,6 +2589,33 @@ struct PCBEditorView: View {
             }
             .buttonStyle(.bordered)
             .padding(.top, 2)
+            // Cross-probe (part 5.3): jump to this part's symbol
+            // in the schematic editor.
+            Button {
+                crossProbe.target = .symbol(reference: component.reference)
+                navigate("schematic")
+            } label: {
+                Label("Show in Schematic", systemImage: "point.3.connected.trianglepath.dotted")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            Button {
+                updateFootprintsFromLibrary(onlyReference: component.reference)
+            } label: {
+                Label("Update Footprint from Library", systemImage: "arrow.clockwise")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
+            Button {
+                unrouteComponent(component.reference)
+            } label: {
+                Label("Unroute Footprint", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
             lockRow(.component(component.reference))
 
             Text("Pins → pads")
@@ -2349,6 +2760,14 @@ struct PCBEditorView: View {
                 lockRow(.trace(trace.id))
                 duplicateButtonRow()
             }
+            Button {
+                unrouteTrace(trace)
+            } label: {
+                Label("Unroute from Here", systemImage: "point.bottomleft.forward.to.point.topright.scurvepath")
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+            }
+            .buttonStyle(.bordered)
             Text("Width (mm)")
                 .font(.callout.weight(.semibold))
                 .foregroundStyle(.white.opacity(0.85))
@@ -2644,19 +3063,36 @@ struct PCBEditorView: View {
     // MARK: - Checker sheets (part 5)
 
     private var manufacturingSheet: some View {
+        // Part 5.3: the boardState overload (netclass-aware rule
+        // 1) and finding exclusions (P7): rows, pass/fail headers
+        // and the summary all run on the VISIBLE findings —
+        // excluded findings stop counting until restored.
         let report = model.map {
             BoardManufacturing.check(model: $0,
                                      copperCount: boardState.copperLayerCount,
                                      settings: manufacturingSettings,
-                                     connectivity: connectivity)
+                                     connectivity: connectivity,
+                                     boardState: boardState)
         }
+        let partition = report.map {
+            BoardManufacturing.visibleFindings(
+                $0.findings, excluding: boardState.manufacturingExclusions)
+        }
+        let visibleKeys = Set(partition?.visible.map(\.key) ?? [])
+        let staleKeys = report.map {
+            BoardManufacturing.staleExclusions(
+                boardState.manufacturingExclusions, findings: $0.findings)
+        } ?? []
+        let visibleFailedCount = report?.rules.filter { rule in
+            rule.findings.contains { visibleKeys.contains($0.key) }
+        }.count ?? 0
         return NavigationStack {
             List {
                 Section {
-                    Text(report.map {
-                        $0.allPassed
-                            ? "All \($0.rules.count) rules pass — this board is inside the current manufacturing limits."
-                            : "\($0.failedCount) of \($0.rules.count) rules fail. The failing rules list what and where below."
+                    Text(report.map { _ in
+                        visibleFailedCount == 0
+                            ? "All \(report?.rules.count ?? 0) rules pass — this board is inside the current manufacturing limits."
+                            : "\(visibleFailedCount) of \(report?.rules.count ?? 0) rules fail. The failing rules list what and where below."
                     } ?? "No board loaded.")
                         .font(.callout)
                 } header: {
@@ -2671,30 +3107,93 @@ struct PCBEditorView: View {
                 }
                 if let report {
                     ForEach(Array(report.rules.enumerated()), id: \.offset) { _, rule in
+                        let visibleFindings = rule.findings.filter {
+                            visibleKeys.contains($0.key)
+                        }
                         Section {
-                            if rule.violations.isEmpty {
+                            if visibleFindings.isEmpty {
                                 Text("Pass — nothing to report.")
                                     .font(.callout)
                                     .foregroundStyle(.secondary)
                             } else {
-                                ForEach(Array(rule.violations.prefix(12).enumerated()),
-                                        id: \.offset) { _, violation in
-                                    Text(violation)
-                                        .font(.callout)
+                                ForEach(Array(visibleFindings.prefix(12).enumerated()),
+                                        id: \.offset) { _, finding in
+                                    HStack(alignment: .top, spacing: 8) {
+                                        Text(finding.message)
+                                            .font(.callout)
+                                        Spacer(minLength: 0)
+                                        Button("Exclude") {
+                                            excludeManufacturingFinding(finding.key)
+                                        }
+                                        .font(.callout.weight(.semibold))
+                                        .lineLimit(1)
+                                    }
                                 }
-                                if rule.violations.count > 12 {
-                                    Text("…and \(rule.violations.count - 12) more")
+                                if visibleFindings.count > 12 {
+                                    Text("…and \(visibleFindings.count - 12) more")
                                         .font(.callout)
                                         .foregroundStyle(.secondary)
                                 }
                             }
                         } header: {
                             HStack(spacing: 6) {
-                                Image(systemName: rule.passed
+                                Image(systemName: visibleFindings.isEmpty
                                       ? "checkmark.circle.fill" : "xmark.circle.fill")
-                                    .foregroundStyle(rule.passed ? .green : .red)
+                                    .foregroundStyle(visibleFindings.isEmpty
+                                                     ? .green : .red)
                                 Text(rule.name)
                             }
+                        }
+                    }
+                    if let partition, !partition.excluded.isEmpty {
+                        Section {
+                            ForEach(Array(partition.excluded.enumerated()),
+                                    id: \.offset) { _, finding in
+                                HStack(alignment: .top, spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(finding.message)
+                                            .font(.callout)
+                                            .foregroundStyle(.secondary)
+                                        if let note = boardState
+                                            .manufacturingExclusionNotes[finding.key],
+                                           !note.isEmpty {
+                                            Text(note)
+                                                .font(.caption)
+                                                .foregroundStyle(.secondary)
+                                        }
+                                    }
+                                    Spacer(minLength: 0)
+                                    Button("Restore") {
+                                        restoreManufacturingFinding(finding.key)
+                                    }
+                                    .font(.callout.weight(.semibold))
+                                    .lineLimit(1)
+                                }
+                            }
+                        } header: {
+                            Text("Excluded (\(partition.excluded.count))")
+                        } footer: {
+                            Text("Excluded findings don't count toward the result. Restore one to count it again.")
+                        }
+                    }
+                    if !staleKeys.isEmpty {
+                        Section {
+                            ForEach(Array(staleKeys.enumerated()),
+                                    id: \.offset) { _, key in
+                                HStack(alignment: .top, spacing: 8) {
+                                    Text("\(key) — no longer matches any finding")
+                                        .font(.callout)
+                                        .foregroundStyle(.secondary)
+                                    Spacer(minLength: 0)
+                                    Button("Remove") {
+                                        restoreManufacturingFinding(key)
+                                    }
+                                    .font(.callout.weight(.semibold))
+                                    .lineLimit(1)
+                                }
+                            }
+                        } header: {
+                            Text("Stale exclusions")
                         }
                     }
                 }
@@ -2707,6 +3206,26 @@ struct PCBEditorView: View {
             }
         }
         .preferredColorScheme(.dark)
+    }
+
+    /// Exclude one manufacturing finding by its stable key (P7).
+    private func excludeManufacturingFinding(_ key: String) {
+        mutateBoard { state in
+            if !state.manufacturingExclusions.contains(key) {
+                state.manufacturingExclusions.append(key)
+            }
+        }
+        setStatus("Finding excluded — it no longer counts in the Manufacturing Check.")
+    }
+
+    /// Restore an excluded finding (or drop a stale exclusion
+    /// key): the key leaves the board's exclusion list.
+    private func restoreManufacturingFinding(_ key: String) {
+        mutateBoard { state in
+            state.manufacturingExclusions.removeAll { $0 == key }
+            state.manufacturingExclusionNotes[key] = nil
+        }
+        setStatus("Finding restored — it counts in the Manufacturing Check again.")
     }
 
     // MARK: - Theory check sheet (heuristics + optional on-device AI)
@@ -2754,7 +3273,8 @@ struct PCBEditorView: View {
                                     model: model,
                                     copperCount: boardState.copperLayerCount,
                                     settings: manufacturingSettings,
-                                    connectivity: connectivity),
+                                    connectivity: connectivity,
+                                    boardState: boardState),
                                 theory: findings)
                             DisclosureGroup("The exact summary it sees") {
                                 Text(summary)
@@ -2977,6 +3497,14 @@ struct PCBEditorView: View {
             }
         }
         guard minX <= maxX, minY <= maxY else { return }
+        frameBoardRect(minX: minX, minY: minY, maxX: maxX, maxY: maxY)
+    }
+
+    /// Frame one board rectangle in the canvas: Fit Board's
+    /// scale/offset math, shared with Zoom to Selection (P17).
+    private func frameBoardRect(minX: Double, minY: Double,
+                                maxX: Double, maxY: Double) {
+        guard canvasSize.width > 10, canvasSize.height > 10 else { return }
         let w = max(maxX - minX, 1), h = max(maxY - minY, 1)
         let newScale = BoardCanvasMetrics.clamped(
             min((Double(canvasSize.width) - 32) / w,
@@ -3058,7 +3586,41 @@ struct PCBEditorView: View {
             moveViaPreview: moveViaPreview,
             editDragTraceID: editDragTraceID,
             editDragPreviewPoints: editDragPreviewPoints,
-            ratsnestCount: ratsnestSegments.count)
+            ratsnestCount: ratsnestSegments.count,
+            inactiveLayerModeRaw: inactiveLayerMode.rawValue)
+    }
+
+    /// The alpha an item on `layer` draws at under the inactive-
+    /// layer mode (part 5.3, P9): 1 when the layer IS the active
+    /// layer (or the mode is Normal), 0.35 in Dim, nil in Hide
+    /// (the caller skips the item). Traces and pads layer their
+    /// legacy dimming on top of / in place of this — see
+    /// drawAllTraces and padInactiveFactor.
+    private func inactiveFactor(forLayer layer: String) -> Double? {
+        switch inactiveLayerMode {
+        case .normal: return 1
+        case .dim: return layer == activeLayer ? 1 : 0.35
+        case .hide: return layer == activeLayer ? 1 : nil
+        }
+    }
+
+    /// A pad's inactive factor: pads count as "on" the active
+    /// layer when they touch it or span every copper layer
+    /// ("*.Cu") — the membership rule the old Highlight Active
+    /// Layer dimming used, now serving all three modes. In
+    /// Normal mode the legacy opt-in dimming (0.4, only under
+    /// the Highlight Active Layer toggle) is preserved exactly.
+    private func padInactiveFactor(_ pad: KiCadFootprintPad) -> Double? {
+        let touches = pad.layers.contains(activeLayer)
+            || pad.layers.contains("*.Cu")
+        switch inactiveLayerMode {
+        case .normal:
+            return (highlightActiveLayer && !touches) ? 0.4 : 1
+        case .dim:
+            return touches ? 1 : 0.35
+        case .hide:
+            return touches ? 1 : nil
+        }
     }
 
     private func boardCanvas(model: BoardModel) -> some View {
@@ -3487,6 +4049,12 @@ struct PCBEditorView: View {
 
     private func handleTap(at point: FPPoint) {
         guard let model else { return }
+        // An armed paste (part 5.3, P11) takes the next Select-
+        // tool tap as its landing point.
+        if pasteArmed, activeTool == .select {
+            commitPaste(at: point)
+            return
+        }
         switch activeTool {
         case .select:
             handleSelectTap(model: model, point: point)
@@ -4177,6 +4745,859 @@ struct PCBEditorView: View {
         setStatus("\(ids.count) tracks moved to \(layer) — saved with the board.")
     }
 
+    // MARK: - Part 5.3 actions (selection ops, cleanup, clipboard, find)
+
+    /// Select / deselect everything carrying the context net
+    /// (P2): traces and vias by id, footprints by reference —
+    /// BoardNetQueries is the membership source.
+    private func selectAllOnNet(deselect: Bool) {
+        guard let model, let net = netSelectionContext else { return }
+        let query = BoardNetQueries.itemIDs(onNet: net, state: boardState,
+                                            model: model)
+        var items = Set<BoardSelection>()
+        for id in query.traceIDs {
+            if let uuid = UUID(uuidString: id) { items.insert(.trace(uuid)) }
+        }
+        for id in query.viaIDs {
+            if let uuid = UUID(uuidString: id) { items.insert(.via(uuid)) }
+        }
+        for reference in query.references {
+            items.insert(.component(reference))
+        }
+        if deselect {
+            selections.subtract(items)
+            // Segments/vertices of the net's traces go too.
+            selections = selections.filter { item in
+                switch item {
+                case .segment(let id, _), .vertex(let id, _):
+                    return !query.traceIDs.contains(id.uuidString)
+                default:
+                    return true
+                }
+            }
+            if let primarySelection, !selections.contains(primarySelection) {
+                self.primarySelection = selections.first
+            }
+            setStatus("Deselected \(items.count) item(s) on \(net).")
+        } else {
+            selections.formUnion(items)
+            primarySelection = items.first ?? primarySelection
+            setStatus("Selected \(query.traceIDs.count) track(s), "
+                      + "\(query.viaIDs.count) via(s) and "
+                      + "\(query.references.count) footprint(s) on \(net).")
+        }
+    }
+
+    /// Select every footprint with at least one unrouted pad
+    /// (P3), per BoardConnectivity via BoardNetQueries.
+    private func selectUnconnectedFootprints() {
+        guard let model else { return }
+        let references = BoardNetQueries.unconnectedReferences(
+            model: model, copperCount: boardState.copperLayerCount)
+        selections = Set(references.map { BoardSelection.component($0) })
+        primarySelection = references.first.map { BoardSelection.component($0) }
+        nextUnconnectedIndex = 0
+        setStatus("\(references.count) unconnected footprints")
+    }
+
+    /// Step through the unconnected footprints one at a time
+    /// (P3): select + centre each, wrapping around the list.
+    private func selectNextUnconnectedFootprint() {
+        guard let model else { return }
+        let references = BoardNetQueries.unconnectedReferences(
+            model: model, copperCount: boardState.copperLayerCount)
+        guard !references.isEmpty else {
+            setStatus("No unconnected footprints — every pad reaches its net.")
+            return
+        }
+        let index = references.indices.contains(nextUnconnectedIndex)
+            ? nextUnconnectedIndex : 0
+        let reference = references[index]
+        selectOnly(.component(reference))
+        centreOnComponent(reference)
+        nextUnconnectedIndex = (index + 1) % references.count
+        setStatus("Unconnected footprint \(index + 1) of \(references.count): \(reference).")
+    }
+
+    // MARK: Move Exactly (P1)
+
+    private var moveExactlySheet: some View {
+        let rotation = Double(moveRotationDraft) ?? 0
+        let selectionHasFootprints = selections.contains { item in
+            if case .component = item { return true }
+            return false
+        }
+        return NavigationStack {
+            List {
+                Section {
+                    Picker("Coordinates", selection: $movePolar) {
+                        Text("Cartesian").lineLimit(1).tag(false)
+                        Text("Polar").lineLimit(1).tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    if movePolar {
+                        HStack(spacing: 8) {
+                            Text("Distance (mm)").lineLimit(1)
+                            Spacer(minLength: 0)
+                            TextField("Distance", text: $moveDistanceDraft)
+                                .keyboardType(.numbersAndPunctuation)
+                                .multilineTextAlignment(.trailing)
+                        }
+                        HStack(spacing: 8) {
+                            Text("Angle (°)").lineLimit(1)
+                            Spacer(minLength: 0)
+                            TextField("Angle", text: $moveAngleDraft)
+                                .keyboardType(.numbersAndPunctuation)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    } else {
+                        HStack(spacing: 8) {
+                            Text("ΔX (mm)").lineLimit(1)
+                            Spacer(minLength: 0)
+                            TextField("ΔX", text: $moveDeltaXDraft)
+                                .keyboardType(.numbersAndPunctuation)
+                                .multilineTextAlignment(.trailing)
+                        }
+                        HStack(spacing: 8) {
+                            Text("ΔY (mm)").lineLimit(1)
+                            Spacer(minLength: 0)
+                            TextField("ΔY", text: $moveDeltaYDraft)
+                                .keyboardType(.numbersAndPunctuation)
+                                .multilineTextAlignment(.trailing)
+                        }
+                    }
+                    HStack(spacing: 8) {
+                        Text("Rotation (°)").lineLimit(1)
+                        Spacer(minLength: 0)
+                        TextField("Rotation", text: $moveRotationDraft)
+                            .keyboardType(.numbersAndPunctuation)
+                            .multilineTextAlignment(.trailing)
+                    }
+                } header: {
+                    Text("Move Exactly")
+                } footer: {
+                    Text("Rotation is around the selection's centre. Board Y runs down, so angles turn clockwise on screen, as in KiCad.")
+                }
+                if selectionHasFootprints, rotation != 0 {
+                    Section {
+                        Text("Footprints move but do not spin — PadCB footprints have no rotation.")
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                    }
+                }
+                Section {
+                    Button("Apply") { applyMoveExactly() }
+                        .font(.callout.weight(.semibold))
+                }
+            }
+            .navigationTitle("Move Exactly")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showMoveExactly = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    /// One undo step: rotate (when asked) around the selection
+    /// bounds centre, then translate — BoardTransforms composed
+    /// in that order. Footprint origins are seeded into
+    /// `placements` first: BoardTransforms moves footprints via
+    /// their placements, and a never-moved part has no entry yet
+    /// (its origin lives only in the merged model).
+    private func applyMoveExactly() {
+        guard let centre = selectionBoundsCentre else {
+            showMoveExactly = false
+            return
+        }
+        let rotation = Double(moveRotationDraft) ?? 0
+        let delta: FPPoint
+        if movePolar {
+            let distance = Double(moveDistanceDraft) ?? 0
+            let angle = Double(moveAngleDraft) ?? 0
+            delta = FPPoint(x: distance, y: 0).rotated(degrees: angle)
+        } else {
+            delta = FPPoint(x: Double(moveDeltaXDraft) ?? 0,
+                            y: Double(moveDeltaYDraft) ?? 0)
+        }
+        let ids = selectionItemIDs
+        let modelComponents = model?.components ?? []
+        mutateBoard { state in
+            for component in modelComponents
+            where ids.contains(component.reference)
+                && state.placements[component.reference] == nil {
+                state.placements[component.reference] = component.origin
+            }
+            var result = state
+            if rotation != 0 {
+                result = BoardTransforms.rotated(state: result, itemIDs: ids,
+                                                  centre: centre,
+                                                  degrees: rotation)
+            }
+            if delta.x != 0 || delta.y != 0 {
+                result = BoardTransforms.translated(state: result, itemIDs: ids,
+                                                    dx: delta.x, dy: delta.y)
+            }
+            state = result
+        }
+        showMoveExactly = false
+        setStatus("Selection moved exactly — Δ \(fmt(delta.x)), \(fmt(delta.y)) mm"
+                  + (rotation != 0 ? ", rotated \(fmt(rotation))°" : "")
+                  + ". Saved with the board.")
+    }
+
+    // MARK: Cleanup sheets (P4/P5)
+
+    private var cleanupOptions: BoardCleanupOptions {
+        BoardCleanupOptions(removeDangling: cleanupDangling,
+                            removeNullSegments: cleanupNullSegments,
+                            mergeCollinear: cleanupMergeCollinear,
+                            removeDuplicateVias: cleanupDuplicateVias,
+                            removeDisconnected: cleanupDisconnected)
+    }
+
+    /// Plain labels for the cleanup report keys, in display order.
+    private static let cleanupTrackLabels: [(key: String, label: String)] = [
+        ("danglingTracks", "Dangling tracks"),
+        ("nullSegments", "Zero-length segments collapsed"),
+        ("mergedSegments", "Collinear segments merged"),
+        ("duplicateVias", "Duplicate vias removed"),
+        ("disconnectedItems", "Disconnected items removed"),
+    ]
+
+    private var cleanupTracksSheet: some View {
+        // Dry-run preview: the pure cleaner over the CURRENT
+        // state — nothing commits until Apply.
+        let preview = model.map {
+            BoardCleanup.cleanTracksAndVias(state: boardState, model: $0,
+                                            options: cleanupOptions).report
+        }
+        return NavigationStack {
+            List {
+                Section {
+                    Toggle("Remove dangling tracks", isOn: $cleanupDangling)
+                    Toggle("Remove zero-length segments", isOn: $cleanupNullSegments)
+                    Toggle("Merge collinear segments", isOn: $cleanupMergeCollinear)
+                    Toggle("Remove duplicate vias", isOn: $cleanupDuplicateVias)
+                    Toggle("Remove disconnected items", isOn: $cleanupDisconnected)
+                } header: {
+                    Text("Cleanup Tracks & Vias")
+                } footer: {
+                    Text("Locked items are never touched.")
+                }
+                Section {
+                    if let preview {
+                        let rows = Self.cleanupTrackLabels.filter {
+                            (preview[$0.key] ?? 0) > 0
+                        }
+                        if rows.isEmpty {
+                            Text("Nothing to clean up with these options.")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(Array(rows.enumerated()), id: \.offset) { _, row in
+                                HStack(spacing: 8) {
+                                    Text(row.label).font(.callout).lineLimit(1)
+                                    Spacer(minLength: 0)
+                                    Text("\(preview[row.key] ?? 0)")
+                                        .font(.callout.weight(.semibold))
+                                        .lineLimit(1)
+                                }
+                            }
+                        }
+                    } else {
+                        Text("No board loaded.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Preview")
+                }
+                Section {
+                    Button("Apply Cleanup") { applyCleanupTracks() }
+                        .font(.callout.weight(.semibold))
+                }
+            }
+            .navigationTitle("Cleanup Tracks & Vias")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showCleanupTracks = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    /// Apply = ONE mutateBoard: the cleaner recomputes against
+    /// the closure's state, so preview and commit can't drift.
+    private func applyCleanupTracks() {
+        guard let model else { showCleanupTracks = false; return }
+        let options = cleanupOptions
+        var report: [String: Int] = [:]
+        mutateBoard { state in
+            let result = BoardCleanup.cleanTracksAndVias(
+                state: state, model: model, options: options)
+            state = result.state
+            report = result.report
+        }
+        showCleanupTracks = false
+        let total = report.values.reduce(0, +)
+        setStatus(total == 0
+                  ? "Cleanup ran — nothing needed cleaning."
+                  : "Cleanup removed/merged \(total) item(s) — saved with the board.")
+    }
+
+    private var cleanupGraphicsSheet: some View {
+        let preview = BoardCleanup.cleanGraphics(state: boardState).report
+        let rows: [(key: String, label: String)] = [
+            ("duplicateGraphics", "Duplicate graphics removed"),
+            ("mergedGraphics", "Collinear graphics merged"),
+        ]
+        return NavigationStack {
+            List {
+                Section {
+                    Text("Removes exact-duplicate graphics and merges collinear touching line graphics on the same layer. Locked items are never touched.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                } header: {
+                    Text("Cleanup Graphics")
+                }
+                Section {
+                    let visibleRows = rows.filter { (preview[$0.key] ?? 0) > 0 }
+                    if visibleRows.isEmpty {
+                        Text("Nothing to clean up.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(visibleRows.enumerated()), id: \.offset) { _, row in
+                            HStack(spacing: 8) {
+                                Text(row.label).font(.callout).lineLimit(1)
+                                Spacer(minLength: 0)
+                                Text("\(preview[row.key] ?? 0)")
+                                    .font(.callout.weight(.semibold))
+                                    .lineLimit(1)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Preview")
+                }
+                Section {
+                    Button("Apply Cleanup") { applyCleanupGraphics() }
+                        .font(.callout.weight(.semibold))
+                }
+            }
+            .navigationTitle("Cleanup Graphics")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showCleanupGraphics = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func applyCleanupGraphics() {
+        var report: [String: Int] = [:]
+        mutateBoard { state in
+            let result = BoardCleanup.cleanGraphics(state: state)
+            state = result.state
+            report = result.report
+        }
+        showCleanupGraphics = false
+        let total = report.values.reduce(0, +)
+        setStatus(total == 0
+                  ? "Cleanup ran — nothing needed cleaning."
+                  : "Cleanup removed/merged \(total) graphic(s) — saved with the board.")
+    }
+
+    // MARK: Teardrops (P6)
+
+    private func addTeardrops() {
+        guard let model else {
+            setStatus("No board loaded — teardrops need a board.", warning: true)
+            return
+        }
+        mutateBoard { state in
+            state.teardrops = BoardTeardrops.generate(state: state, model: model)
+        }
+        setStatus("\(boardState.teardrops.count) teardrops on the board — real copper, saved with the board.")
+    }
+
+    // MARK: Global Deletions (P13)
+
+    private var globalDeleteSheet: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Toggle("Tracks", isOn: $globalDeleteTracks)
+                    Toggle("Vias", isOn: $globalDeleteVias)
+                    Toggle("Zones", isOn: $globalDeleteZones)
+                    Toggle("Graphics", isOn: $globalDeleteGraphics)
+                    Toggle("Teardrops", isOn: $globalDeleteTeardrops)
+                } header: {
+                    Text("Delete every item of these classes")
+                }
+                Section {
+                    Toggle("Include locked items", isOn: $globalDeleteIncludeLocked)
+                } footer: {
+                    Text("Locked items are kept unless this is on. One undo step either way.")
+                }
+                Section {
+                    Button(role: .destructive) { applyGlobalDelete() } label: {
+                        Text("Delete")
+                            .font(.callout.weight(.semibold))
+                            .lineLimit(1)
+                    }
+                    .disabled(!globalDeleteTracks && !globalDeleteVias
+                              && !globalDeleteZones && !globalDeleteGraphics
+                              && !globalDeleteTeardrops)
+                }
+            }
+            .navigationTitle("Global Deletions")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showGlobalDelete = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func applyGlobalDelete() {
+        var classes = Set<BoardGlobalDeleteClass>()
+        if globalDeleteTracks { classes.insert(.tracks) }
+        if globalDeleteVias { classes.insert(.vias) }
+        if globalDeleteZones { classes.insert(.zones) }
+        if globalDeleteGraphics { classes.insert(.graphics) }
+        if globalDeleteTeardrops { classes.insert(.teardrops) }
+        guard !classes.isEmpty else { return }
+        let includeLocked = globalDeleteIncludeLocked
+        var counts: [String: Int] = [:]
+        mutateBoard { state in
+            let result = BoardGlobalDelete.apply(state: state, classes: classes,
+                                                 includeLocked: includeLocked)
+            state = result.state
+            counts = result.counts
+        }
+        showGlobalDelete = false
+        var parts: [String] = []
+        for (key, label) in [("tracks", "tracks"), ("vias", "vias"),
+                             ("zones", "zones"), ("graphics", "graphics"),
+                             ("teardrops", "teardrops")] {
+            if let count = counts[key], count > 0 {
+                parts.append("\(count) \(label)")
+            }
+        }
+        setStatus(parts.isEmpty
+                  ? "Global deletions ran — nothing of those classes to delete."
+                  : "Deleted \(parts.joined(separator: ", ")) — saved with the board.")
+    }
+
+    // MARK: Swap Layers (P15)
+
+    private func swapLayers() {
+        mutateBoard { state in
+            state = BoardLayerSwap.swapped(state: state)
+        }
+        setStatus("Front and back copper swapped — footprints flipped too. Saved with the board.")
+    }
+
+    // MARK: Unroute (P14)
+
+    private func unrouteComponent(_ reference: String) {
+        guard let model else { return }
+        var removedTraces = 0, removedVias = 0
+        mutateBoard { state in
+            let result = BoardUnroute.removingRouting(
+                forReference: reference, state: state, model: model)
+            state = result.state
+            removedTraces = result.removedTraces
+            removedVias = result.removedVias
+        }
+        setStatus("Removed \(removedTraces) tracks, \(removedVias) vias connected to \(reference).")
+    }
+
+    private func unrouteTrace(_ trace: BoardTrace) {
+        guard let model else { return }
+        var removedTraces = 0, removedVias = 0
+        mutateBoard { state in
+            let result = BoardUnroute.removingRouting(
+                fromTraceID: trace.id, state: state, model: model)
+            state = result.state
+            removedTraces = result.removedTraces
+            removedVias = result.removedVias
+        }
+        setStatus("Removed \(removedTraces) tracks, \(removedVias) vias from that track.")
+    }
+
+    // MARK: Clipboard (P11)
+
+    private func copySelectionToClipboard() {
+        let slice = BoardClipboard.extract(state: boardState,
+                                           itemIDs: selectionItemIDs)
+        guard !slice.isEmpty else {
+            setStatus("Nothing to copy — footprints come from the schematic and aren't copied; select tracks, vias, fills, graphics or teardrops.",
+                      warning: true)
+            return
+        }
+        clipboardSlice = slice
+        let count = slice.traces.count + slice.vias.count + slice.zones.count
+            + slice.graphics.count + slice.teardrops.count
+        setStatus("Copied \(count) items — choose Paste, then tap where they should land.")
+    }
+
+    /// The armed paste's commit: ONE mutateBoard, the pasted
+    /// items become the new selection, paste disarms.
+    private func commitPaste(at point: FPPoint) {
+        guard let slice = clipboardSlice else {
+            pasteArmed = false
+            return
+        }
+        var newIDs: [String] = []
+        mutateBoard { state in
+            let result = BoardClipboard.pasted(
+                into: state, slice: slice,
+                anchorOffset: FPPoint(x: point.x - slice.boundsOrigin.x,
+                                      y: point.y - slice.boundsOrigin.y))
+            state = result.state
+            newIDs = result.newIDs
+        }
+        pasteArmed = false
+        var pasted = Set<BoardSelection>()
+        for idString in newIDs {
+            guard let uuid = UUID(uuidString: idString),
+                  let item = boardSelection(forItemUUID: uuid) else { continue }
+            pasted.insert(item)
+        }
+        selections = pasted
+        primarySelection = pasted.first
+        setStatus("Pasted \(newIDs.count) items — they are the new selection.")
+    }
+
+    /// Resolve a bare item UUID to its selection case (teardrops
+    /// have no selection case and resolve to nil).
+    private func boardSelection(forItemUUID uuid: UUID) -> BoardSelection? {
+        guard let model else { return nil }
+        if model.traces.contains(where: { $0.id == uuid }) { return .trace(uuid) }
+        if model.vias.contains(where: { $0.id == uuid }) { return .via(uuid) }
+        if model.zones.contains(where: { $0.id == uuid }) { return .zone(uuid) }
+        if model.graphics.contains(where: { $0.id == uuid }) { return .graphic(uuid) }
+        return nil
+    }
+
+    // MARK: PCB Find (P12)
+
+    private var findSheet: some View {
+        let hits = model.map { BoardFind.hits(model: $0, query: findQuery) } ?? []
+        return NavigationStack {
+            List {
+                Section {
+                    TextField("Reference, value or net name", text: $findQuery)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                }
+                Section {
+                    if findQuery.trimmingCharacters(in: .whitespaces).isEmpty {
+                        Text("Type to search this board's footprints and nets.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else if hits.isEmpty {
+                        Text("No matches on this board.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(hits.enumerated()), id: \.offset) { _, hit in
+                            Button {
+                                applyFindHit(hit)
+                                showFind = false
+                            } label: {
+                                HStack(spacing: 8) {
+                                    Text(hit.text)
+                                        .font(.callout.weight(.semibold))
+                                        .foregroundStyle(.white)
+                                        .lineLimit(1)
+                                    Spacer(minLength: 0)
+                                    Text(hit.kind == .net
+                                         ? "net · at \(hit.reference)"
+                                         : (hit.kind == .value
+                                            ? "value · \(hit.reference)"
+                                            : "reference"))
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                } header: {
+                    Text("Results")
+                }
+            }
+            .navigationTitle("Find")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { showFind = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    private func applyFindHit(_ hit: BoardFindHit) {
+        switch hit.kind {
+        case .reference, .value:
+            selectOnly(.component(hit.reference))
+            centreOnComponent(hit.reference)
+            setStatus("Found \(hit.reference) — selected and centred.")
+        case .net:
+            highlightedNet = hit.text
+            centreOnComponent(hit.reference)
+            setStatus("Highlighting \(hit.text) — centred on \(hit.reference).")
+        }
+    }
+
+    // MARK: Update Footprints from Library (P10)
+
+    /// Re-pull footprint geometry from the CURRENT library —
+    /// for every component, or (onlyReference) just one — then
+    /// re-merge the board state over the refreshed base model,
+    /// the same stack handling Sync uses: this is a model
+    /// refresh, not a board edit, so it runs OUTSIDE mutateBoard
+    /// and RESETS the undo stacks (the old snapshots describe a
+    /// model that no longer exists).
+    private func updateFootprintsFromLibrary(onlyReference: String? = nil) {
+        guard let baseModel, let model else { return }
+        let refreshed = PCBBoardModelBuilder.refreshed(model: baseModel,
+                                                       store: footprintStore)
+        var newBase = refreshed
+        if let onlyReference {
+            // Compose a base where ONLY that component's entry
+            // comes from the refreshed model.
+            newBase = baseModel
+            if let index = newBase.components.firstIndex(
+                where: { $0.reference == onlyReference }),
+               let fresh = refreshed.components.first(
+                where: { $0.reference == onlyReference }) {
+                newBase.components[index] = fresh
+            }
+        }
+        // Pad binding diff for the single-component case,
+        // compared on the merged models (what's on screen).
+        var padReport = ""
+        if let onlyReference,
+           let before = model.components.first(
+            where: { $0.reference == onlyReference }) {
+            let beforePads = Set((before.footprint?.pads ?? [])
+                .map(\.number).filter { !$0.isEmpty })
+            let mergedPreview = PCBBoardMerger.apply(
+                state: boardState, to: newBase, isSync: false).model
+            if let after = mergedPreview.components.first(
+                where: { $0.reference == onlyReference }) {
+                let afterPads = Set((after.footprint?.pads ?? [])
+                    .map(\.number).filter { !$0.isEmpty })
+                let added = afterPads.subtracting(beforePads).count
+                let removed = beforePads.subtracting(afterPads).count
+                padReport = " — \(added) pad(s) added, \(removed) removed for \(onlyReference)"
+            }
+        }
+        let merged = PCBBoardMerger.apply(state: boardState, to: newBase,
+                                          isSync: false)
+        self.baseModel = newBase
+        boardState = merged.stateToSave
+        self.model = merged.model
+        try? BoardStateStore.save(boardState, tableStem: tableStem)
+        undoStack = []
+        redoStack = []
+        cancelInProgress()
+        selections = selections.filter {
+            selectionExists($0, in: merged.model)
+        }
+        if let primarySelection,
+           !selectionExists(primarySelection, in: merged.model) {
+            self.primarySelection = selections.first
+        }
+        visibility.copperLayerCount = merged.stateToSave.copperLayerCount
+        refreshChecks()
+        if let onlyReference {
+            setStatus("\(onlyReference) footprint updated from the library\(padReport). Undo history was reset by the refresh.")
+        } else {
+            setStatus("Footprints updated from the library — placements, sides and routing kept. Undo history was reset by the refresh.")
+        }
+    }
+
+    // MARK: Netclasses (P16)
+
+    private func toggleRatsnestHidden(_ net: String) {
+        mutateBoard { state in
+            if state.ratsnestHiddenNets.contains(net) {
+                state.ratsnestHiddenNets.removeAll { $0 == net }
+            } else {
+                state.ratsnestHiddenNets.append(net)
+            }
+        }
+    }
+
+    private func assignNetClass(_ net: String, className: String?) {
+        mutateBoard { state in
+            state.assignNetClass(net: net, className: className)
+        }
+        setStatus(className.map {
+            "\(net) is now in netclass \($0) — routing starts at its width and its clearance applies."
+        } ?? "\(net) has no netclass now.")
+    }
+
+    private var netClassesSheet: some View {
+        NavigationStack {
+            List {
+                if boardState.netClasses.isEmpty {
+                    Section {
+                        Text("No netclasses yet. Add one below — a class gives its nets a starting track width and their own clearance.")
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    }
+                } else {
+                    Section {
+                        ForEach(boardState.netClasses, id: \.name) { netClass in
+                            HStack(spacing: 8) {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(netClass.name)
+                                        .font(.callout.weight(.semibold))
+                                        .foregroundStyle(.white)
+                                        .lineLimit(1)
+                                    Text("Width \(PCBBoardMerger.formatMM(netClass.trackWidthMM)) mm · clearance \(PCBBoardMerger.formatMM(netClass.clearanceMM)) mm")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                Spacer(minLength: 0)
+                                Button("Edit") {
+                                    netClassEditingName = netClass.name
+                                    netClassNameDraft = netClass.name
+                                    netClassWidthDraft = PCBBoardMerger.formatMM(netClass.trackWidthMM)
+                                    netClassClearanceDraft = PCBBoardMerger.formatMM(netClass.clearanceMM)
+                                }
+                                .font(.callout.weight(.semibold))
+                                .lineLimit(1)
+                                Button("Delete", role: .destructive) {
+                                    mutateBoard { state in
+                                        state.deleteNetClass(named: netClass.name)
+                                    }
+                                    if netClassEditingName == netClass.name {
+                                        netClassEditingName = nil
+                                        netClassNameDraft = ""
+                                    }
+                                    setStatus("Netclass \(netClass.name) deleted — its nets are unassigned.")
+                                }
+                                .font(.callout.weight(.semibold))
+                                .lineLimit(1)
+                            }
+                        }
+                    } header: {
+                        Text("Netclasses")
+                    }
+                }
+                Section {
+                    TextField("Name", text: $netClassNameDraft)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                    HStack(spacing: 8) {
+                        Text("Track width (mm)").lineLimit(1)
+                        Spacer(minLength: 0)
+                        TextField("Width", text: $netClassWidthDraft)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    HStack(spacing: 8) {
+                        Text("Clearance (mm)").lineLimit(1)
+                        Spacer(minLength: 0)
+                        TextField("Clearance", text: $netClassClearanceDraft)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    Button(netClassEditingName == nil ? "Add Class" : "Save Class") {
+                        saveNetClassDraft()
+                    }
+                    .font(.callout.weight(.semibold))
+                    if netClassEditingName != nil {
+                        Button("Stop Editing") {
+                            netClassEditingName = nil
+                            netClassNameDraft = ""
+                        }
+                        .font(.callout)
+                    }
+                } header: {
+                    Text(netClassEditingName == nil ? "Add a class" : "Edit class")
+                } footer: {
+                    Text("Renaming a class keeps its nets — they are reassigned to the new name in the same step.")
+                }
+            }
+            .navigationTitle("Netclasses")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { showNetClasses = false }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
+    }
+
+    /// Add a class, or save an edit. A rename is upsert-new +
+    /// reassign the old class's nets + delete-old, inside ONE
+    /// mutateBoard (one undo step).
+    private func saveNetClassDraft() {
+        let name = netClassNameDraft.trimmingCharacters(in: .whitespaces)
+        guard !name.isEmpty,
+              let width = Double(netClassWidthDraft), width > 0,
+              let clearance = Double(netClassClearanceDraft), clearance >= 0
+        else {
+            setStatus("A netclass needs a name, a width over 0 and a clearance of 0 or more.",
+                      warning: true)
+            return
+        }
+        let newClass = NetClass(name: name, trackWidthMM: width,
+                                clearanceMM: clearance)
+        if let oldName = netClassEditingName, oldName != name {
+            mutateBoard { state in
+                state.upsertNetClass(newClass)
+                let netsToMove = state.netClassByNet
+                    .filter { $0.value == oldName }.map(\.key)
+                for net in netsToMove {
+                    state.assignNetClass(net: net, className: name)
+                }
+                state.deleteNetClass(named: oldName)
+            }
+            setStatus("Netclass \(oldName) renamed to \(name) — its nets kept the class.")
+        } else {
+            mutateBoard { state in state.upsertNetClass(newClass) }
+            setStatus("Netclass \(name) saved — width \(PCBBoardMerger.formatMM(width)) mm, clearance \(PCBBoardMerger.formatMM(clearance)) mm.")
+        }
+        netClassEditingName = nil
+        netClassNameDraft = ""
+    }
+
+    // MARK: Zoom to Selection (P17)
+
+    /// Frame exactly the current selection (Fit Board's math
+    /// over the selection's own bounds, pads included).
+    private func zoomToSelection() {
+        let points = selectionGeometryPoints(includePads: true)
+        guard let first = points.first else {
+            setStatus("Select something first — Zoom to Selection frames the selection.",
+                      warning: true)
+            return
+        }
+        var minX = first.x, minY = first.y, maxX = first.x, maxY = first.y
+        for point in points {
+            minX = min(minX, point.x); minY = min(minY, point.y)
+            maxX = max(maxX, point.x); maxY = max(maxY, point.y)
+        }
+        frameBoardRect(minX: minX, minY: minY, maxX: maxX, maxY: maxY)
+    }
+
     // MARK: - Routing (Route Tracks)
 
     private func handleRouteTap(model: BoardModel, point: FPPoint) {
@@ -4206,6 +5627,13 @@ struct PCBEditorView: View {
             routeHead.reset()
             routeNet = target.netName
             routePoints = [target.center]
+            // Netclass width (part 5.3, P16): a route on a net
+            // with a class starts at the class's track width.
+            if let net = target.netName,
+               let classWidth = BoardNetClasses.defaultTrackWidthMM(
+                   forNet: net, boardState: boardState) {
+                currentTrackWidth = classWidth
+            }
             refreshRoutePreview()
             if let net = target.netName {
                 setStatus("Routing \(net) from \(target.reference) pad "
@@ -4439,13 +5867,23 @@ struct PCBEditorView: View {
         // Board graphics (drawings) under everything else.
         for item in model.graphics where item.kind != .text
             && visibility.boardGraphicShown(item) {
-            drawBoardGraphic(&ctx, item: item)
+            // Inactive-layer mode (part 5.3, P9): off-active
+            // graphics dim or vanish with the mode.
+            guard let factor = inactiveFactor(forLayer: item.layer)
+            else { continue }
+            var graphicCtx = ctx
+            graphicCtx.opacity = factor
+            drawBoardGraphic(&graphicCtx, item: item)
         }
         // Copper fills (part 5) under traces and pads, with the
         // clearance gap cut around foreign-net copper.
         for zone in model.zones where visibility.zoneShown(zone) {
             drawZone(&ctx, zone: zone, model: model)
         }
+        // Teardrops (part 5.3, P6): real copper polygons in
+        // their layer's colour, translucent like the zones,
+        // under the traces they flare from.
+        drawTeardrops(&ctx, model: model)
         // Copper traces, batched by style (part 5, item 3).
         drawAllTraces(&ctx, model: model)
         // Vias (part 5) sit on the copper they connect.
@@ -4460,7 +5898,11 @@ struct PCBEditorView: View {
         // Board text items.
         for item in model.graphics where item.kind == .text
             && visibility.boardGraphicShown(item) {
-            drawBoardGraphic(&ctx, item: item)
+            guard let factor = inactiveFactor(forLayer: item.layer)
+            else { continue }
+            var graphicCtx = ctx
+            graphicCtx.opacity = factor
+            drawBoardGraphic(&graphicCtx, item: item)
         }
         // Selection overlay for a chosen graphic.
         if let graphic = selectedGraphic,
@@ -4470,6 +5912,35 @@ struct PCBEditorView: View {
         // Ratsnest (part 5.2): the unrouted connections, under
         // the preview layer's work.
         if visibility.showRatsnest { drawRatsnest(&ctx, model: model) }
+    }
+
+    /// Teardrop polygons (part 5.3, P6): filled in their layer's
+    /// copper colour at zone-like translucency, dimmed with
+    /// their net under a net highlight, and subject to the
+    /// inactive-layer mode like every other copper item. They
+    /// live in BoardState (and the merged model's teardrops), so
+    /// the static token's boardState + renderVersion already
+    /// force a redraw whenever they change.
+    private func drawTeardrops(_ ctx: inout GraphicsContext, model: BoardModel) {
+        for teardrop in model.teardrops where teardrop.points.count >= 3 {
+            guard visibility.layerShown(teardrop.layer) else { continue }
+            guard let factor = inactiveFactor(forLayer: teardrop.layer)
+            else { continue }
+            var path = Path()
+            for (index, point) in teardrop.points.enumerated() {
+                let screen = boardToScreen(point)
+                if index == 0 { path.move(to: screen) }
+                else { path.addLine(to: screen) }
+            }
+            path.closeSubpath()
+            var alpha = 0.65 * factor
+            if let highlightedNet, teardrop.netName != highlightedNet {
+                alpha *= 0.4
+            }
+            ctx.opacity = alpha
+            ctx.fill(path, with: .color(copperColor(teardrop.layer)))
+            ctx.opacity = 1
+        }
     }
 
     /// Ratsnest lines (part 5.2): one thin line per MST link
@@ -4539,6 +6010,21 @@ struct PCBEditorView: View {
         var bucketOrder: [TraceStyleKey] = []
         for trace in model.traces where visibility.traceShown(trace) {
             guard trace.points.count > 1 else { continue }
+            // Inactive-layer mode (part 5.3, P9) for traces:
+            // Normal keeps the legacy always-on 0.55 dimming of
+            // off-active traces; Dim uses the uniform 0.35;
+            // Hide skips off-active traces entirely (selection
+            // underlay included).
+            let traceFactor: Double
+            switch inactiveLayerMode {
+            case .normal:
+                traceFactor = trace.layer != activeLayer ? 0.55 : 1
+            case .dim:
+                traceFactor = trace.layer != activeLayer ? 0.35 : 1
+            case .hide:
+                if trace.layer != activeLayer { continue }
+                traceFactor = 1
+            }
             let isSelected = selections.contains(.trace(trace.id))
                 || isVertexPrimary(trace.id)
             var path = Path()
@@ -4558,7 +6044,7 @@ struct PCBEditorView: View {
                 if trace.disconnectedNetName != nil { colorName = "__grey" }
                 alpha = 0.75
             }
-            if trace.layer != activeLayer { alpha *= 0.55 }
+            alpha *= traceFactor
             if let highlightedNet {
                 alpha *= (trace.netName == highlightedNet) ? 1.0 : 0.18
             }
@@ -4589,6 +6075,9 @@ struct PCBEditorView: View {
         for selected in selectedSegments {
             let trace = selected.trace
             guard visibility.traceShown(trace) else { continue }
+            if inactiveLayerMode == .hide, trace.layer != activeLayer {
+                continue
+            }
             let points = displayTracePoints(trace)
             var path = Path()
             path.move(to: boardToScreen(points[selected.index]))
@@ -4604,11 +6093,21 @@ struct PCBEditorView: View {
     // MARK: Vias + zones drawing (part 5)
 
     private func drawVia(_ ctx: inout GraphicsContext, via: BoardVia) {
+        // Inactive-layer mode (part 5.3, P9): a via spans every
+        // copper layer, so it counts as "on" the active layer
+        // whenever the active layer is copper at all.
+        let viaFactor: Double?
+        switch inactiveLayerMode {
+        case .normal: viaFactor = 1
+        case .dim: viaFactor = BoardLayers.isCopper(activeLayer) ? 1 : 0.35
+        case .hide: viaFactor = BoardLayers.isCopper(activeLayer) ? 1 : nil
+        }
+        guard let viaFactor else { return }
         let centreBoard = displayViaCenter(via)
         let centre = boardToScreen(centreBoard)
         let r = CGFloat(via.diameter / 2 * scale)
         let drillR = CGFloat(via.drill / 2 * scale)
-        var alpha = 1.0
+        var alpha = viaFactor
         if let highlightedNet, via.netName != highlightedNet { alpha *= 0.3 }
         ctx.opacity = alpha
         // Annulus in the F.Cu colour (a via lives on every copper
@@ -4644,13 +6143,16 @@ struct PCBEditorView: View {
     private func drawZone(_ ctx: inout GraphicsContext, zone: BoardZone,
                           model: BoardModel) {
         guard zone.points.count >= 3 else { return }
+        // Inactive-layer mode (part 5.3, P9) for fills.
+        guard let zoneFactor = inactiveFactor(forLayer: zone.layer)
+        else { return }
         var path = Path()
         for (index, point) in zone.points.enumerated() {
             let screen = boardToScreen(point)
             if index == 0 { path.move(to: screen) } else { path.addLine(to: screen) }
         }
         path.closeSubpath()
-        var alpha = 0.45
+        var alpha = 0.45 * zoneFactor
         if let highlightedNet, zone.netName != highlightedNet { alpha *= 0.4 }
         ctx.opacity = alpha
         ctx.fill(path, with: .color(copperColor(zone.layer)))
@@ -5068,7 +6570,14 @@ struct PCBEditorView: View {
         for graphic in footprint.graphics {
             let effective = BoardGeometry.boardGraphic(component, graphic)
             if visibility.footprintGraphicShown(effective) {
-                drawGraphic(&ctx, graphic: effective, origin: component.origin)
+                // Inactive-layer mode (part 5.3, P9) applies to
+                // footprint graphics too, by their effective layer.
+                guard let factor = inactiveFactor(forLayer: effective.layer)
+                else { continue }
+                var graphicCtx = ctx
+                graphicCtx.opacity = factor
+                drawGraphic(&graphicCtx, graphic: effective,
+                            origin: component.origin)
             }
         }
         // Highlight halo under the highlighted net's pads.
@@ -5229,16 +6738,15 @@ struct PCBEditorView: View {
         let h = CGFloat(effective.height * scale)
 
         // Dimming: a net highlight dims every pad not on the net;
-        // "Highlight layer" dims pads that don't touch the active
-        // layer.
+        // the inactive-layer factor (part 5.3, P9 — which folds
+        // in the old "Highlight layer" 0.4 dimming in Normal
+        // mode, and skips the pad entirely in Hide mode when it
+        // doesn't touch the active layer) does the rest.
         var alpha = 1.0
         let net = BoardGeometry.netName(component, pad)
         if let highlightedNet, net != highlightedNet { alpha *= 0.3 }
-        if highlightActiveLayer,
-           !effective.layers.contains(activeLayer),
-           !effective.layers.contains("*.Cu") {
-            alpha *= 0.4
-        }
+        guard let factor = padInactiveFactor(effective) else { return }
+        alpha *= factor
 
         var pctx = ctx
         pctx.opacity = alpha

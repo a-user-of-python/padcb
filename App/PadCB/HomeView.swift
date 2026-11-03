@@ -11,12 +11,20 @@ struct HomeView: View {
     @EnvironmentObject private var store: LibraryStore
     @EnvironmentObject private var footprintStore: FootprintStore
 
+    /// Path-based navigation (part 5.3, S8): the editors receive a
+    /// `navigate` closure that appends a destination value, so
+    /// cross-probing can push the OTHER editor ("Show on Board" /
+    /// "Show in Schematic") without either editor knowing about
+    /// the stack. Values are "schematic" / "pcb", resolved by the
+    /// navigationDestination below.
+    @State private var navPath: [String] = []
+
     private var libraryCount: Int {
         Set(store.index.map(\.libraryKey)).count
     }
 
     var body: some View {
-        NavigationStack {
+        NavigationStack(path: $navPath) {
             ZStack {
                 Color(white: 0.08)
                     .ignoresSafeArea()
@@ -36,6 +44,16 @@ struct HomeView: View {
             }
             .navigationTitle("PadCB")
             .navigationBarTitleDisplayMode(.inline)
+            .navigationDestination(for: String.self) { destination in
+                switch destination {
+                case "schematic":
+                    SchematicEditorView(navigate: { navPath.append($0) })
+                case "pcb":
+                    PCBEditorView(navigate: { navPath.append($0) })
+                default:
+                    EmptyView()
+                }
+            }
             .task {
                 store.bootstrap()
                 footprintStore.bootstrap()
@@ -61,17 +79,13 @@ struct HomeView: View {
 
     private var navigationButtons: some View {
         VStack(spacing: 16) {
-            NavigationLink {
-                SchematicEditorView()
-            } label: {
+            NavigationLink(value: "schematic") {
                 launcherRow(icon: "point.3.connected.trianglepath.dotted",
                             title: "Schematic Editor")
             }
             .buttonStyle(.plain)
 
-            NavigationLink {
-                PCBEditorView()
-            } label: {
+            NavigationLink(value: "pcb") {
                 launcherRow(icon: "circuitboard",
                             title: "PCB Editor")
             }

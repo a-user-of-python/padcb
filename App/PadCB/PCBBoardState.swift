@@ -102,6 +102,57 @@ struct BoardTrace: Codable, Equatable, Identifiable {
     }
 }
 
+/// One teardrop (part 5.3, KiCad pcbnew/teardrop): a trapezoidal
+/// copper flare where a track meets a pad or via, persisted as
+/// REAL copper — a polygon in BoardState, included in BoardCopper
+/// shapes so connectivity and clearance see it exactly like a
+/// zone outline. `layer` uses the same representation traces use
+/// (a copper layer name string, e.g. "F.Cu").
+struct TeardropItem: Codable, Equatable, Identifiable {
+    var id: UUID
+    /// The net this teardrop pours for; nil = unconnected.
+    var netName: String?
+    /// Copper layer, e.g. "F.Cu" (same representation as traces).
+    var layer: String
+    /// Polygon vertices in board coordinates (a trapezoid: base
+    /// edge at the junction, tip edge along the track). The
+    /// polygon closes implicitly.
+    var points: [FPPoint]
+    /// The id (uuidString) of the track this teardrop hangs off.
+    var anchorTrackID: String
+    /// The track vertex the teardrop flares from (the junction
+    /// point coincident with the pad/via centre).
+    var anchorPoint: FPPoint
+
+    /// Stable identity for regeneration replacement: track id +
+    /// anchor point + tip midpoint (the tip distinguishes the
+    /// two segment directions at one interior vertex — without
+    /// it the two teardrops at a corner would clobber each
+    /// other). Deterministic: regeneration from the same board
+    /// reproduces the same geometry bit-for-bit.
+    var anchorKey: String {
+        let tip = points.count >= 3
+            ? FPPoint(x: (points[1].x + points[2].x) / 2,
+                      y: (points[1].y + points[2].y) / 2)
+            : anchorPoint
+        return "\(anchorTrackID)|\(anchorPoint.x),\(anchorPoint.y)"
+            + "|\(tip.x),\(tip.y)"
+    }
+}
+
+/// One named netclass (part 5.3, KiCad's netclass setup): the
+/// track width new routes of a member net start at, and the
+/// clearance member nets demand against every other net.
+struct NetClass: Codable, Equatable, Identifiable {
+    var name: String
+    /// Default track width for the class's nets, mm.
+    var trackWidthMM: Double
+    /// Clearance the class's nets require, mm.
+    var clearanceMM: Double
+
+    var id: String { name }
+}
+
 /// One drawn board graphic (Draw Line / Draw Arc / Draw Circle /
 /// Text tools). Points by kind: line = [start, end];
 /// arc = [start, mid, end] (the arc runs through all three);
@@ -183,6 +234,22 @@ struct BoardState: Equatable {
     /// be moved, flipped or board-deleted.
     var lockedReferences: [String] = []
 
+    // -- Part 5.3 additions (decode as defaults when absent) --
+
+    /// Teardrop copper polygons (see TeardropItem).
+    var teardrops: [TeardropItem] = []
+    /// Named netclasses (see NetClass).
+    var netClasses: [NetClass] = []
+    /// Net name -> netclass name assignments.
+    var netClassByNet: [String: String] = [:]
+    /// Excluded manufacturing findings, by stable finding key
+    /// (see BoardManufacturing in PCBDesignChecks.swift).
+    var manufacturingExclusions: [String] = []
+    /// Optional user notes on excluded findings, by finding key.
+    var manufacturingExclusionNotes: [String: String] = [:]
+    /// Nets whose ratsnest lines are hidden (per-net eye toggle).
+    var ratsnestHiddenNets: [String] = []
+
     static let empty = BoardState()
 
     /// Is this board item locked? (traces/vias/zones/graphics)
@@ -227,7 +294,10 @@ extension BoardState: Codable {
         case formatVersion, placements, excludedReferences, traces,
              graphics, knownReferences, vias, zones, sides,
              copperLayerCount, gridMil, clearanceMil,
-             lockedItemIDs, lockedReferences
+             lockedItemIDs, lockedReferences,
+             teardrops, netClasses, netClassByNet,
+             manufacturingExclusions, manufacturingExclusionNotes,
+             ratsnestHiddenNets
     }
 
     init(from decoder: Decoder) throws {
@@ -246,6 +316,12 @@ extension BoardState: Codable {
         clearanceMil = try box.decodeIfPresent(Double.self, forKey: .clearanceMil) ?? 8
         lockedItemIDs = try box.decodeIfPresent([String].self, forKey: .lockedItemIDs) ?? []
         lockedReferences = try box.decodeIfPresent([String].self, forKey: .lockedReferences) ?? []
+        teardrops = try box.decodeIfPresent([TeardropItem].self, forKey: .teardrops) ?? []
+        netClasses = try box.decodeIfPresent([NetClass].self, forKey: .netClasses) ?? []
+        netClassByNet = try box.decodeIfPresent([String: String].self, forKey: .netClassByNet) ?? [:]
+        manufacturingExclusions = try box.decodeIfPresent([String].self, forKey: .manufacturingExclusions) ?? []
+        manufacturingExclusionNotes = try box.decodeIfPresent([String: String].self, forKey: .manufacturingExclusionNotes) ?? [:]
+        ratsnestHiddenNets = try box.decodeIfPresent([String].self, forKey: .ratsnestHiddenNets) ?? []
     }
 
     func encode(to encoder: Encoder) throws {
@@ -264,6 +340,12 @@ extension BoardState: Codable {
         try box.encode(clearanceMil, forKey: .clearanceMil)
         try box.encode(lockedItemIDs, forKey: .lockedItemIDs)
         try box.encode(lockedReferences, forKey: .lockedReferences)
+        try box.encode(teardrops, forKey: .teardrops)
+        try box.encode(netClasses, forKey: .netClasses)
+        try box.encode(netClassByNet, forKey: .netClassByNet)
+        try box.encode(manufacturingExclusions, forKey: .manufacturingExclusions)
+        try box.encode(manufacturingExclusionNotes, forKey: .manufacturingExclusionNotes)
+        try box.encode(ratsnestHiddenNets, forKey: .ratsnestHiddenNets)
     }
 }
 
@@ -474,6 +556,11 @@ enum PCBBoardMerger {
         model.vias = vias
         model.zones = zones
         model.graphics = state.graphics
+        // Teardrops (part 5.3) carry over verbatim, like graphics:
+        // their anchor traces are never dropped by a merge, so an
+        // anchor can only dangle if the user deletes the track —
+        // the cleanup/unroute paths prune those explicitly.
+        model.teardrops = state.teardrops
         model.boardProblems = problems
 
         // -- Canonical state to persist --
@@ -494,12 +581,20 @@ enum PCBBoardMerger {
         canonical.copperLayerCount = state.copperLayerCount
         canonical.gridMil = state.gridMil
         canonical.clearanceMil = state.clearanceMil
+        // Part 5.3 state carries through every merge verbatim.
+        canonical.teardrops = state.teardrops
+        canonical.netClasses = state.netClasses
+        canonical.netClassByNet = state.netClassByNet
+        canonical.manufacturingExclusions = state.manufacturingExclusions
+        canonical.manufacturingExclusionNotes = state.manufacturingExclusionNotes
+        canonical.ratsnestHiddenNets = state.ratsnestHiddenNets
         // Locks survive the merge for items/references that do;
         // locks naming vanished items are pruned like placements.
         let liveItemIDs = Set(traces.map(\.id.uuidString))
             .union(vias.map(\.id.uuidString))
             .union(zones.map(\.id.uuidString))
             .union(state.graphics.map(\.id.uuidString))
+            .union(state.teardrops.map(\.id.uuidString))
         canonical.lockedItemIDs = state.lockedItemIDs.filter {
             liveItemIDs.contains($0)
         }
@@ -2327,5 +2422,420 @@ struct BoardSpatialIndex {
             }
         }
         return nil
+    }
+}
+
+// MARK: - Netclass assignment (part 5.3, P16)
+//
+// Pure BoardState operations for netclasses. The EFFECTS of a
+// class (the clearance a pair of nets requires, the width a new
+// route starts at) live in PCBDesignChecks.swift
+// (BoardNetClasses) — the single source of truth the checkers
+// and the editor both read.
+
+extension BoardState {
+
+    /// Insert a netclass, or replace the existing class of the
+    /// same name (name is the class's identity).
+    mutating func upsertNetClass(_ netClass: NetClass) {
+        if let index = netClasses.firstIndex(where: { $0.name == netClass.name }) {
+            netClasses[index] = netClass
+        } else {
+            netClasses.append(netClass)
+        }
+    }
+
+    /// Delete a netclass by name and UNASSIGN every net that was
+    /// assigned to it (a dangling assignment would silently keep
+    /// applying a deleted class's numbers).
+    mutating func deleteNetClass(named name: String) {
+        netClasses.removeAll { $0.name == name }
+        netClassByNet = netClassByNet.filter { $0.value != name }
+    }
+
+    /// Assign a net to a class, or unassign it (className nil).
+    /// A non-nil name that matches no existing class is ignored —
+    /// assignments only ever name real classes, so the checkers
+    /// never chase a class that isn't there.
+    mutating func assignNetClass(net: String, className: String?) {
+        guard let className else {
+            netClassByNet[net] = nil
+            return
+        }
+        guard netClasses.contains(where: { $0.name == className }) else { return }
+        netClassByNet[net] = className
+    }
+
+    /// The class a net is assigned to, if any.
+    func netClass(forNet net: String) -> NetClass? {
+        guard let name = netClassByNet[net] else { return nil }
+        return netClasses.first { $0.name == name }
+    }
+}
+
+// MARK: - Selection transforms: Move Exactly (part 5.3, P1)
+//
+// Pure BoardState transforms behind KiCad's Move Exactly dialog:
+// translate / rotate a set of board items by exact numbers. Item
+// identity in the id set: traces/vias/zones/graphics/teardrops
+// by id uuidString, footprints by REFERENCE (their placements
+// move; there is no other footprint identity in board state).
+// Locked items are silently skipped (locked board items in
+// lockedItemIDs, locked components in lockedReferences).
+//
+// FOOTPRINT ROTATION: BoardState carries NO per-footprint
+// rotation (placements are points, sides are front/back only),
+// so rotated() moves footprint origins around the centre but
+// does NOT spin the footprints themselves.
+
+enum BoardTransforms {
+
+    static func translated(state: BoardState, itemIDs: Set<String>,
+                           dx: Double, dy: Double) -> BoardState {
+        var result = state
+        let delta = FPPoint(x: dx, y: dy)
+        func shift(_ points: [FPPoint]) -> [FPPoint] {
+            points.map { FPPoint(x: $0.x + delta.x, y: $0.y + delta.y) }
+        }
+        for index in result.traces.indices
+        where itemIDs.contains(result.traces[index].id.uuidString)
+            && !result.isLocked(result.traces[index].id) {
+            result.traces[index].points = shift(result.traces[index].points)
+        }
+        for index in result.vias.indices
+        where itemIDs.contains(result.vias[index].id.uuidString)
+            && !result.isLocked(result.vias[index].id) {
+            result.vias[index].center = FPPoint(
+                x: result.vias[index].center.x + dx,
+                y: result.vias[index].center.y + dy)
+        }
+        for index in result.zones.indices
+        where itemIDs.contains(result.zones[index].id.uuidString)
+            && !result.isLocked(result.zones[index].id) {
+            result.zones[index].points = shift(result.zones[index].points)
+        }
+        for index in result.graphics.indices
+        where itemIDs.contains(result.graphics[index].id.uuidString)
+            && !result.isLocked(result.graphics[index].id) {
+            result.graphics[index].points = shift(result.graphics[index].points)
+        }
+        for index in result.teardrops.indices
+        where itemIDs.contains(result.teardrops[index].id.uuidString)
+            && !result.isLocked(result.teardrops[index].id) {
+            result.teardrops[index].points = shift(result.teardrops[index].points)
+            result.teardrops[index].anchorPoint = FPPoint(
+                x: result.teardrops[index].anchorPoint.x + dx,
+                y: result.teardrops[index].anchorPoint.y + dy)
+        }
+        for reference in Array(result.placements.keys)
+        where itemIDs.contains(reference)
+            && !result.isLocked(reference: reference) {
+            let point = result.placements[reference]!
+            result.placements[reference] = FPPoint(x: point.x + dx,
+                                                   y: point.y + dy)
+        }
+        return result
+    }
+
+    static func rotated(state: BoardState, itemIDs: Set<String>,
+                        centre: FPPoint, degrees: Double) -> BoardState {
+        var result = state
+        func spin(_ point: FPPoint) -> FPPoint {
+            let relative = FPPoint(x: point.x - centre.x,
+                                   y: point.y - centre.y)
+                .rotated(degrees: degrees)
+            return FPPoint(x: centre.x + relative.x,
+                           y: centre.y + relative.y)
+        }
+        for index in result.traces.indices
+        where itemIDs.contains(result.traces[index].id.uuidString)
+            && !result.isLocked(result.traces[index].id) {
+            result.traces[index].points = result.traces[index].points.map(spin)
+        }
+        for index in result.vias.indices
+        where itemIDs.contains(result.vias[index].id.uuidString)
+            && !result.isLocked(result.vias[index].id) {
+            result.vias[index].center = spin(result.vias[index].center)
+        }
+        for index in result.zones.indices
+        where itemIDs.contains(result.zones[index].id.uuidString)
+            && !result.isLocked(result.zones[index].id) {
+            result.zones[index].points = result.zones[index].points.map(spin)
+        }
+        for index in result.graphics.indices
+        where itemIDs.contains(result.graphics[index].id.uuidString)
+            && !result.isLocked(result.graphics[index].id) {
+            // Every graphic kind stores its defining points in
+            // `points` (line ends, arc triple, circle centre,
+            // text anchor): rotating the points rotates the
+            // graphic. A circle's radius and a text's size are
+            // scalars — unchanged, as they should be.
+            result.graphics[index].points = result.graphics[index].points.map(spin)
+        }
+        for index in result.teardrops.indices
+        where itemIDs.contains(result.teardrops[index].id.uuidString)
+            && !result.isLocked(result.teardrops[index].id) {
+            result.teardrops[index].points = result.teardrops[index].points.map(spin)
+            result.teardrops[index].anchorPoint = spin(result.teardrops[index].anchorPoint)
+        }
+        // Footprints: origins orbit the centre; the footprints
+        // themselves do not spin (no rotation in board state).
+        for reference in Array(result.placements.keys)
+        where itemIDs.contains(reference)
+            && !result.isLocked(reference: reference) {
+            result.placements[reference] = spin(result.placements[reference]!)
+        }
+        return result
+    }
+}
+
+// MARK: - Clipboard (part 5.3, P11)
+//
+// Board-internal copy/paste (KiCad's kicad_clipboard, scoped to
+// one app): the slice is the selected COPPER work — traces,
+// vias, zones, graphics, teardrops. Footprints are silently
+// excluded (the schematic owns references, exactly the rule
+// Duplicate follows). The slice records the selection bounds
+// origin; the view computes the paste offset as
+// tapPoint − boundsOrigin and hands it to pasted().
+
+struct BoardClipboardSlice: Codable, Equatable {
+    var traces: [BoardTrace] = []
+    var vias: [BoardVia] = []
+    var zones: [BoardZone] = []
+    var graphics: [BoardGraphicItem] = []
+    var teardrops: [TeardropItem] = []
+    /// Min-x / min-y over every geometry point of the copied
+    /// items (zero when the slice is empty).
+    var boundsOrigin: FPPoint = .zero
+
+    var isEmpty: Bool {
+        traces.isEmpty && vias.isEmpty && zones.isEmpty
+            && graphics.isEmpty && teardrops.isEmpty
+    }
+}
+
+enum BoardClipboard {
+
+    static func extract(state: BoardState, itemIDs: Set<String>) -> BoardClipboardSlice {
+        var slice = BoardClipboardSlice(
+            traces: state.traces.filter { itemIDs.contains($0.id.uuidString) },
+            vias: state.vias.filter { itemIDs.contains($0.id.uuidString) },
+            zones: state.zones.filter { itemIDs.contains($0.id.uuidString) },
+            graphics: state.graphics.filter { itemIDs.contains($0.id.uuidString) },
+            teardrops: state.teardrops.filter { itemIDs.contains($0.id.uuidString) })
+        var points: [FPPoint] = []
+        for trace in slice.traces { points += trace.points }
+        for via in slice.vias { points.append(via.center) }
+        for zone in slice.zones { points += zone.points }
+        for item in slice.graphics { points += item.points }
+        for teardrop in slice.teardrops { points += teardrop.points }
+        if let first = points.first {
+            var origin = first
+            for point in points {
+                origin.x = min(origin.x, point.x)
+                origin.y = min(origin.y, point.y)
+            }
+            slice.boundsOrigin = origin
+        }
+        return slice
+    }
+
+    /// Paste a slice into a state, translated by `anchorOffset`
+    /// (the view's tapPoint − slice.boundsOrigin). Every pasted
+    /// item gets a FRESH id (the Duplicate pattern), so pasted
+    /// items are never locked (locks key on ids, and no lock
+    /// names a fresh id) and the source items are untouched —
+    /// teardrop anchors are remapped to the pasted copies of
+    /// their tracks when those tracks are in the slice, so a
+    /// copied teardrop stays attached to its copied track.
+    /// Returns the new state and the pasted items' id strings
+    /// (traces, vias, zones, graphics, teardrops, in slice
+    /// order) — the view makes them the new selection.
+    static func pasted(into state: BoardState, slice: BoardClipboardSlice,
+                       anchorOffset: FPPoint)
+        -> (state: BoardState, newIDs: [String]) {
+        var result = state
+        var newIDs: [String] = []
+        func shift(_ points: [FPPoint]) -> [FPPoint] {
+            points.map { FPPoint(x: $0.x + anchorOffset.x,
+                                 y: $0.y + anchorOffset.y) }
+        }
+        var trackIDMap: [String: String] = [:]
+        for trace in slice.traces {
+            var copy = trace
+            copy.id = UUID()
+            copy.points = shift(trace.points)
+            trackIDMap[trace.id.uuidString] = copy.id.uuidString
+            result.traces.append(copy)
+            newIDs.append(copy.id.uuidString)
+        }
+        for via in slice.vias {
+            var copy = via
+            copy.id = UUID()
+            copy.center = FPPoint(x: via.center.x + anchorOffset.x,
+                                  y: via.center.y + anchorOffset.y)
+            result.vias.append(copy)
+            newIDs.append(copy.id.uuidString)
+        }
+        for zone in slice.zones {
+            var copy = zone
+            copy.id = UUID()
+            copy.points = shift(zone.points)
+            result.zones.append(copy)
+            newIDs.append(copy.id.uuidString)
+        }
+        for item in slice.graphics {
+            var copy = item
+            copy.id = UUID()
+            copy.points = shift(item.points)
+            result.graphics.append(copy)
+            newIDs.append(copy.id.uuidString)
+        }
+        for teardrop in slice.teardrops {
+            var copy = teardrop
+            copy.id = UUID()
+            copy.points = shift(teardrop.points)
+            copy.anchorPoint = FPPoint(
+                x: teardrop.anchorPoint.x + anchorOffset.x,
+                y: teardrop.anchorPoint.y + anchorOffset.y)
+            if let remapped = trackIDMap[teardrop.anchorTrackID] {
+                copy.anchorTrackID = remapped
+            }
+            result.teardrops.append(copy)
+            newIDs.append(copy.id.uuidString)
+        }
+        return (result, newIDs)
+    }
+}
+
+// MARK: - Swap Layers (part 5.3, P15)
+//
+// Board-wide layer exchange (KiCad's dialog_swap_layers): with
+// copperLayerCount N, copper layer index i maps to N−1−i — the
+// front/back swap on a 2-layer board, the full stack reversal on
+// bigger ones. Footprint sides flip through BoardState.sides,
+// the same state the part-5 flip machinery reads. Locked items
+// DO swap: this is a reinterpretation of the whole board, not an
+// edit of any item (KiCad swaps everything).
+
+enum BoardLayerSwap {
+
+    /// The layer `layer` becomes under the swap on a board with
+    /// `copperCount` copper layers. Non-copper layers and copper
+    /// layers outside the current stack are unchanged.
+    static func swappedLayer(_ layer: String, copperCount: Int) -> String {
+        let stack = BoardLayers.copperLayers(count: copperCount)
+        guard let index = stack.firstIndex(of: layer) else { return layer }
+        return stack[stack.count - 1 - index]
+    }
+
+    static func swapped(state: BoardState) -> BoardState {
+        var result = state
+        let count = state.copperLayerCount
+        for index in result.traces.indices {
+            result.traces[index].layer = swappedLayer(
+                result.traces[index].layer, copperCount: count)
+        }
+        for index in result.zones.indices {
+            result.zones[index].layer = swappedLayer(
+                result.zones[index].layer, copperCount: count)
+        }
+        for index in result.teardrops.indices {
+            result.teardrops[index].layer = swappedLayer(
+                result.teardrops[index].layer, copperCount: count)
+        }
+        for index in result.graphics.indices
+        where BoardLayers.isCopper(result.graphics[index].layer) {
+            result.graphics[index].layer = swappedLayer(
+                result.graphics[index].layer, copperCount: count)
+        }
+        // Footprint sides: every known reference flips — a
+        // reference with no sides entry sits on the front by
+        // default, so after a board-wide swap it must record
+        // .back explicitly.
+        var references = Set(state.sides.keys)
+        references.formUnion(state.placements.keys)
+        references.formUnion(state.knownReferences)
+        for reference in references {
+            let current = state.sides[reference] ?? .front
+            result.sides[reference] = current == .front ? .back : .front
+        }
+        return result
+    }
+}
+
+// MARK: - Global Deletions (part 5.3, P13)
+//
+// KiCad's dialog_global_deletion: delete every item of the
+// chosen classes in one operation. Locked items are kept unless
+// includeLocked is set (and their lock entries are pruned when
+// they do go).
+
+enum BoardGlobalDeleteClass: String, CaseIterable {
+    case tracks, vias, zones, graphics, teardrops
+}
+
+enum BoardGlobalDelete {
+
+    static func apply(state: BoardState,
+                      classes: Set<BoardGlobalDeleteClass>,
+                      includeLocked: Bool)
+        -> (state: BoardState, counts: [String: Int]) {
+        var result = state
+        // Counts always carry every class key (0 when the class
+        // was not requested or nothing of it was removed).
+        var counts: [String: Int] = [
+            "tracks": 0, "vias": 0, "zones": 0,
+            "graphics": 0, "teardrops": 0,
+        ]
+        func removable(_ id: UUID) -> Bool {
+            includeLocked || !state.isLocked(id)
+        }
+        if classes.contains(.tracks) {
+            let before = result.traces.count
+            result.traces.removeAll { removable($0.id) }
+            counts[BoardGlobalDeleteClass.tracks.rawValue] = before - result.traces.count
+        }
+        if classes.contains(.vias) {
+            let before = result.vias.count
+            result.vias.removeAll { removable($0.id) }
+            counts[BoardGlobalDeleteClass.vias.rawValue] = before - result.vias.count
+        }
+        if classes.contains(.zones) {
+            let before = result.zones.count
+            result.zones.removeAll { removable($0.id) }
+            counts[BoardGlobalDeleteClass.zones.rawValue] = before - result.zones.count
+        }
+        if classes.contains(.graphics) {
+            let before = result.graphics.count
+            result.graphics.removeAll { removable($0.id) }
+            counts[BoardGlobalDeleteClass.graphics.rawValue] = before - result.graphics.count
+        }
+        if classes.contains(.teardrops) {
+            let before = result.teardrops.count
+            result.teardrops.removeAll { removable($0.id) }
+            counts[BoardGlobalDeleteClass.teardrops.rawValue] = before - result.teardrops.count
+        }
+        if includeLocked {
+            let live = Set(result.traces.map(\.id.uuidString))
+                .union(result.vias.map(\.id.uuidString))
+                .union(result.zones.map(\.id.uuidString))
+                .union(result.graphics.map(\.id.uuidString))
+                .union(result.teardrops.map(\.id.uuidString))
+            result.lockedItemIDs.removeAll { !live.contains($0) }
+        }
+        return (result, counts)
+    }
+
+    /// String-class convenience for callers that name classes by
+    /// the raw values ("tracks"/"vias"/"zones"/"graphics"/
+    /// "teardrops"); unknown names are ignored.
+    static func apply(state: BoardState, classes: Set<String>,
+                      includeLocked: Bool)
+        -> (state: BoardState, counts: [String: Int]) {
+        apply(state: state,
+              classes: Set(classes.compactMap(BoardGlobalDeleteClass.init(rawValue:))),
+              includeLocked: includeLocked)
     }
 }

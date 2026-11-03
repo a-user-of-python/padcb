@@ -22,6 +22,9 @@ SWIFT_FILES = [
     # Part 5: design checks (units/grid/layers, connectivity,
     # clearance, manufacturing, theory) + the on-device AI bridge.
     "PCBDesignChecks.swift", "TheoryAIBridge.swift",
+    # Part 5.3: session bridge (hub-owned stores, cross-probe,
+    # live-session registry) + AirPlay / external display scene.
+    "SessionBridge.swift", "ExternalDisplay.swift",
 ]
 
 
