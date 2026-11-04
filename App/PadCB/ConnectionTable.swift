@@ -15,11 +15,27 @@ import Foundation
 ///   on another segment (a T), when a JunctionItem sits on both, or
 ///   when a pin touches both. Two segments merely CROSSING (interior
 ///   to interior, no junction/pin) do NOT connect — KiCad's rule.
-/// - A label whose point lies on a wire (or exactly on a pin) names
-///   that wire's net; nets carrying the same label text are the same
-///   net, even when drawn as separate wire runs.
-/// - A power symbol's pins are global: nets carrying the same power
-///   name (the symbol's Value, e.g. "GND") merge the same way.
+/// - Net naming follows KiCad 10's driver priority
+///   (eeschema/connection_graph.h CONNECTION_SUBGRAPH::PRIORITY:
+///   PIN=1 < SHEET_PIN=2 < HIER_LABEL=3 < LOCAL_LABEL=4 <
+///   LOCAL_POWER_PIN=5 < GLOBAL_POWER_PIN=6 < GLOBAL=7),
+///   renumbered locally to the classes PadCB has: label = 1,
+///   local power = 2, global power = 3. A label whose point lies
+///   on a wire (or exactly on a pin) names that wire's net; a
+///   power symbol names its net from its Value (e.g. "GND"),
+///   in the local tier when its definition's (power local)
+///   scope says so and in the global tier otherwise — a power
+///   symbol with NO (power …) scope (classic #-reference
+///   symbols) reads as global, KiCad's treatment of its bundled
+///   power library. The winning (primary) name is the first
+///   name of the highest non-empty tier, names sorted ascending
+///   within the tier (eeschema/connection_graph.cpp
+///   ResolveDrivers tie-breaks: prefer non-"-Pad" names, then
+///   alphabetical). Nets carrying the same name in ANY tier
+///   are the same net, even when drawn as separate wire runs.
+///   Every other distinct explicit name on the merged net is
+///   recorded as an alias — the losing names, surfaced by ERC
+///   as driver conflicts.
 /// - Pins of type no_connect never appear as endpoints.
 /// - Only nets with **2 or more endpoints** are written — a lone pin
 ///   on a stub wire is not a connection. (Two separately-drawn single
@@ -207,7 +223,11 @@ enum ConnectionTableBuilder {
         var endpointPoints: [DPoint] = [] // parallel to endpoints
         var components: [ConnectionComponent] = []
         var unresolved: [String] = []
-        var powerNameByEndpoint: [Int: String] = [:]
+        // Per-endpoint power name with its naming tier (part 5.4):
+        // KiCad priorities LOCAL_LABEL=4 / LOCAL_POWER_PIN=5 /
+        // GLOBAL_POWER_PIN=6, renumbered locally — label = 1,
+        // local power = 2, global power = 3.
+        var powerByEndpoint: [Int: (name: String, tier: Int)] = [:]
         var seenEndpointKeys = Set<String>()
         var flaggedNoConnects = Set<String>()
 
@@ -238,6 +258,10 @@ enum ConnectionTableBuilder {
                     ? placed.symbolName
                     : placed.value.trimmingCharacters(in: .whitespaces))
                 : nil
+            // A power symbol with NO (power …) scope — classic
+            // #-reference symbols — reads as global, KiCad's
+            // treatment of its bundled power library.
+            let powerTier: Int = def.powerScope == "local" ? 2 : 3
 
             for entry in SymbolDrawList.pinWorldPoints(def: def, placed: placed) {
                 let pin = entry.pin
@@ -268,7 +292,9 @@ enum ConnectionTableBuilder {
                     pinName: KiCadText.plain(pin.name),
                     pinType: pin.type.rawValue))
                 endpointPoints.append(entry.point)
-                if let powerName { powerNameByEndpoint[index] = powerName }
+                if let powerName {
+                    powerByEndpoint[index] = (name: powerName, tier: powerTier)
+                }
             }
         }
         components.sort {
@@ -342,9 +368,11 @@ enum ConnectionTableBuilder {
             componentKeyByEndpoint[index] = key ?? "point:\(pointKey(point))"
         }
 
-        // 4. Explicit net names per geometric component: labels lying
-        //    on it, plus power names from its endpoints.
-        var namesByComponent: [String: Set<String>] = [:]
+        // 4. Explicit net names per geometric component, tiered
+        //    by KiCad driver priority (part 5.4): labels lying on
+        //    it insert tier 1, plus power names from its endpoints
+        //    inserting their tier (local power = 2, global = 3).
+        var namesByComponent: [String: [Int: Set<String>]] = [:]
         for label in state.labels {
             let text = label.text.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !text.isEmpty else { continue }
@@ -361,16 +389,23 @@ enum ConnectionTableBuilder {
                     key = componentKeyByEndpoint[match]
                 }
             }
-            if let key { namesByComponent[key, default: []].insert(text) }
+            if let key {
+                var tiers = namesByComponent[key] ?? [:]
+                tiers[1, default: []].insert(text)
+                namesByComponent[key] = tiers
+            }
         }
-        for (index, name) in powerNameByEndpoint {
+        for (index, power) in powerByEndpoint {
             if let key = componentKeyByEndpoint[index] {
-                namesByComponent[key, default: []].insert(name)
+                var tiers = namesByComponent[key] ?? [:]
+                tiers[power.tier, default: []].insert(power.name)
+                namesByComponent[key] = tiers
             }
         }
 
         // 5. Merge geometric components that share an explicit name
-        //    (same label in two places, same power net, …).
+        //    in ANY tier (same label in two places, same power
+        //    net, …) — connectivity is name equality, unchanged.
         let componentKeys = Set(componentKeyByEndpoint.values).sorted()
         var componentIndex: [String: Int] = [:]
         for (i, key) in componentKeys.enumerated() { componentIndex[key] = i }
@@ -378,18 +413,21 @@ enum ConnectionTableBuilder {
         var firstComponentByName: [String: Int] = [:]
         for key in componentKeys {
             guard let idx = componentIndex[key] else { continue }
-            for name in namesByComponent[key] ?? [] {
-                if let other = firstComponentByName[name] {
-                    groupUnion.unite(idx, other)
-                } else {
-                    firstComponentByName[name] = idx
+            let tiers = namesByComponent[key] ?? [:]
+            for tier in tiers.keys.sorted() {
+                for name in tiers[tier] ?? [] {
+                    if let other = firstComponentByName[name] {
+                        groupUnion.unite(idx, other)
+                    } else {
+                        firstComponentByName[name] = idx
+                    }
                 }
             }
         }
 
         // 6. Final nets: group endpoints, attach names, drop singles.
         var endpointsByGroup: [Int: [Int]] = [:]
-        var namesByGroup: [Int: Set<String>] = [:]
+        var namesByGroup: [Int: [Int: Set<String>]] = [:]
         for index in endpoints.indices {
             guard let key = componentKeyByEndpoint[index],
                   let ci = componentIndex[key] else { continue }
@@ -399,7 +437,11 @@ enum ConnectionTableBuilder {
         for key in componentKeys {
             guard let ci = componentIndex[key] else { continue }
             let group = groupUnion.find(ci)
-            namesByGroup[group, default: []].formUnion(namesByComponent[key] ?? [])
+            for (tier, names) in namesByComponent[key] ?? [:] {
+                var tiers = namesByGroup[group] ?? [:]
+                tiers[tier, default: []].formUnion(names)
+                namesByGroup[group] = tiers
+            }
         }
 
         func endpointSortKey(_ e: ConnectionEndpoint) -> (String, Int, String, String) {
@@ -420,10 +462,27 @@ enum ConnectionTableBuilder {
         for (group, indices) in endpointsByGroup where indices.count >= 2 {
             let sortedEndpoints = indices.map { endpoints[$0] }
                 .sorted { endpointSortKey($0) < endpointSortKey($1) }
-            let names = (namesByGroup[group] ?? []).sorted()
-            if let primary = names.first {
+            // Primary (part 5.4): the first non-empty tier in
+            // DESCENDING tier order wins (global power 3, then
+            // local power 2, then label 1 — KiCad's
+            // CONNECTION_SUBGRAPH::PRIORITY order); within the
+            // winning tier names sort ascending and the first
+            // wins (ResolveDrivers tie-break). Aliases are every
+            // other distinct explicit name across all tiers,
+            // sorted ascending — the losing names.
+            let tieredNames = namesByGroup[group] ?? [:]
+            var primary: String? = nil
+            for tier in [3, 2, 1] {
+                if let names = tieredNames[tier], !names.isEmpty {
+                    primary = names.sorted().first
+                    break
+                }
+            }
+            if let primary {
+                let allNames = Set(tieredNames.values.flatMap { $0 })
+                let aliases = allNames.subtracting([primary]).sorted()
                 namedGroups.append((group, sortedEndpoints, primary,
-                                    Array(names.dropFirst())))
+                                    aliases))
                 groupToNetName[group] = primary
             } else {
                 unnamedGroups.append((group, sortedEndpoints))
@@ -584,6 +643,7 @@ struct ERCFinding: Equatable {
         case pinNotConnected
         case powerPinNotDriven
         case outputConflict
+        case driverConflict
         case duplicateReference
         case unannotated
         case unresolvedSymbol
@@ -600,7 +660,8 @@ struct ERCFinding: Equatable {
     var reference: String = ""
     /// The finding's detail slot: the pin number for
     /// pinNotConnected, the involved "Ref pin N" list for the
-    /// per-net findings, "unit N" for duplicateReference, the
+    /// per-net findings, the losing alias for driverConflict,
+    /// "unit N" for duplicateReference, the
     /// symbol name for unannotated, the label text for
     /// labelNotConnected, "" for unresolvedSymbol.
     var detail: String = ""
@@ -633,6 +694,16 @@ struct ERCFinding: Equatable {
 ///   KiCad where a power port drives its net.)
 /// - output conflict (error): a net with 2+ driving pins
 ///   (output or power_out of ordinary symbols).
+/// - driver conflict (warning, part 5.4): a net carrying more
+///   than one explicit name — every alias is a second strong
+///   name-source (label or power) on the net, precisely
+///   KiCad's multiple-driver condition
+///   (eeschema/connection_graph.cpp ercCheckMultipleDrivers,
+///   ERCE_DRIVER_CONFLICT, whose default severity in
+///   eeschema/erc/erc_settings.cpp is WARNING). One finding
+///   per losing NAME — KiCad reports per driver item, which
+///   is PadCB's stated delta, since the table records names,
+///   not driver items.
 /// - duplicate reference (error): two placed instances sharing
 ///   reference AND unit (the same reference across DIFFERENT
 ///   units is one legal multi-unit part).
@@ -774,6 +845,27 @@ enum SchematicERC {
         }
         findings += powerFindings.sorted { $0.message < $1.message }
         findings += outputFindings.sorted { $0.message < $1.message }
+
+        // -- Driver conflicts (part 5.4) --
+        // Every alias is a second strong name-source (label or
+        // power) on the net — precisely KiCad's multiple-driver
+        // condition (connection_graph.cpp
+        // ercCheckMultipleDrivers, ERCE_DRIVER_CONFLICT).
+        // One finding per losing NAME (KiCad reports per driver
+        // item) — the stated delta, since the table records
+        // names, not driver items.
+        var driverFindings: [ERCFinding] = []
+        for net in table.nets {
+            for alias in net.aliases {
+                driverFindings.append(ERCFinding(
+                    severity: .warning, kind: .driverConflict,
+                    message: "Both \(net.name) and \(alias) are attached to the same net; \(net.name) will be used as the net name",
+                    instanceID: nil,
+                    reference: net.name,
+                    detail: alias))
+            }
+        }
+        findings += driverFindings.sorted { $0.message < $1.message }
 
         // -- Duplicate reference + unit --
         var byRefUnit: [String: [PlacedSymbol]] = [:]

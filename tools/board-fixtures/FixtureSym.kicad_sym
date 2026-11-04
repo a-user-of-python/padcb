@@ -113,4 +113,42 @@
 			)
 		)
 	)
+	(symbol "FIXPWRG"
+		(power global)
+		(property "Reference" "#PWR"
+			(at 0 2.54 0)
+			(effects (font (size 1.27 1.27)))
+		)
+		(property "Value" "FIXPWRG"
+			(at 0 -2.54 0)
+			(effects (font (size 1.27 1.27)))
+		)
+		(symbol "FIXPWRG_1_1"
+			(pin power_in line
+				(at 0 0 0)
+				(length 2.54)
+				(name "PWR" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
+	(symbol "FIXPWRL"
+		(power local)
+		(property "Reference" "#PWR"
+			(at 0 2.54 0)
+			(effects (font (size 1.27 1.27)))
+		)
+		(property "Value" "FIXPWRL"
+			(at 0 -2.54 0)
+			(effects (font (size 1.27 1.27)))
+		)
+		(symbol "FIXPWRL_1_1"
+			(pin power_in line
+				(at 0 0 0)
+				(length 2.54)
+				(name "PWR" (effects (font (size 1.27 1.27))))
+				(number "1" (effects (font (size 1.27 1.27))))
+			)
+		)
+	)
 )

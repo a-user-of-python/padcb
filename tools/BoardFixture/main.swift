@@ -4141,6 +4141,410 @@ check(r1Empty53.footprint == nil,
 check(!r1Empty53.pins.isEmpty && r1Empty53.pins.allSatisfy { $0.pad == nil },
       "5.3 refresh: with an empty store every R1 pin's pad is nil")
 
+// MARK: - Part 5.4: net labels — tiered naming, power scope,
+//         label edit/move, validation, cleanup safety, board sync
+//
+// The v5.4 proof section. Builder naming is TIERED (KiCad
+// connection_graph.h PRIORITY): tier 3 = global power symbol name,
+// tier 2 = local power symbol name, tier 1 = label text. The primary
+// name is the highest non-empty tier's alphabetical-first name; all
+// other distinct explicit names are the net's aliases, sorted.
+// Every assertion states the CONTRACT value against the real
+// ConnectionTableBuilder / SchematicERC / SchematicDocument /
+// PCBBoardModelBuilder compiled into this harness.
+
+guard let fixpwrgDef54 = fixtureLib.symbols["FIXPWRG"]
+else { fatal("FIXPWRG missing") }
+guard let fixpwrlDef54 = fixtureLib.symbols["FIXPWRL"]
+else { fatal("FIXPWRL missing") }
+
+check(fixpwrgDef54.isPower && fixpwrgDef54.powerScope == "global",
+      "5.4 power fixture: FIXPWRG resolves as a global power symbol")
+check(fixpwrlDef54.isPower && fixpwrlDef54.powerScope == "local",
+      "5.4 power fixture: FIXPWRL resolves as a local power symbol")
+
+func fixr54(_ reference: String, _ x: Double, _ y: Double) -> PlacedSymbol {
+    PlacedSymbol(id: UUID(), library: "FixtureSym", symbolName: "FIXR",
+                 unit: 1, x: x, y: y, rotation: 0, mirrorX: false,
+                 mirrorY: false, reference: reference, value: "10k")
+}
+
+func fixpwr54(_ symbol: String, _ reference: String, _ value: String,
+              _ x: Double, _ y: Double) -> PlacedSymbol {
+    PlacedSymbol(id: UUID(), library: "FixtureSym", symbolName: symbol,
+                 unit: 1, x: x, y: y, rotation: 0, mirrorX: false,
+                 mirrorY: false, reference: reference, value: value)
+}
+
+func wire54(_ a: DPoint, _ b: DPoint, verticalFirst: Bool = true) -> WireItem {
+    wire(UUID().uuidString, from: a, to: b, verticalFirst: verticalFirst)
+}
+
+/// One straight FIXR-to-FIXR run on the 25.40 placement grid: the
+/// left part's pin 2 wired to the right part's pin 1.
+func fixrRun54(_ leftRef: String, _ rightRef: String, _ y: Double)
+    -> (left: PlacedSymbol, right: PlacedSymbol, wire: WireItem) {
+    let left = fixr54(leftRef, 25.40, y)
+    let right = fixr54(rightRef, 50.80, y)
+    let runWire = wire54(pinPoint(def: fixrDef, placed: left, number: "2"),
+                         pinPoint(def: fixrDef, placed: right, number: "1"))
+    return (left, right, runWire)
+}
+
+func label54(_ text: String, _ at: DPoint) -> LabelItem {
+    LabelItem(id: UUID(), at: at, text: text)
+}
+
+func table54(_ state: SchematicState) -> ConnectionTable {
+    ConnectionTableBuilder.build(
+        state: state,
+        sourceFileName: "fixture54.json",
+        resolveSymbol: { placed in
+            defsByKey["\(placed.library)|\(placed.symbolName)"]
+        },
+        resolveFootprint: { placed, def in
+            let match = FootprintMatcher.match(def: def,
+                                               choiceKey: placed.footprintChoice,
+                                               entries: entries)
+            return (key: match.resolved?.resolutionKey, kind: match.kind?.rawValue)
+        })
+}
+
+func erc54(_ state: SchematicState) -> [ERCFinding] {
+    SchematicERC.check(state: state) { placed in
+        defsByKey["\(placed.library)|\(placed.symbolName)"]
+    }
+}
+
+func driverConflicts54(_ state: SchematicState) -> [ERCFinding] {
+    erc54(state).filter { $0.kind == .driverConflict }
+}
+
+func endpointKeys54(_ net: ConnectionNet?) -> Set<String> {
+    Set((net?.endpoints ?? []).map { "\($0.reference)|\($0.pinNumber)" })
+}
+
+func makeDoc54(_ state: SchematicState) -> SchematicDocument {
+    let doc = SchematicDocument()
+    doc.replaceState(state)
+    return doc
+}
+
+// The power fixtures' pin 1 sits at local (0, 0), so pinWorldPoints
+// puts it exactly at the placed origin (FIXR's pins, by contrast,
+// sit at (±5.08, 0) — every other placement below goes through
+// pinPoint(...) instead of assuming an origin coincidence).
+let pwrPlacedG54 = fixpwr54("FIXPWRG", "#PWR1", "VDD", 25.40, 101.60)
+check(pinPoint(def: fixpwrgDef54, placed: pwrPlacedG54, number: "1")
+      == DPoint(x: 25.40, y: 101.60),
+      "5.4 power fixture: FIXPWRG pin 1 is exactly at the placed origin")
+let pwrPlacedL54 = fixpwr54("FIXPWRL", "#PWR2", "VDD", 50.80, 101.60)
+check(pinPoint(def: fixpwrlDef54, placed: pwrPlacedL54, number: "1")
+      == DPoint(x: 50.80, y: 101.60),
+      "5.4 power fixture: FIXPWRL pin 1 is exactly at the placed origin")
+
+// -- 1: a label names its net (Sean's example) --
+
+let u2_54 = PlacedSymbol(
+    id: UUID(), library: "FixtureSym", symbolName: "FIXIC", unit: 1,
+    x: 25.40, y: 25.40, rotation: 0, mirrorX: false, mirrorY: false,
+    reference: "U2", value: "FIXIC")
+let r2_54 = fixr54("R2", 50.80, 25.40)
+// U2 pin 2 (not pin 1): pin 1's row also carries pin 2's point, so a
+// wire out of pin 1 would pass through pin 2 and join it — pin 2's
+// first segment is clear of every other pin.
+let wire1_54 = wire54(pinPoint(def: fixicDef, placed: u2_54, number: "2"),
+                      pinPoint(def: fixrDef, placed: r2_54, number: "1"),
+                      verticalFirst: false)
+let label1_54 = label54("3V3", onFirstSegment(wire1_54, t: 0.5))
+let state1_54 = SchematicState(
+    symbols: [u2_54, r2_54], wires: [wire1_54], junctions: [],
+    labels: [label1_54], title: "54-1")
+let table1_54 = table54(state1_54)
+check(table1_54.net(named: "3V3") != nil,
+      "5.4 label names its net: a net named 3V3 exists")
+checkEqual(table1_54.net(named: "3V3")?.endpoints.count ?? -1, 2,
+           "5.4 label names its net: the 3V3 net has exactly 2 endpoints")
+checkEqual(endpointKeys54(table1_54.net(named: "3V3")),
+           Set(["U2|2", "R2|1"]),
+           "5.4 label names its net: the endpoints are U2 pin 2 and R2 pin 1")
+checkEqual(table1_54.nets.count, 1,
+           "5.4 label names its net: the state writes exactly one net")
+
+// -- 2: same-name labels union separate runs --
+
+let runA54_2 = fixrRun54("R2", "R3", 76.20)
+let runB54_2 = fixrRun54("R4", "R5", 25.40)
+let state2_54 = SchematicState(
+    symbols: [runA54_2.left, runA54_2.right, runB54_2.left, runB54_2.right],
+    wires: [runA54_2.wire, runB54_2.wire], junctions: [],
+    labels: [label54("3V3", onFirstSegment(runA54_2.wire, t: 0.5)),
+             label54("3V3", onFirstSegment(runB54_2.wire, t: 0.5))],
+    title: "54-2")
+let table2_54 = table54(state2_54)
+checkEqual(table2_54.nets.count, 1,
+           "5.4 same-name union: two 3V3 runs write exactly one net")
+checkEqual(table2_54.net(named: "3V3")?.endpoints.count ?? -1, 4,
+           "5.4 same-name union: the single 3V3 net has all 4 endpoints")
+checkEqual(table2_54.wireNetByWireID?[runA54_2.wire.id.uuidString] ?? "", "3V3",
+           "5.4 same-name union: the first run's wire maps to 3V3")
+checkEqual(table2_54.wireNetByWireID?[runB54_2.wire.id.uuidString] ?? "", "3V3",
+           "5.4 same-name union: the second run's wire maps to 3V3")
+
+// -- 3: a floating label joins nothing --
+
+let run54_3 = fixrRun54("R2", "R3", 25.40)
+let state3_54 = SchematicState(
+    symbols: [run54_3.left, run54_3.right],
+    wires: [run54_3.wire], junctions: [],
+    labels: [label54("ORPHAN", DPoint(x: 200, y: 200))],
+    title: "54-3")
+let table3_54 = table54(state3_54)
+check(table3_54.net(named: "ORPHAN") == nil,
+      "5.4 floating label: no net is named ORPHAN")
+let orphanFindings54 = erc54(state3_54).filter { $0.kind == .labelNotConnected }
+checkEqual(orphanFindings54.count, 1,
+           "5.4 floating label: ERC reports exactly one label-not-connected finding")
+checkEqual(orphanFindings54.first?.detail ?? "", "ORPHAN",
+           "5.4 floating label: the finding's detail is the label text ORPHAN")
+
+// -- 4: a global power name beats a label on the same run --
+
+let run54_4 = fixrRun54("R2", "R3", 25.40)
+let pwr54_4 = fixpwr54("FIXPWRG", "#PWR1", "VDD", 38.10, 25.40)
+let state4_54 = SchematicState(
+    symbols: [run54_4.left, run54_4.right, pwr54_4],
+    wires: [run54_4.wire], junctions: [],
+    labels: [label54("3V3", onFirstSegment(run54_4.wire, t: 0.25))],
+    title: "54-4")
+let table4_54 = table54(state4_54)
+check(table4_54.net(named: "VDD") != nil,
+      "5.4 power beats label: the net is named VDD (the tier-3 power name)")
+checkEqual(table4_54.net(named: "VDD")?.aliases ?? [], ["3V3"],
+           "5.4 power beats label: the label survives as the only alias")
+checkEqual(table4_54.net(named: "VDD")?.endpoints.count ?? -1, 3,
+           "5.4 power beats label: the net carries both pins plus the power pin")
+let conflicts54_4 = driverConflicts54(state4_54)
+checkEqual(conflicts54_4.count, 1,
+           "5.4 power beats label: ERC reports exactly one driver conflict")
+check(conflicts54_4.first?.severity == .warning
+      && conflicts54_4.first?.reference == "VDD"
+      && conflicts54_4.first?.detail == "3V3",
+      "5.4 power beats label: the conflict is a warning keyed VDD / 3V3")
+check(conflicts54_4.first?.message.contains("will be used as the net name") == true,
+      "5.4 power beats label: the message says VDD will be used as the net name")
+
+// -- 5: two labels on one run — alphabetical-first wins within the tier --
+
+let run54_5 = fixrRun54("R2", "R3", 25.40)
+let state5_54 = SchematicState(
+    symbols: [run54_5.left, run54_5.right],
+    wires: [run54_5.wire], junctions: [],
+    labels: [label54("BBB", onFirstSegment(run54_5.wire, t: 0.25)),
+             label54("AAA", onFirstSegment(run54_5.wire, t: 0.75))],
+    title: "54-5")
+let table5_54 = table54(state5_54)
+check(table5_54.net(named: "AAA") != nil,
+      "5.4 two labels conflict: the net is named AAA (alphabetical within tier 1)")
+checkEqual(table5_54.net(named: "AAA")?.aliases ?? [], ["BBB"],
+           "5.4 two labels conflict: BBB is the only alias")
+let conflicts54_5 = driverConflicts54(state5_54)
+checkEqual(conflicts54_5.count, 1,
+           "5.4 two labels conflict: ERC reports exactly one driver conflict")
+checkEqual(conflicts54_5.first?.detail ?? "", "BBB",
+           "5.4 two labels conflict: the conflict's detail is BBB")
+
+// -- 6: global power beats local power (tier beats alphabetical) --
+
+let pwrG54_6 = fixpwr54("FIXPWRG", "#PWR1", "ZGND", 25.40, 25.40)
+let pwrL54_6 = fixpwr54("FIXPWRL", "#PWR2", "AGND", 50.80, 25.40)
+let wire54_6 = wire54(
+    pinPoint(def: fixpwrgDef54, placed: pwrG54_6, number: "1"),
+    pinPoint(def: fixpwrlDef54, placed: pwrL54_6, number: "1"))
+let state6_54 = SchematicState(
+    symbols: [pwrG54_6, pwrL54_6], wires: [wire54_6], junctions: [],
+    labels: [], title: "54-6")
+let table6_54 = table54(state6_54)
+check(table6_54.net(named: "ZGND") != nil,
+      "5.4 global beats local: the net is named ZGND (tier 3 beats tier 2, not alphabetical)")
+checkEqual(table6_54.net(named: "ZGND")?.aliases ?? [], ["AGND"],
+           "5.4 global beats local: AGND is the only alias")
+checkEqual(table6_54.net(named: "ZGND")?.endpoints.count ?? -1, 2,
+           "5.4 global beats local: the written net has both power endpoints")
+let conflicts54_6 = driverConflicts54(state6_54)
+checkEqual(conflicts54_6.count, 1,
+           "5.4 global beats local: ERC reports exactly one driver conflict")
+checkEqual(conflicts54_6.first?.detail ?? "", "AGND",
+           "5.4 global beats local: the conflict's detail is AGND")
+
+// -- 7: renaming one of two unioned labels splits the net --
+
+let runA54_7 = fixrRun54("R2", "R3", 76.20)
+let runB54_7 = fixrRun54("R4", "R5", 25.40)
+let labelA54_7 = label54("3V3", onFirstSegment(runA54_7.wire, t: 0.5))
+let labelB54_7 = label54("3V3", onFirstSegment(runB54_7.wire, t: 0.5))
+let doc54_7 = makeDoc54(SchematicState(
+    symbols: [runA54_7.left, runA54_7.right, runB54_7.left, runB54_7.right],
+    wires: [runA54_7.wire, runB54_7.wire], junctions: [],
+    labels: [labelA54_7, labelB54_7], title: "54-7"))
+let tableBefore54_7 = table54(doc54_7.state)
+checkEqual(tableBefore54_7.nets.count, 1,
+           "5.4 rename splits: before the rename the two runs are one net")
+checkEqual(tableBefore54_7.net(named: "3V3")?.endpoints.count ?? -1, 4,
+           "5.4 rename splits: the unioned 3V3 net has 4 endpoints")
+let canUndoBeforeNoop54_7 = doc54_7.canUndo
+check(doc54_7.editLabelText(id: labelA54_7.id, text: "3V3") == false,
+      "5.4 rename splits: editing a label to its current text returns false")
+checkEqual(doc54_7.canUndo, canUndoBeforeNoop54_7,
+           "5.4 rename splits: the no-op edit records no history")
+check(doc54_7.editLabelText(id: labelB54_7.id, text: "5V") == true,
+      "5.4 rename splits: renaming the second run's label returns true")
+let tableAfter54_7 = table54(doc54_7.state)
+checkEqual(tableAfter54_7.net(named: "3V3")?.endpoints.count ?? -1, 2,
+           "5.4 rename splits: 3V3 keeps the first run's 2 endpoints")
+checkEqual(tableAfter54_7.net(named: "5V")?.endpoints.count ?? -1, 2,
+           "5.4 rename splits: 5V takes the renamed run's 2 endpoints")
+doc54_7.undo()
+let tableUndone54_7 = table54(doc54_7.state)
+checkEqual(tableUndone54_7.nets.count, 1,
+           "5.4 rename splits: one undo reunions the runs into a single net")
+checkEqual(tableUndone54_7.net(named: "3V3")?.endpoints.count ?? -1, 4,
+           "5.4 rename splits: after undo the single 3V3 net has 4 endpoints again")
+
+// -- 8: deleting labels falls back through the remaining names --
+
+let run54_8 = fixrRun54("R2", "R3", 25.40)
+let labelA54_8 = label54("3V3", onFirstSegment(run54_8.wire, t: 0.25))
+let labelB54_8 = label54("3V3", onFirstSegment(run54_8.wire, t: 0.75))
+let doc54_8 = makeDoc54(SchematicState(
+    symbols: [run54_8.left, run54_8.right],
+    wires: [run54_8.wire], junctions: [],
+    labels: [labelA54_8, labelB54_8], title: "54-8"))
+doc54_8.deleteLabel(id: labelA54_8.id)
+check(table54(doc54_8.state).net(named: "3V3") != nil,
+      "5.4 delete fallback: with one 3V3 label left the net is still 3V3")
+doc54_8.deleteLabel(id: labelB54_8.id)
+check(table54(doc54_8.state).net(named: "3V3") == nil,
+      "5.4 delete fallback: with both labels gone no net is named 3V3")
+checkEqual(table54(doc54_8.state).net(named: "Net-1")?.endpoints.count ?? -1, 2,
+           "5.4 delete fallback: the unnamed run falls back to the auto-name Net-1")
+
+// -- 9: label-name validation (exact messages) --
+
+check(NetLabelName.validationProblem("3V3") == nil,
+      "5.4 validation: 3V3 is a valid net name")
+check(NetLabelName.validationProblem("VCC_MAIN") == nil,
+      "5.4 validation: VCC_MAIN is a valid net name")
+check(NetLabelName.validationProblem("3V3/5V") == nil,
+      "5.4 validation: 3V3/5V is valid (a slash is allowed in a single-sheet name)")
+checkEqual(NetLabelName.validationProblem("MY NET") ?? "<nil>",
+           "Net names can't contain spaces — join the words with an underscore instead, like VCC_MAIN.",
+           "5.4 validation: a name with a space gets the spaces message verbatim")
+checkEqual(NetLabelName.validationProblem("A\tB") ?? "<nil>",
+           "Net names can't contain spaces — join the words with an underscore instead, like VCC_MAIN.",
+           "5.4 validation: a name with a tab gets the spaces message verbatim")
+checkEqual(NetLabelName.validationProblem("") ?? "<nil>",
+           "A net label needs a name — type the net's name, like 3V3 or GND.",
+           "5.4 validation: an empty name gets the empty message verbatim")
+checkEqual(NetLabelName.validationProblem("   ") ?? "<nil>",
+           "A net label needs a name — type the net's name, like 3V3 or GND.",
+           "5.4 validation: an all-whitespace name gets the empty message verbatim")
+
+// -- 10: moving a label re-anchors its name --
+
+let runA54_10 = fixrRun54("R2", "R3", 76.20)
+let runB54_10 = fixrRun54("R4", "R5", 25.40)
+let label54_10 = label54("3V3", onFirstSegment(runA54_10.wire, t: 0.5))
+let startPoint54_10 = label54_10.at
+let doc54_10 = makeDoc54(SchematicState(
+    symbols: [runA54_10.left, runA54_10.right, runB54_10.left, runB54_10.right],
+    wires: [runA54_10.wire, runB54_10.wire], junctions: [],
+    labels: [label54_10], title: "54-10"))
+checkEqual(endpointKeys54(table54(doc54_10.state).net(named: "3V3")),
+           Set(["R2|2", "R3|1"]),
+           "5.4 move re-anchors: 3V3 starts on the first run")
+check(doc54_10.moveLabel(id: label54_10.id, to: DPoint(x: 200, y: 200)) == true,
+      "5.4 move re-anchors: moving the label to an empty point returns true")
+check(table54(doc54_10.state).net(named: "3V3") == nil,
+      "5.4 move re-anchors: off every wire, the label names nothing (the run is auto-named)")
+check(doc54_10.moveLabel(id: label54_10.id,
+                         to: onFirstSegment(runB54_10.wire, t: 0.5)) == true,
+      "5.4 move re-anchors: moving the label onto the second run returns true")
+checkEqual(endpointKeys54(table54(doc54_10.state).net(named: "3V3")),
+           Set(["R4|2", "R5|1"]),
+           "5.4 move re-anchors: 3V3 now names the second run")
+doc54_10.undo()
+doc54_10.undo()
+check(doc54_10.state.labels.first { $0.id == label54_10.id }?.at == startPoint54_10,
+      "5.4 move re-anchors: two undos (one per move) return the label to its start point")
+
+// -- 11: Clean Up Sheet keeps a pin-anchored, labelled wire --
+
+let r54_11 = fixr54("R2", 25.40, 25.40)
+let pin1_54_11 = pinPoint(def: fixrDef, placed: r54_11, number: "1")
+let wire54_11 = WireItem(
+    id: UUID(),
+    points: [pin1_54_11, DPoint(x: pin1_54_11.x - 10.16, y: pin1_54_11.y)])
+let label54_11 = label54("KEEP", onFirstSegment(wire54_11, t: 0.5))
+let state11_54 = SchematicState(
+    symbols: [r54_11], wires: [wire54_11], junctions: [],
+    labels: [label54_11], title: "54-11")
+let doc54_11 = makeDoc54(state11_54)
+let allPinPoints54_11: [DPoint] = state11_54.symbols.flatMap { placed in
+    guard let def = defsByKey["\(placed.library)|\(placed.symbolName)"]
+    else { return [DPoint]() }
+    return SymbolDrawList.pinWorldPoints(def: def, placed: placed).map(\.point)
+}
+let cleanup54_11 = doc54_11.cleanUpSheet(pinPoints: allPinPoints54_11)
+checkEqual(cleanup54_11["isolatedWires"] ?? -1, 0,
+           "5.4 cleanup safety: the pin-anchored labelled wire is not isolated")
+check(doc54_11.state.wires.count == 1
+      && doc54_11.state.wires.first?.id == wire54_11.id,
+      "5.4 cleanup safety: the wire is still present after Clean Up Sheet")
+check(doc54_11.state.labels.count == 1
+      && doc54_11.state.labels.first?.id == label54_11.id
+      && doc54_11.state.labels.first?.text == "KEEP",
+      "5.4 cleanup safety: the KEEP label is unchanged by Clean Up Sheet")
+
+// -- 12: the label-named net reaches the board model --
+
+let board54_12 = PCBBoardModelBuilder.build(
+    table: table1_54,
+    resolveSymbol: { library, name in defsByKey["\(library)|\(name)"] },
+    resolveFootprint: { key in
+        guard let entry = FootprintMatcher.entry(forResolutionKey: key, in: entries),
+              let parsed = entry.parsed else { return nil }
+        return (entry: entry, parsed: parsed)
+    })
+check(board54_12.netNames.contains("3V3"),
+      "5.4 board: the board model's net names contain 3V3")
+
+// -- 13: label persistence (round-trip + pre-5.4 JSON) --
+
+do {
+    let data54 = try JSONEncoder().encode(state1_54)
+    let decoded54 = try JSONDecoder().decode(SchematicState.self, from: data54)
+    checkEqual(decoded54.labels.count, 1,
+               "5.4 persistence: the encoded state decodes with its one label")
+    check(decoded54.labels.first?.id == label1_54.id
+          && decoded54.labels.first?.at == label1_54.at
+          && decoded54.labels.first?.text == label1_54.text,
+          "5.4 persistence: the label round-trips exactly (id, at, text)")
+} catch {
+    check(false, "5.4 persistence: the state round-trip threw \(error)")
+}
+let legacyJSON54 = """
+{"symbols":[],"wires":[],"junctions":[],"title":"Legacy54"}
+"""
+do {
+    let legacy54 = try JSONDecoder().decode(
+        SchematicState.self, from: Data(legacyJSON54.utf8))
+    check(legacy54.labels.isEmpty,
+          "5.4 persistence: legacy JSON with no labels key loads with no labels")
+} catch {
+    check(false, "5.4 persistence: the legacy literal threw \(error)")
+}
+
 // MARK: - Result
 
 print("BoardFixture: \(passCount) passed, \(failCount) failed")

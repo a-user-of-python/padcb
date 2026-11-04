@@ -213,6 +213,26 @@ struct SchematicFindMatch: Equatable {
     var itemID: UUID? { symbolID ?? labelID }
 }
 
+/// Net-label name rules (part 5.4; KiCad's NETNAME_VALIDATOR,
+/// common/validators.cpp, in its no-spaces form — net names
+/// cannot contain whitespace, eeschema/sch_connection.cpp).
+enum NetLabelName {
+    /// A plain-words problem with the proposed name, or nil
+    /// when the name is usable. The name is judged trimmed;
+    /// entry points trim before storing, exactly as the
+    /// builder trims when naming.
+    static func validationProblem(_ raw: String) -> String? {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if name.isEmpty {
+            return "A net label needs a name — type the net's name, like 3V3 or GND."
+        }
+        if name.contains(where: { $0.isWhitespace }) {
+            return "Net names can't contain spaces — join the words with an underscore instead, like VCC_MAIN."
+        }
+        return nil
+    }
+}
+
 // MARK: - Document
 
 final class SchematicDocument: ObservableObject {
@@ -378,6 +398,37 @@ final class SchematicDocument: ObservableObject {
         guard state.labels.contains(where: { $0.id == id }) else { return }
         pushHistory()
         state.labels.removeAll { $0.id == id }
+    }
+
+    /// Renames a label as ONE history step. KiCad semantics —
+    /// renaming a label renames only that label; other labels
+    /// keeping the old name stay on the old net (the nets split
+    /// at the next table build). Returns false and records NO
+    /// history when the id is missing or the text is unchanged.
+    /// The text is trimmed before storing, exactly as the
+    /// builder trims when naming.
+    @discardableResult
+    func editLabelText(id: UUID, text: String) -> Bool {
+        guard let idx = state.labels.firstIndex(where: { $0.id == id })
+        else { return false }
+        let newText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard newText != state.labels[idx].text else { return false }
+        pushHistory()
+        state.labels[idx].text = newText
+        return true
+    }
+
+    /// Moves a label as ONE history step. Returns false and
+    /// records NO history when the id is missing or the target
+    /// is the label's current point.
+    @discardableResult
+    func moveLabel(id: UUID, to: DPoint) -> Bool {
+        guard let idx = state.labels.firstIndex(where: { $0.id == id })
+        else { return false }
+        guard state.labels[idx].at != to else { return false }
+        pushHistory()
+        state.labels[idx].at = to
+        return true
     }
 
     // MARK: References

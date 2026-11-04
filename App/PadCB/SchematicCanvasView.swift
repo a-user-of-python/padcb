@@ -157,13 +157,19 @@ struct SchematicCanvasView: View {
     var onDeleteConnectionSelection: () -> Void = {}
 
     // Drag bookkeeping
-    private enum DragKind { case none, pan, moveSymbol, track }
+    private enum DragKind { case none, pan, moveSymbol, track, moveLabel }
     @State private var dragKind: DragKind = .none
     @State private var dragStartOffset: CGPoint = .zero
     @State private var dragSymbolID: UUID?
     @State private var dragStartOrigin: DPoint = .zero
     @State private var dragPinPoints: [DPoint] = []
     @State private var dragOrigin: DPoint? // live snapped origin while moving a symbol
+    // Label drag bookkeeping (part 5.4): a label moves as its own item;
+    // its anchor re-evaluates against wires at the next table build —
+    // nothing else moves with it.
+    @State private var dragLabelID: UUID?
+    @State private var dragStartLabelAt: DPoint = .zero
+    @State private var dragLabelOrigin: DPoint? // live snapped point while moving a label
 
     // Two-finger session (pinch zoom + two-finger pan, UIKit bridge):
     // scale at session start and the world point that was under the touch
@@ -188,10 +194,14 @@ struct SchematicCanvasView: View {
     @State private var ghostMirrorX = false
     @State private var ghostMirrorY = false
 
-    // Label prompt
+    // Label prompt (part 5.4: dual-purpose — creates a new label, or
+    // edits an existing one when `editingLabelID` is set; KiCad:
+    // editing a label's text renames only that label).
     @State private var labelPoint: DPoint?
     @State private var labelText: String = ""
     @State private var showingLabelAlert = false
+    @State private var editingLabelID: UUID?
+    @State private var labelError: String?
 
     @FocusState private var focused: Bool
 
@@ -272,6 +282,12 @@ struct SchematicCanvasView: View {
         return s
     }
 
+    /// The label point as it should be drawn right now (drag preview,
+    /// part 5.4).
+    private func effectiveLabelPoint(_ l: LabelItem) -> DPoint {
+        (dragKind == .moveLabel && l.id == dragLabelID) ? (dragLabelOrigin ?? l.at) : l.at
+    }
+
     private func nearestPin(to w: DPoint, defs: [UUID: KiCadSymbolDef]) -> (point: DPoint, distance: Double)? {
         var best: (point: DPoint, distance: Double)?
         for s in document.state.symbols {
@@ -322,6 +338,13 @@ struct SchematicCanvasView: View {
             }
         }
         return nil
+    }
+
+    // Label hit test (part 5.4): same tolerance the Delete tool uses
+    // for labels.
+    private func labelAt(_ w: DPoint) -> LabelItem? {
+        let tol = max(1.5, 8.0 / scaleD)
+        return document.state.labels.first { w.distance(to: $0.at) <= tol }
     }
 
     private static func pointSegmentDistance(_ p: DPoint, _ a: DPoint, _ b: DPoint) -> (distance: Double, projected: DPoint) {
@@ -387,22 +410,35 @@ struct SchematicCanvasView: View {
                 ghostMirrorX = false
                 ghostMirrorY = false
             }
-            .alert("Add Label", isPresented: $showingLabelAlert) {
+            .alert(editingLabelID == nil ? "Add Label" : "Edit Label", isPresented: $showingLabelAlert) {
                 TextField("Label text", text: $labelText)
-                Button("Add") {
-                    let text = labelText.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if let p = labelPoint, !text.isEmpty {
-                        document.addLabel(at: p, text: text)
+                Button(editingLabelID == nil ? "Add" : "Save") {
+                    let trimmed = labelText.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if let problem = NetLabelName.validationProblem(trimmed) {
+                        labelError = problem
+                    } else if let id = editingLabelID {
+                        document.editLabelText(id: id, text: trimmed)
+                    } else if let p = labelPoint {
+                        document.addLabel(at: p, text: trimmed)
                     }
                     labelPoint = nil
                     labelText = ""
+                    editingLabelID = nil
                 }
                 Button("Cancel", role: .cancel) {
                     labelPoint = nil
                     labelText = ""
+                    editingLabelID = nil
                 }
             } message: {
-                Text("Enter the label text.")
+                Text("The label names the net it touches. Net names can't contain spaces — use _ instead.")
+            }
+            .alert("That name won't work",
+                   isPresented: Binding(get: { labelError != nil },
+                                        set: { if !$0 { labelError = nil } })) {
+                Button("OK") { labelError = nil }
+            } message: {
+                Text(labelError ?? "")
             }
         }
     }
@@ -456,6 +492,12 @@ struct SchematicCanvasView: View {
                 // start a symbol drag or change the selection — the
                 // tap split in handlePanEnded resolves the mode.
                 dragKind = .track
+            } else if let hit = labelAt(world(startLocation)) {
+                // Label drag (part 5.4): a label moves as its own item.
+                dragKind = .moveLabel
+                dragLabelID = hit.id
+                dragStartLabelAt = hit.at
+                dragLabelOrigin = hit.at
             } else if let hit = symbolAt(world(startLocation), defs: defsByID) {
                 dragKind = .moveSymbol
                 dragSymbolID = hit.id
@@ -491,6 +533,11 @@ struct SchematicCanvasView: View {
             let dw = DPoint(x: Double(translation.x) / scaleD,
                             y: -Double(translation.y) / scaleD)
             dragOrigin = snap(dragStartOrigin + dw)
+        case .moveLabel:
+            // Part 5.4: same snapped-delta math as .moveSymbol.
+            let dw = DPoint(x: Double(translation.x) / scaleD,
+                            y: -Double(translation.y) / scaleD)
+            dragLabelOrigin = snap(dragStartLabelAt + dw)
         case .track:
             if tool == .wire {
                 let target = nearestPin(to: w, defs: defsByID)?.point ?? snap(w)
@@ -534,6 +581,12 @@ struct SchematicCanvasView: View {
         } else if dragKind == .moveSymbol, let id = dragSymbolID,
                   let target = dragOrigin, target != dragStartOrigin {
             document.moveSymbol(id: id, to: target, pinPointsBefore: dragPinPoints)
+        } else if dragKind == .moveLabel, let id = dragLabelID,
+                  let target = dragLabelOrigin, target != dragStartLabelAt {
+            // Part 5.4: one document call on pan end, mirroring the
+            // symbol path; the label's anchor re-evaluates against
+            // wires at the next table build — nothing else moves.
+            document.moveLabel(id: id, to: target)
         }
         resetDrag()
     }
@@ -543,6 +596,8 @@ struct SchematicCanvasView: View {
         dragSymbolID = nil
         dragOrigin = nil
         dragPinPoints = []
+        dragLabelID = nil
+        dragLabelOrigin = nil
         wireDragStart = nil
         wireDragActive = false
     }
@@ -612,8 +667,18 @@ struct SchematicCanvasView: View {
         case .junction:
             junctionTap(at: w)
         case .label:
-            labelPoint = snap(w)
-            labelText = ""
+            // Part 5.4: tapping an existing label edits it (KiCad:
+            // editing a label's text renames only that label);
+            // tapping empty space creates a new one.
+            if let hit = labelAt(w) {
+                editingLabelID = hit.id
+                labelPoint = hit.at
+                labelText = hit.text
+            } else {
+                editingLabelID = nil
+                labelPoint = snap(w)
+                labelText = ""
+            }
             showingLabelAlert = true
         case .noConnect:
             noConnectTap(at: w)
@@ -965,10 +1030,12 @@ extension SchematicCanvasView {
                                           lineCap: .round))
         }
 
-        // Labels (KiCad label texts support _{...} markup -> KiCadText)
+        // Labels (KiCad label texts support _{...} markup -> KiCadText;
+        // part 5.4: drawn at the effective point so a label drag
+        // previews live, mirroring effectivePlaced for symbols)
         for l in document.state.labels {
             let sizePt = max(CGFloat(1.27 * scaleD), 9)
-            let pt = screen(l.at)
+            let pt = screen(effectiveLabelPoint(l))
             KiCadText.draw(in: &ctx, l.text, at: CGPoint(x: pt.x, y: pt.y - 2),
                            size: sizePt, color: Self.labelColor, angle: 0,
                            anchor: UnitPoint(x: 0, y: 1), bold: false, italic: false)

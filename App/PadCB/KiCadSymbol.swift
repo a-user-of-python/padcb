@@ -104,6 +104,9 @@ struct KiCadSymbolDef {
     /// The symbol node carries a (power global) / (power local) marker
     /// (after extends merge).
     var isPowerSymbol: Bool = false
+    /// The (power global) / (power local) scope after extends merge;
+    /// nil when the symbol carries no (power …) marker.
+    var powerScope: String? = nil
 
     func property(_ name: String) -> String? {
         properties.first(where: { $0.name == name })?.value
@@ -266,7 +269,8 @@ struct KiCadLibrary {
                 pinNameOffset: parent?.pinNameOffset ?? raw.pinNameOffset ?? 0.508,
                 pinNamesHidden: parent?.pinNamesHidden ?? raw.pinNamesHidden ?? false,
                 pinNumbersHidden: parent?.pinNumbersHidden ?? raw.pinNumbersHidden ?? false,
-                isPowerSymbol: raw.hasPowerMarker ?? parent?.isPowerSymbol ?? false
+                isPowerSymbol: raw.hasPowerMarker ?? parent?.isPowerSymbol ?? false,
+                powerScope: raw.powerScope ?? parent?.powerScope
             )
             resolved[symbolName] = def
             return def
@@ -300,6 +304,7 @@ private struct RawSymbol {
     var pinNumbersHidden: Bool?
     /// Non-nil (true) when a (power global)/(power local) node is present.
     var hasPowerMarker: Bool?
+    var powerScope: String?
 }
 
 private func parseRawSymbol(_ node: SExpr) -> RawSymbol? {
@@ -321,6 +326,7 @@ private func parseRawSymbol(_ node: SExpr) -> RawSymbol? {
         case "power":
             // (power global) / (power local) — any value marks a power symbol.
             raw.hasPowerMarker = true
+            raw.powerScope = item.value(1)
         case "pin_names":
             if let offset = item.child("offset")?.double(1) {
                 raw.pinNameOffset = offset
